@@ -514,18 +514,17 @@ COPY (
  WITH r AS (SELECT * FROM jsonb_to_recordset(:'raws'::jsonb) AS x(key text, clip bigint)),
       p AS (SELECT * FROM jsonb_to_recordset(:'pairs'::jsonb) AS x(raw text, clip bigint, output text)),
       o AS (SELECT DISTINCT output AS key FROM p)
- SELECT 'raw', r.key, c.size_bytes::text, (c.purged_at IS NULL)::text, NULL, NULL, NULL, NULL
+ SELECT 'raw', r.key, c.size_bytes::text, (c.purged_at IS NULL)::text, r2_owner_keep_held('stoarama',r.key)::text, NULL, NULL
  FROM r JOIN recording_clips c ON c.id=r.clip AND c.bucket='stoarama' AND c.object_key=r.key
  UNION ALL
  SELECT 'output', o.key, count(x.id)::text, min(x.size_bytes)::text,
   EXISTS(SELECT FROM r2_object_retirements z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
   EXISTS(SELECT FROM r2_retirement_reservations z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
-  r2_owner_keep_held('stoarama',o.key)::text,
   EXISTS(SELECT FROM r2_nonraw_intents z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text
  FROM o LEFT JOIN recording_collation_outputs x ON x.object_key=o.key GROUP BY o.key
  UNION ALL
  SELECT 'pair', p.raw, p.output, EXISTS(SELECT FROM recording_collation_outputs x
-   WHERE x.object_key=p.output AND p.clip=ANY(x.source_clip_ids))::text, NULL, NULL, NULL, NULL
+   WHERE x.object_key=p.output AND p.clip=ANY(x.source_clip_ids))::text, NULL, NULL, NULL
  FROM p
 ) TO STDOUT WITH (FORMAT csv, DELIMITER E'\\t');
 ROLLBACK;
@@ -560,13 +559,16 @@ def verify_chunk(cfg, store, batch, manifest, sources, cover, attempted, held):
         db[(row[0], row[1]) if row[0] != 'pair' else ('pair', row[1], row[2])] = row
     for k in batch:
         got = db.get(('raw', k))
-        if got is None or got[2:4] != [str(manifest[k]['size']), 'true']:
-            raise SystemExit(f'verify: recording_clips row for {k} is {got and got[2:4]}, want size {manifest[k]["size"]} and purged_at NULL')
+        if got is None or got[2:5] != [str(manifest[k]['size']), 'true', 'false']:
+            raise SystemExit(f'verify: recording_clips row for {k} [size, purged_at NULL, owner keep] is {got and got[2:5]}, '
+                             f'want size {manifest[k]["size"]}, purged_at NULL and no owner keep')
+    # A covering output's owner keep (e.g. collation_v2_recovery_held) is the protection a
+    # sole copy must have, so it is not checked here; a raw's owner keep refuses above.
     for o in outputs:
         got = db[('output', o)]
-        if got[2:] != ['1', str(heads[o][0]), 'false', 'false', 'false', 'false']:
-            raise SystemExit(f'verify: covering output {o} catalog [rows, size, receipt, reservation, owner keep, nonraw intent] '
-                             f'is {got[2:]}, want one row at size {heads[o][0]} with none of the others')
+        if got[2:7] != ['1', str(heads[o][0]), 'false', 'false', 'false']:
+            raise SystemExit(f'verify: covering output {o} catalog [rows, size, receipt, reservation, nonraw intent] '
+                             f'is {got[2:7]}, want one row at size {heads[o][0]} with none of the others')
     for k in batch:
         for o, _ in cover[k]:
             if db[('pair', k, o)][3] != 'true':

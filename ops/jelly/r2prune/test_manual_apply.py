@@ -69,11 +69,11 @@ if 'jsonb_to_recordset' in script:
     db = json.load(open(S + '/db.json'))
     for r in raws:
         if r['key'] in db['clips']:
-            print('\t'.join(['raw', r['key']] + db['clips'][r['key']] + ['', '', '', '']))
+            print('\t'.join(['raw', r['key']] + db['clips'][r['key']] + [str(r['key'] in db.get('kept', [])).lower(), '', '']))
     for o in sorted({p['output'] for p in pairs}):
-        print('\t'.join(['output', o] + db['outputs'].get(o, ['0', '', 'false', 'false', 'false', 'false'])))
+        print('\t'.join(['output', o] + db['outputs'].get(o, ['0', '', 'false', 'false', 'false'])))
     for p in pairs:
-        print('\t'.join(['pair', p['raw'], p['output'], 'true' if p['raw'] in db['contains'].get(p['output'], []) else 'false', '', '', '', '']))
+        print('\t'.join(['pair', p['raw'], p['output'], 'true' if p['raw'] in db['contains'].get(p['output'], []) else 'false', '', '', '']))
     sys.exit(0)
 wanted = set(json.loads(script.split('$k$')[1]))
 for key, s in json.load(open(S + '/sources.json')).items():
@@ -478,7 +478,7 @@ class ChunkVerify(Base):
                                  f'{KE[2]}\t999\t{OUT1}\t500\n')
         self.r2({**{k: [100, 'e1', 1] for k in KE}, OUT1: [500, 'o1', 5], OUT2: [600, 'o2', 6]})
         self.db({'clips': {k: ['100', 'true'] for k in KE},
-                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false', 'false'], OUT2: ['1', '600', 'false', 'false', 'false', 'false']},
+                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false'], OUT2: ['1', '600', 'false', 'false', 'false']},
                  'contains': {OUT1: KE[:2], OUT2: KE[2:]}})
 
     def r2(self, objects):
@@ -506,6 +506,14 @@ class ChunkVerify(Base):
         self.assertEqual([len(p.read_text().splitlines()) for p in sorted(self.W.glob('ledger-*.jsonl'))], [3, 2])
         self.assertTrue(self.result()['complete'])
         self.assertTrue(self.server.auth and all(self.server.auth))
+
+    def test_a_cover_under_owner_keep_still_covers(self):
+        # collation_v2_recovery_held keeps every cover of the 2026-11-25 canary: the protection a sole copy needs
+        db = json.loads((self.d / 'db.json').read_text())
+        self.db({**db, 'kept': [OUT1, OUT2]})
+        self.delete('--chunk', '2')
+        self.assertEqual(set(self.applied()), set(KE))
+        self.assertTrue(self.result()['complete'])
 
     def test_keys_outside_the_chunk_are_deferred_not_final(self):
         self.delete('--chunk', '1', '--chunks', '1')
@@ -545,13 +553,13 @@ class ChunkVerify(Base):
             'raw etag': (lambda: self.r2({**objects, KE[2]: [100, 'e2', 1]}), 'R2 HEAD of ' + KE[2]),
             'raw absent, never sent': (lambda: self.r2({k: v for k, v in objects.items() if k != KE[2]}), 'R2 HEAD of ' + KE[2]),
             'output size': (lambda: self.r2({**objects, OUT2: [601, 'o2', 6]}), 'covering output ' + OUT2),
+            'raw owner keep': (lambda: self.db({**db, 'kept': [KE[2]]}), 'recording_clips row for ' + KE[2]),
             'clip purged': (lambda: self.db({**db, 'clips': {**db['clips'], KE[2]: ['100', 'false']}}), 'recording_clips row for ' + KE[2]),
             'clip size': (lambda: self.db({**db, 'clips': {**db['clips'], KE[2]: ['101', 'true']}}), 'recording_clips row for ' + KE[2]),
-            'output receipted': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'true', 'false', 'false', 'false']}}), OUT2),
-            'output reserved': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'true', 'false', 'false']}}), OUT2),
-            'output owner keep': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'false', 'true', 'false']}}), OUT2),
-            'output nonraw intent': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'false', 'false', 'true']}}), OUT2),
-            'output catalog size': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '599', 'false', 'false', 'false', 'false']}}), OUT2),
+            'output receipted': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'true', 'false', 'false']}}), OUT2),
+            'output reserved': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'true', 'false']}}), OUT2),
+            'output nonraw intent': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'false', 'true']}}), OUT2),
+            'output catalog size': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '599', 'false', 'false', 'false']}}), OUT2),
             'clip left the output': (lambda: self.db({**db, 'contains': {OUT1: KE[:2], OUT2: []}}), 'source_clip_ids of ' + OUT2),
             'output in another open intent': (other_intent, "another open intent's manifest"),
         }
