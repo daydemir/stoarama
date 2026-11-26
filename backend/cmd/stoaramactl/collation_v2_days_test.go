@@ -114,6 +114,37 @@ INSERT INTO recording_clips(id,recording_id,recording_job_id,clip_start_at,clip_
 		t.Fatalf("new hour under --recovery-batch: %+v", f)
 	}
 
+	// A repaired clip: a new hour reads its repaired/ copy; the registered hour
+	// restores from its catalogued keys even when the ledger repaired them.
+	repairSHA := strings.Repeat("9", 64)
+	repairs := map[int64]clipRepair{
+		301: {status: repairDone, originalSHA: strings.Repeat("5", 64), key: "repaired/raw/301.mp4", size: 12, sha: repairSHA},
+		101: {status: repairDone, originalSHA: strings.Repeat("1", 64), key: "repaired/raw/101.mp4", size: 12, sha: repairSHA},
+	}
+	repaired, err := planCollation(ctx, pool, collationPlanOptions{scope: "days", dayList: dayList("5,2026-10-01"), now: now, recoveryBatch: recoveryBatch, repairs: repairs})
+	if err != nil || len(repaired.work) != len(plan.work) {
+		t.Fatalf("repaired plan %+v %v", repaired, err)
+	}
+	if c := repaired.work[1].Clips[0]; c.ClipID != 301 || c.ObjectKey != "repaired/raw/301.mp4" || c.SizeBytes != 12 || c.SHA256 != repairSHA || c.ETag != "" || c.Purged {
+		t.Fatalf("new hour did not read the repaired copy: %+v", c)
+	}
+	if c := repaired.work[0].Clips[0]; c.ClipID != 101 || c.ObjectKey != "raw/101.mp4" || c.SHA256 != strings.Repeat("1", 64) {
+		t.Fatalf("restore left its registered sources: %+v", c)
+	}
+	// A clip the ledger could not repair fails the plan, unless quarantined.
+	repairs[301] = clipRepair{status: "failed"}
+	if _, err := planCollation(ctx, pool, collationPlanOptions{scope: "days", dayList: dayList("5,2026-10-01,3"), now: now, repairs: repairs}); err == nil || !strings.Contains(err.Error(), "no decodable source") {
+		t.Fatalf("unrepaired clip planned: %v", err)
+	}
+	if q, err := planCollation(ctx, pool, collationPlanOptions{scope: "days", dayList: dayList("5,2026-10-01,3"), now: now, repairs: repairs, broken: map[int64]bool{301: true}}); err != nil || !q.work[0].Clips[0].KnownBroken {
+		t.Fatalf("quarantined unrepaired clip: %+v %v", q, err)
+	}
+	// A repair of other bytes than the catalogued clip is refused.
+	repairs[301] = clipRepair{status: repairDone, originalSHA: strings.Repeat("0", 64), key: "repaired/raw/301.mp4", size: 12, sha: repairSHA}
+	if _, err := planCollation(ctx, pool, collationPlanOptions{scope: "days", dayList: dayList("5,2026-10-01,3"), now: now, repairs: repairs}); err == nil || !strings.Contains(err.Error(), "not of its catalogued bytes") {
+		t.Fatalf("repair of other bytes planned: %v", err)
+	}
+
 	one, err := planCollation(ctx, pool, collationPlanOptions{scope: "days", dayList: dayList("5,2026-10-01,1"), now: now})
 	if err != nil || len(one.work) != 1 || one.work[0].HourID != hour1 {
 		t.Fatalf("single hour plan %+v %v", one, err)

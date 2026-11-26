@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -28,7 +29,7 @@ import (
 
 const collationV2Usage = `usage:
   stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD | --days N]
-  stoaramactl collation-v2 plan --scope days --day-list FILE --out worklist.jsonl [--broken-ids FILE] [--recovery-batch recovery-NAME]
+  stoaramactl collation-v2 plan --scope days --day-list FILE --out worklist.jsonl [--broken-ids FILE] [--recovery-batch recovery-NAME] [--repair-ledger FILE]
     FILE lines: recording_id,YYYY-MM-DD[,delivery_hour]; any recording status.
     An hour already registered is planned as a restore of its exact registered
     outputs (its batch, content-addressed keys); run republishes them only if
@@ -58,6 +59,7 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		dayList := fs.String("day-list", "", "days: file of recording_id,YYYY-MM-DD[,delivery_hour] lines")
 		out := fs.String("out", "", "worklist output path")
 		broken := fs.String("broken-ids", "", "file of known-unplayable clip ids (one per line)")
+		repairLedger := fs.String("repair-ledger", "", "TSV export of the Jelly repair ledger (clip_id, status, orig_sha256, repaired_key, repaired_size, repaired_sha256): a new hour reads each repaired clip's repaired/ copy")
 		recordings := fs.String("recordings", "", "optional comma-separated recording ids")
 		hourIDs := fs.String("hour-ids", "", "optional file of hour ids to keep")
 		date := fs.String("date", "", "nightly: local date to plan (default: the last --days closed days in each recording's timezone)")
@@ -79,6 +81,9 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		opts := collationPlanOptions{scope: *scope, date: *date, days: *days, now: time.Now(), recoveryBatch: *recoveryBatch}
 		var err error
 		if opts.broken, err = readIDSet(*broken); err != nil {
+			log.Fatal(err)
+		}
+		if opts.repairs, err = readRepairLedger(*repairLedger); err != nil {
 			log.Fatal(err)
 		}
 		if opts.recordings, err = parseIDList(*recordings); err != nil {
@@ -420,12 +425,14 @@ func readDayList(path string) ([]collationDayRequest, error) {
 }
 
 type collationPlanOptions struct {
-	dayList    []collationDayRequest
-	scope      string
-	date       string
-	days       int
-	now        time.Time
-	broken     map[int64]bool
+	dayList []collationDayRequest
+	scope   string
+	date    string
+	days    int
+	now     time.Time
+	broken  map[int64]bool
+	// repairs is the Jelly repair ledger by clip id (--repair-ledger).
+	repairs    map[int64]clipRepair
 	recordings map[int64]bool
 	hourIDs    map[string]bool
 	// recoveryBatch, when set, names every planned hour in that fresh batch;
@@ -640,10 +647,14 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 				}
 				if isRegistered {
 					// A restore rebuilds the registered clip set exactly; only
-					// purge state comes from the current catalog.
+					// purge state comes from the current catalog. Registered
+					// hours were built from their catalogued keys, never from
+					// repaired/ copies, so a restore never reads one.
 					if w.Clips, err = restoreClips(reg.clips, clips); err != nil {
 						return plan, fmt.Errorf("%s: %w", hourID, err)
 					}
+				} else if w.Clips, err = repairedSources(w.Clips, opts.repairs); err != nil {
+					return plan, fmt.Errorf("%s: %w", hourID, err)
 				}
 				if gen1ID, ok := gen1[collationGen1Key{d.batchID, d.localDate, h}]; ok {
 					w.SupersedesHourRecordID = gen1ID.id
@@ -668,6 +679,99 @@ type collationRegisteredHour struct {
 	hourID  string
 	clips   []collation.Clip
 	restore collation.RestoreHour
+}
+
+// repairStatus is a Jelly repair ledger status (ops/jelly/repair/repair.py).
+type repairStatus string
+
+const (
+	// repairDone: the original is an unfinalized MP4 (no moov) and a decoded,
+	// full-decode-checked copy is at repaired/<original key>.
+	repairDone repairStatus = "done"
+	// repairSkippedSignature: the original's header is not a no-moov relay
+	// clip; the original stands.
+	repairSkippedSignature repairStatus = "skipped_signature"
+)
+
+// clipRepair is one ledger row: the original's sha256 and its repaired copy.
+type clipRepair struct {
+	status      repairStatus
+	originalSHA string
+	key         string
+	size        int64
+	sha         string
+}
+
+// readRepairLedger reads a TSV export of the repair ledger, e.g.
+//
+//	sqlite3 -readonly -header -separator $'\t' 'file:ledger.sqlite?immutable=1' \
+//	  'SELECT clip_id,status,orig_sha256,repaired_key,repaired_size,repaired_sha256 FROM clips'
+func readRepairLedger(path string) (map[int64]clipRepair, error) {
+	out := map[int64]clipRepair{}
+	if path == "" {
+		return out, nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
+	if len(lines) == 0 || lines[0] != "clip_id\tstatus\torig_sha256\trepaired_key\trepaired_size\trepaired_sha256" {
+		return nil, fmt.Errorf("%s: header must be clip_id, status, orig_sha256, repaired_key, repaired_size, repaired_sha256", path)
+	}
+	for n, line := range lines[1:] {
+		f := strings.Split(line, "\t")
+		if len(f) != 6 {
+			return nil, fmt.Errorf("%s line %d: want 6 fields", path, n+2)
+		}
+		id, err := strconv.ParseInt(f[0], 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("%s line %d: bad clip id %q", path, n+2, f[0])
+		}
+		if _, dup := out[id]; dup {
+			return nil, fmt.Errorf("%s line %d: clip %d listed twice", path, n+2, id)
+		}
+		r := clipRepair{status: repairStatus(f[1]), originalSHA: f[2], key: f[3], sha: f[5]}
+		if r.status == repairDone {
+			if r.size, err = strconv.ParseInt(f[4], 10, 64); err != nil || r.size <= 0 || !strings.HasPrefix(r.key, "repaired/") ||
+				!collationSHA256.MatchString(r.sha) || !collationSHA256.MatchString(r.originalSHA) {
+				return nil, fmt.Errorf("%s line %d: clip %d is done without a repaired key, size and sha256", path, n+2, id)
+			}
+		}
+		out[id] = r
+	}
+	return out, nil
+}
+
+var collationSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// repairedSources points each clip the repair ledger repaired at its
+// repaired/ copy: that copy's key, size and sha256, so run downloads and
+// verifies exactly those bytes. The clip id and timing stay the catalog's. A
+// repair must be of the clip's own catalogued bytes. A clip the ledger lists
+// without a repaired copy has no decodable source: the plan fails unless the
+// clip is quarantined by --broken-ids.
+func repairedSources(clips []collation.Clip, repairs map[int64]clipRepair) ([]collation.Clip, error) {
+	var unrepaired []int64
+	for i, c := range clips {
+		r, listed := repairs[c.ClipID]
+		switch {
+		case !listed || r.status == repairSkippedSignature:
+		case r.status == repairDone:
+			if r.originalSHA != c.SHA256 || r.key != "repaired/"+c.ObjectKey {
+				return nil, fmt.Errorf("repair of clip %d is not of its catalogued bytes", c.ClipID)
+			}
+			c.ObjectKey, c.SizeBytes, c.SHA256, c.ETag, c.Purged = r.key, r.size, r.sha, "", false
+			clips[i] = c
+		case c.KnownBroken:
+		default:
+			unrepaired = append(unrepaired, c.ClipID)
+		}
+	}
+	if len(unrepaired) > 0 {
+		return nil, fmt.Errorf("clips %v have no decodable source (repair ledger: not repaired); list them in --broken-ids to quarantine", unrepaired)
+	}
+	return clips, nil
 }
 
 // restoreClips is a registered hour's manifest clip set with each clip's
