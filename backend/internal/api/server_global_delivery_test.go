@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,12 +10,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func globalDeliveryTestRegistry() *globalDeliveryRegistry {
@@ -278,5 +281,140 @@ func TestPublicGlobalDeliveryEncodedFileIDThroughRouter(t *testing.T) {
 				t.Fatalf("ticket status = %d, want %d", w.Code, tc.status)
 			}
 		})
+	}
+}
+
+func TestPublicGlobalDeliveryRevalidatesAssetRepresentations(t *testing.T) {
+	const assetPath = "/api/coverage-delivery/manifest?stream=1&scope=available"
+	body := []byte(`{"outputs":[{"id":"1","path":"unchanged.mp4"}]}`)
+	sum := sha256.Sum256(body)
+	generation := strings.Repeat("a", 32)
+	reg := &globalDeliveryRegistry{Generation: generation, Assets: map[string]globalDeliveryObject{
+		assetPath:             {ContentType: "application/json", SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(body))},
+		"/download-script.py": {SHA256: strings.Repeat("c", 64)},
+	}}
+	store := &globalDeliveryTestStore{body: body}
+	s := &Server{
+		globalDeliveryStore: store, publicDeliveryRegistries: []*globalDeliveryRegistry{reg},
+		publicDeliveryCurrent: generation, publicDeliveryCurrentAt: time.Now(),
+	}
+	target := publicGlobalDeliveryAPI + "/metadata?path=" + url.QueryEscape(assetPath)
+	request := func(encoding, etag string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, target, nil)
+		r.Header.Set("Accept-Encoding", encoding)
+		r.Header.Set("If-None-Match", etag)
+		w := httptest.NewRecorder()
+		s.handleGlobalDeliveryAsset(w, r)
+		return w
+	}
+	compressed := request("br, gzip", "")
+	etag := compressed.Header().Get("ETag")
+	if compressed.Code != http.StatusOK || compressed.Header().Get("Content-Encoding") != "gzip" ||
+		compressed.Header().Get("Vary") != "Accept-Encoding" || compressed.Header().Get("Cache-Control") != "private, no-cache" ||
+		!strings.HasPrefix(etag, "W/") {
+		t.Fatalf("gzip response: status %d, headers %v", compressed.Code, compressed.Header())
+	}
+	zr, err := gzip.NewReader(compressed.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	decoded, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := request("gzip;q=0", "")
+	if plain.Header().Get("Content-Encoding") != "" || plain.Header().Get("ETag") != etag || !bytes.Equal(decoded, plain.Body.Bytes()) ||
+		!bytes.Contains(decoded, []byte(`"delivery_generation":"`+generation+`"`)) ||
+		!bytes.Contains(decoded, []byte(`"download_script_sha256":"`+reg.Assets["/download-script.py"].SHA256+`"`)) ||
+		!bytes.Contains(decoded, []byte(`"path":"unchanged.mp4"`)) {
+		t.Fatalf("identity and gzip must carry the same stamped manifest: %q", decoded)
+	}
+	w := request("gzip", `"unrelated", `+etag)
+	if w.Code != http.StatusNotModified || w.Body.Len() != 0 || store.opened != 2 {
+		t.Fatalf("revalidation opened storage or wrote a body: status=%d opens=%d", w.Code, store.opened)
+	}
+	// An unchanged R2 asset must be stamped again after publication moves.
+	reg.Generation = strings.Repeat("b", 32)
+	s.publicDeliveryCurrent = reg.Generation
+	w = request("identity", etag)
+	if w.Code != http.StatusOK || etag == w.Header().Get("ETag") || store.opened != 3 {
+		t.Fatalf("new generation reused old manifest: status=%d opens=%d", w.Code, store.opened)
+	}
+}
+
+type deliveryCurrentTestStore struct {
+	globalDeliveryMapStore
+	registryOpens int
+}
+
+func (s *deliveryCurrentTestStore) Head(ctx context.Context, key string) (r2.ObjectHead, error) {
+	head, err := s.globalDeliveryMapStore.Head(ctx, key)
+	sum := sha256.Sum256(s.globalDeliveryMapStore[key])
+	head.ETag = hex.EncodeToString(sum[:])
+	return head, err
+}
+
+func (s *deliveryCurrentTestStore) OpenExact(ctx context.Context, key, etag, version string) (io.ReadCloser, error) {
+	s.registryOpens++
+	return s.globalDeliveryMapStore.OpenExact(ctx, key, etag, version)
+}
+
+func TestPublicGlobalDeliveryColdRegistryUsesFenceConnection(t *testing.T) {
+	db := cleanupTestPool(t)
+	cfg := db.Config()
+	cfg.MaxConns = 1
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	reg := globalDeliveryTestRegistry()
+	reg.Generation, reg.PublicDelivery, reg.SelectionScope = strings.Repeat("a", 32), true, "available"
+	asset := reg.Assets["/fixture.txt"]
+	reg.Assets = map[string]globalDeliveryObject{"/public/catalog.json": asset}
+	for _, object := range []globalDeliveryObject{asset, reg.Files["1"]} {
+		if _, err := db.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,$2,$3,'live_file')`, object.Key, object.ETag, object.SizeBytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := globalDeliveryPrefix + "public/current.json"
+	store := &deliveryCurrentTestStore{globalDeliveryMapStore: globalDeliveryMapStore{key: raw}}
+	s := &Server{globalDeliveryStore: store, pool: pool}
+	first, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+	if err != nil {
+		t.Fatalf("cold load must complete with a single database connection: %v", err)
+	}
+
+	s.publicDeliveryCurrentAt = time.Time{}
+	next, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+	if err != nil || next != first || store.registryOpens != 1 {
+		t.Fatalf("unchanged current should reuse parsed registry: opens=%d err=%v", store.registryOpens, err)
+	}
+
+	if _, err := db.Exec(ctx, `ALTER TABLE delivery_keep_holds RENAME TO fixture_holds`); err != nil {
+		t.Fatal(err)
+	}
+	s.publicDeliveryCurrentAt = time.Time{}
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err == nil || store.registryOpens != 1 {
+		t.Fatalf("unchanged current skipped the unavailable hold check: opens=%d err=%v", store.registryOpens, err)
+	}
+
+	// A same-size publication with a different ETag still reloads.
+	if _, err := db.Exec(ctx, `ALTER TABLE fixture_holds RENAME TO delivery_keep_holds`); err != nil {
+		t.Fatal(err)
+	}
+	newGeneration := strings.Repeat("b", 32)
+	store.globalDeliveryMapStore[key] = bytes.Replace(raw, []byte(reg.Generation), []byte(newGeneration), 1)
+	next, err = s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+	if err != nil || next.Generation != newGeneration || store.registryOpens != 2 {
+		t.Fatalf("changed current must reload: opens=%d err=%v", store.registryOpens, err)
 	}
 }

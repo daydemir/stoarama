@@ -117,6 +117,11 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 	return s.loadGlobalDeliveryRegistryScope(ctx, false, "")
 }
 func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool, generation string) (*globalDeliveryRegistry, error) {
+	// Queue registry readers before checking out a database connection. Only
+	// the reader holding the mutex needs a fence transaction.
+	s.globalDeliveryMu.Lock()
+	defer s.globalDeliveryMu.Unlock()
+	var keepQuerier deliveryKeepQuerier
 	// While cleanup permits can be outstanding, serve only the operator-pinned
 	// public generation (gss_public_generation_pin, 0268). A direct registry
 	// publication cannot introduce a new protected source midway through a
@@ -127,6 +132,7 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			return nil, errors.New("public cleanup fence unavailable")
 		}
 		defer fence.Rollback(ctx)
+		keepQuerier = fence
 		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
 			return nil, errors.New("public cleanup fence unavailable")
 		}
@@ -146,8 +152,6 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 			generation = *pinned
 		}
 	}
-	s.globalDeliveryMu.Lock()
-	defer s.globalDeliveryMu.Unlock()
 	if public {
 		fresh := generation == "" && time.Since(s.publicDeliveryCurrentAt) < 15*time.Second
 		want := generation
@@ -183,25 +187,20 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	if err != nil || head.SizeBytes <= 0 || head.SizeBytes > 64<<20 {
 		return nil, errors.New("dataset registry unavailable")
 	}
-	body, err := store.OpenExact(ctx, key, head.ETag, head.VersionID)
-	if err != nil {
-		return nil, errors.New("dataset registry changed")
+	var result *globalDeliveryRegistry
+	if public && generation == "" && head.ETag != "" && head == s.publicDeliveryCurrentHead {
+		for _, cached := range s.publicDeliveryRegistries {
+			if cached.Generation == s.publicDeliveryCurrent {
+				result = cached
+				break
+			}
+		}
 	}
-	defer body.Close()
-	bytes, err := readGlobalDeliveryExact(body, head.SizeBytes)
-	if err != nil {
-		return nil, errors.New("dataset registry length differs")
-	}
-	bytes, err = decodeGlobalDeliveryRegistry(bytes)
-	if err != nil {
-		return nil, err
-	}
-	var result globalDeliveryRegistry
-	if err = json.Unmarshal(bytes, &result); err != nil {
-		return nil, errors.New("dataset registry unreadable")
-	}
-	if err = validateGlobalDeliveryRegistry(&result); err != nil {
-		return nil, err
+	if result == nil {
+		result, err = readGlobalDeliveryRegistry(ctx, store, key, head)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if public {
 		if !result.PublicDelivery || result.SelectionScope != "available" || (generation != "" && result.Generation != generation) {
@@ -223,18 +222,43 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 				return nil, err
 			}
 		}
-		if s.pool != nil {
-			if err := RequireDeliveryKeep(ctx, s.pool, keep); err != nil {
+		if keepQuerier != nil {
+			if err := RequireDeliveryKeep(ctx, keepQuerier, keep); err != nil {
 				return nil, err
 			}
 		}
 		if generation == "" {
 			s.publicDeliveryCurrent, s.publicDeliveryCurrentAt = result.Generation, time.Now()
+			s.publicDeliveryCurrentHead = head
 		}
-		s.cachePublicDeliveryRegistry(&result)
+		s.cachePublicDeliveryRegistry(result)
 	} else {
-		s.globalDeliveryRegistry = &result
+		s.globalDeliveryRegistry = result
 		s.globalDeliveryRegistryAt = time.Now()
+	}
+	return result, nil
+}
+
+func readGlobalDeliveryRegistry(ctx context.Context, store globalDeliveryObjectStore, key string, head r2.ObjectHead) (*globalDeliveryRegistry, error) {
+	body, err := store.OpenExact(ctx, key, head.ETag, head.VersionID)
+	if err != nil {
+		return nil, errors.New("dataset registry changed")
+	}
+	defer body.Close()
+	raw, err := readGlobalDeliveryExact(body, head.SizeBytes)
+	if err != nil {
+		return nil, errors.New("dataset registry length differs")
+	}
+	raw, err = decodeGlobalDeliveryRegistry(raw)
+	if err != nil {
+		return nil, err
+	}
+	var result globalDeliveryRegistry
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, errors.New("dataset registry unreadable")
+	}
+	if err := validateGlobalDeliveryRegistry(&result); err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
@@ -281,7 +305,7 @@ func readGlobalDeliveryExact(body io.Reader, size int64) ([]byte, error) {
 // fully decoded tree (a 4,000-output manifest decoded into map[string]any
 // allocated ~59 MB per request).
 // scriptSHA is empty when the generation has no download script.
-func writeGlobalDeliveryManifest(w http.ResponseWriter, data []byte, generation, scriptSHA, contentType string) {
+func writeGlobalDeliveryManifest(w http.ResponseWriter, r *http.Request, data []byte, generation, scriptSHA, contentType, etag string) {
 	var manifest map[string]json.RawMessage
 	if json.Unmarshal(data, &manifest) != nil {
 		util.WriteError(w, http.StatusConflict, "Manifest payload invalid.")
@@ -295,45 +319,44 @@ func writeGlobalDeliveryManifest(w http.ResponseWriter, data []byte, generation,
 	outputs, hasOutputs := manifest["outputs"]
 	delete(manifest, "outputs")
 	rest, _ := json.Marshal(manifest) // never "{}": it holds generation
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	writer, closeStream := startGlobalDeliveryAsset(w, r, contentType, etag)
+	defer closeStream()
 	if !hasOutputs {
-		_, _ = w.Write(rest)
+		_, _ = writer.Write(rest)
 		return
 	}
-	_, _ = io.WriteString(w, `{"outputs":`)
+	_, _ = io.WriteString(writer, `{"outputs":`)
 	list := json.NewDecoder(bytes.NewReader(outputs))
 	if open, _ := list.Token(); open != json.Delim('[') {
-		_, _ = w.Write(outputs)
+		_, _ = writer.Write(outputs)
 	} else {
 		stamp := append([]byte(`"delivery_generation":`), stamped...)
-		_, _ = io.WriteString(w, "[")
+		_, _ = io.WriteString(writer, "[")
 		for i := 0; list.More(); i++ {
 			var output json.RawMessage
 			if list.Decode(&output) != nil {
 				return
 			}
 			if i > 0 {
-				_, _ = io.WriteString(w, ",")
+				_, _ = io.WriteString(writer, ",")
 			}
 			if output[0] != '{' {
-				_, _ = w.Write(output)
+				_, _ = writer.Write(output)
 				continue
 			}
 			body := bytes.TrimSpace(output[1 : len(output)-1])
-			_, _ = io.WriteString(w, "{")
+			_, _ = io.WriteString(writer, "{")
 			if len(body) > 0 {
-				_, _ = w.Write(body)
-				_, _ = io.WriteString(w, ",")
+				_, _ = writer.Write(body)
+				_, _ = io.WriteString(writer, ",")
 			}
-			_, _ = w.Write(stamp)
-			_, _ = io.WriteString(w, "}")
+			_, _ = writer.Write(stamp)
+			_, _ = io.WriteString(writer, "}")
 		}
-		_, _ = io.WriteString(w, "]")
+		_, _ = io.WriteString(writer, "]")
 	}
-	_, _ = io.WriteString(w, ",")
-	_, _ = w.Write(rest[1:])
+	_, _ = io.WriteString(writer, ",")
+	_, _ = writer.Write(rest[1:])
 }
 
 func writeGlobalDeliveryRegistryError(w http.ResponseWriter, err error, unavailable string) {
@@ -376,6 +399,39 @@ func (s *Server) handleGlobalDeliveryStatic(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	_, _ = w.Write(data)
 }
+
+// startGlobalDeliveryAsset is called after verification. Keep the original
+// representation for clients that request it, including the download tool.
+func startGlobalDeliveryAsset(w http.ResponseWriter, r *http.Request, contentType, etag string) (io.Writer, func()) {
+	h := w.Header()
+	h.Set("Content-Type", contentType)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "private, no-store")
+	if etag != "" {
+		h.Set("Cache-Control", "private, no-cache")
+		h.Set("ETag", etag)
+		h.Set("Vary", "Accept-Encoding")
+	}
+	if kind, _, _ := mime.ParseMediaType(contentType); etag != "" && kind == "application/json" {
+		for _, value := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+			coding, params, err := mime.ParseMediaType(value)
+			if err != nil || coding != "gzip" {
+				continue
+			}
+			if q, ok := params["q"]; ok {
+				weight, err := strconv.ParseFloat(q, 64)
+				if err != nil || !(weight > 0 && weight <= 1) {
+					break
+				}
+			}
+			h.Set("Content-Encoding", "gzip")
+			zw, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
+			return zw, func() { _ = zw.Close() }
+		}
+	}
+	return w, func() {}
+}
+
 func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Request) {
 	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
 	if !public && !authorizeGlobalDelivery(w, r) {
@@ -395,6 +451,26 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 	// Keep only these past this point so a waiting or streaming request never
 	// pins an evicted registry in memory.
 	generation, scriptSHA := registry.Generation, registry.Assets["/download-script.py"].SHA256
+	manifest := public && (strings.HasPrefix(name, "/api/coverage-delivery/manifest?") || (strings.HasPrefix(name, "/public/manifest/") && strings.HasSuffix(name, ".json")))
+	var etag string
+	if public {
+		identity := object.ContentType + ":" + object.SHA256
+		if manifest {
+			// The served bytes also include the generation and tool digest.
+			identity += ":manifest-v1:" + generation + ":" + scriptSHA
+		}
+		etag = fmt.Sprintf(`W/"%x"`, sha256.Sum256([]byte(identity)))
+		for _, value := range strings.Split(r.Header.Get("If-None-Match"), ",") {
+			if strings.TrimPrefix(strings.TrimSpace(value), "W/") == etag[2:] {
+				h := w.Header()
+				h.Set("ETag", etag)
+				h.Set("Cache-Control", "private, no-cache")
+				h.Set("Vary", "Accept-Encoding")
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+	}
 	select {
 	case globalDeliveryAssetSlots <- struct{}{}:
 		defer func() { <-globalDeliveryAssetSlots }()
@@ -413,14 +489,13 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusConflict, "Dataset asset verification failed.")
 		return
 	}
-	if public && (strings.HasPrefix(name, "/api/coverage-delivery/manifest?") || (strings.HasPrefix(name, "/public/manifest/") && strings.HasSuffix(name, ".json"))) {
-		writeGlobalDeliveryManifest(w, data, generation, scriptSHA, object.ContentType)
+	if manifest {
+		writeGlobalDeliveryManifest(w, r, data, generation, scriptSHA, object.ContentType, etag)
 		return
 	}
-	w.Header().Set("Content-Type", object.ContentType)
-	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	_, _ = w.Write(data)
+	writer, closeStream := startGlobalDeliveryAsset(w, r, object.ContentType, etag)
+	defer closeStream()
+	_, _ = writer.Write(data)
 }
 func globalDeliveryFileID(r *http.Request) string {
 	id := chi.URLParam(r, "fileID")

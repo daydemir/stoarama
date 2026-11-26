@@ -157,8 +157,10 @@ func TestGlobalDeliveryMemoryBudget(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/metadata?generation="+gen+"&path="+url.QueryEscape(memoryTestManifestPath), nil)
+	req.Header.Set("Accept-Encoding", "gzip")
 	alloc = totalAlloc()
-	s.handleGlobalDeliveryAsset(w, httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/metadata?generation="+gen+"&path="+url.QueryEscape(memoryTestManifestPath), nil))
+	s.handleGlobalDeliveryAsset(w, req)
 	manifestAlloc := totalAlloc() - alloc - uint64(w.Body.Cap())
 	if w.Code != http.StatusOK {
 		t.Fatalf("manifest %d %s", w.Code, w.Body.String())
@@ -177,7 +179,12 @@ func TestGlobalDeliveryMemoryBudget(t *testing.T) {
 	for _, o := range want["outputs"].([]any) {
 		o.(map[string]any)["delivery_generation"] = gen
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || !reflect.DeepEqual(got, want) {
+	compressed, err := gzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compressed.Close()
+	if err := json.NewDecoder(compressed).Decode(&got); err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("rewritten manifest differs: %v", err)
 	}
 }
@@ -190,13 +197,13 @@ func TestGlobalDeliveryManifestRewriteEdgeShapes(t *testing.T) {
 		{`{"schema":2}`, "", `{"generation":"g","schema":2}`},
 	} {
 		w := httptest.NewRecorder()
-		writeGlobalDeliveryManifest(w, []byte(c.in), "g", c.script, "application/json")
+		writeGlobalDeliveryManifest(w, httptest.NewRequest(http.MethodGet, "/", nil), []byte(c.in), "g", c.script, "application/json", "")
 		if w.Body.String() != c.want {
 			t.Fatalf("%s:\n got %s\nwant %s", c.in, w.Body.String(), c.want)
 		}
 	}
 	w := httptest.NewRecorder()
-	writeGlobalDeliveryManifest(w, []byte(`{"outputs":[`), "g", "", "application/json")
+	writeGlobalDeliveryManifest(w, httptest.NewRequest(http.MethodGet, "/", nil), []byte(`{"outputs":[`), "g", "", "application/json", "")
 	if w.Code != http.StatusConflict {
 		t.Fatal("invalid manifest served", w.Code)
 	}
