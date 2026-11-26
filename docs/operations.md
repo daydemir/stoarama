@@ -422,6 +422,25 @@ NAS copy (`joined/<nas_relative_path>`); `nas_restore_admitted` is the one gate
 for both kinds. Only a NAS client that sends `output_restores` leases these. A
 verified output changes no catalog or retirement row.
 
+Migration 0272 adds read-only stream-day NAS inventories and a third restore
+gate. `stoaramactl nas-day-inventory request --days-file TSV --label L
+[--recording-ids ...]` queues one unit per (recording_id, local_date) row,
+all or none. Only the `r2-copy-v8-inventory` client leases a unit. It lists that
+stream's day directories read-only: the folders its pinned folder map assigns
+the stream, in the flat, plaza and joined layouts, plus the directories of the
+catalog's clips for that day. It reports each media file's path, size, mtime and
+the sha256 of the bytes it read. The API matches a raw file to a clip of that
+recording and day by name and size, one to one; an ambiguous match stays
+unmatched. `status --label L` prints per-day found raw, found joined, matched,
+matched with the catalogued sha256, and unmatched. A match with the catalogued
+sha256 counts as NAS-verified for `nas-restore request` only, purged or not and
+whatever its stream's Keep Everything pin: `nas_restore_inventoried_original`
+admits an 'original' restore to the clip's own key from the path the unit read.
+The PUT is create-only, so an existing object is re-hashed and never overwritten.
+Matches are never written to `nas_inventory_files`. That ledger is the client's
+sidecar-backed evidence, which cleanup, retirement and the cleanup runner's
+final check read as exact-path proof. `cancel --label L` withdraws the scope.
+
 ## R2 writer readiness reconciliation
 
 Migration0198 separates the retirement consumer's `r2_retirement_writes_blocked`

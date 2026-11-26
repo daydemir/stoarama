@@ -28,6 +28,9 @@ import (
 // own object key and is only allowed for purged clips; --test-prefix writes a
 // disposable copy under nas-restore-test/<label>/ that the API deletes once it
 // is verified, which measures restore throughput without touching live keys.
+// A clip a completed stream-day inventory matched (nas-day-inventory) is queued
+// as an 'original' from the path where the inventory read its exact bytes,
+// purged or not: the PUT is create-only.
 // --output-ids-file queues 'output' restores of stitched outputs: each writes
 // the output's own key from the NAS copy the connection acknowledged, and is
 // leased only while the controller keeps the output in nas_restore_output_scope.
@@ -194,6 +197,18 @@ type nasRestoreCandidate struct {
 	ConnectionID  int64
 	NASVerified   bool
 	NASConnection int
+	// InventoriedPath is where a completed stream-day inventory read the
+	// clip's exact bytes (nas_restore_inventoried_original), or "". It counts
+	// as NAS verification for the restore only.
+	InventoriedPath string
+}
+
+// sourcePath is the NAS path the restore reads.
+func (c nasRestoreCandidate) sourcePath() string {
+	if c.InventoriedPath != "" {
+		return c.InventoriedPath
+	}
+	return c.DisplayPath
 }
 
 // classifyNASRestoreCandidate returns "" when the clip may be queued.
@@ -207,11 +222,11 @@ func classifyNASRestoreCandidate(c nasRestoreCandidate, bucket string, test bool
 		return "clip_identity_incomplete"
 	case c.SizeBytes > r2.MaxConditionalPutBytes:
 		return "too_large"
-	case !c.NASVerified:
+	case !c.NASVerified && c.InventoriedPath == "":
 		return "nas_unverified"
 	case !test && (!c.Managed || c.Bucket != bucket):
 		return "not_managed_storage"
-	case !test && !c.Purged:
+	case !test && !c.Purged && c.InventoriedPath == "":
 		return "not_purged"
 	}
 	return ""
@@ -229,7 +244,9 @@ SELECT c.id, c.recording_id, COALESCE(c.object_key,''), COALESCE(c.display_path,
        EXISTS(SELECT 1 FROM nas_inventory_files n
               WHERE n.connection_id=conn.id AND n.clip_id=c.id AND n.state='present'
                 AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes AND n.relative_path=c.display_path),
-       (SELECT count(*) FROM connections k WHERE k.account_id=rec.account_id AND k.kind='nas_pull')
+       (SELECT count(*) FROM connections k WHERE k.account_id=rec.account_id AND k.kind='nas_pull'),
+       COALESCE((SELECT min(f.relative_path) FROM nas_day_inventory_files f WHERE f.clip_id=c.id
+                 AND nas_restore_inventoried_original('original',conn.id,c.id,c.object_key,c.size_bytes,lower(c.sha256),f.relative_path)),'')
 FROM recording_clips c
 JOIN recordings rec ON rec.id=c.recording_id
 LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id
@@ -267,7 +284,7 @@ func loadNASRestoreCandidates(ctx context.Context, q interface {
 	for rows.Next() {
 		var c nasRestoreCandidate
 		if err := rows.Scan(&c.ClipID, &c.RecordingID, &c.ObjectKey, &c.DisplayPath, &c.ContentType, &c.SizeBytes, &c.SHA256,
-			&c.Purged, &c.Bucket, &c.Managed, &c.ConnectionID, &c.NASVerified, &c.NASConnection); err != nil {
+			&c.Purged, &c.Bucket, &c.Managed, &c.ConnectionID, &c.NASVerified, &c.NASConnection, &c.InventoriedPath); err != nil {
 			return nil, fmt.Errorf("scan restore candidate: %w", err)
 		}
 		out = append(out, c)
@@ -373,7 +390,7 @@ func nasRestoreQueueRows(ctx context.Context, tx pgx.Tx, bucket string, opts nas
 		}
 		out = append(out, nasRestoreQueueRow{skip: classifyNASRestoreCandidate(c, bucket, opts.test), what: fmt.Sprintf("clip %d", c.ClipID),
 			connectionID: c.ConnectionID, clipID: c.ClipID, recordingID: c.RecordingID, sizeBytes: c.SizeBytes,
-			key: key, sourceKey: c.ObjectKey, relativePath: c.DisplayPath, ctype: c.ContentType, sha256: c.SHA256})
+			key: key, sourceKey: c.ObjectKey, relativePath: c.sourcePath(), ctype: c.ContentType, sha256: c.SHA256})
 	}
 	return out, nil
 }

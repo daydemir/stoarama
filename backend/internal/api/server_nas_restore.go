@@ -28,14 +28,18 @@ import (
 // back to its own key too.
 //
 // stoaramactl nas-restore request queues rows in nas_restore_requests. A row
-// is restorable only when nas_restore_admitted holds (migrations 0260, 0263):
+// is restorable only when nas_restore_admitted holds (migrations 0260, 0263, 0272):
 //   - target 'original': the purged clip's own object key, size, sha256 and
 //     NAS path, and the clip's stream pinned keep_everything in
 //     nas_media_keep20_windows (the manifest cleanupEmbeddedPolicy embeds);
 //   - target 'output': an output the controller put in
 //     nas_restore_output_scope, with its own key, size and sha256 and the
 //     joined/ path of this connection's acknowledged copy of those bytes. Only
-//     clients that declare output_restores lease these.
+//     clients that declare output_restores lease these;
+//   - target 'original' of a clip a completed stream-day inventory of this
+//     connection matched (0272): the clip's own key, size and sha256, read
+//     from the path where the inventory found exactly those bytes, purged or
+//     not and whatever its stream's Keep Everything pin.
 // Every other row stays as it is: never leased, requeued, verified or canceled
 // here, and its report is refused with 409 before any verification, unpurge or
 // row transition. Test restores stay retired. A clip under a NAS cleanup hold
@@ -322,7 +326,7 @@ func (s *Server) handleAccountConnectionRestoreResult(w http.ResponseWriter, r *
 		return
 	}
 	if !admitted {
-		util.WriteError(w, http.StatusConflict, "only Keep Everything original and scoped output restores are live; this request is preserved")
+		util.WriteError(w, http.StatusConflict, "only Keep Everything original, scoped output and inventoried original restores are live; this request is preserved")
 		return
 	}
 	if err := validateNASRestoreResult(req, row.SizeBytes, now); err != nil {

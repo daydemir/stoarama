@@ -73,6 +73,19 @@ func TestClassifyNASRestoreCandidate(t *testing.T) {
 	if got := classifyNASRestoreCandidate(live, "stoarama", true); got != "" {
 		t.Fatalf("test restore of a live clip classified %q", got)
 	}
+	// A stream-day inventory's exact match is verified for the restore, purged
+	// or not, and is read from where the inventory found it.
+	inventoried := ok
+	inventoried.NASVerified, inventoried.Purged, inventoried.InventoriedPath = false, false, "plaza/September/25-Friday/b.mp4"
+	if got := classifyNASRestoreCandidate(inventoried, "stoarama", false); got != "" || inventoried.sourcePath() != "plaza/September/25-Friday/b.mp4" {
+		t.Fatalf("inventoried clip classified %q from %q", got, inventoried.sourcePath())
+	}
+	if inventoried.Bucket = "other"; classifyNASRestoreCandidate(inventoried, "stoarama", false) != "not_managed_storage" {
+		t.Fatal("inventoried clip in foreign storage queued")
+	}
+	if ok.sourcePath() != "a/b.mp4" {
+		t.Fatalf("verified clip reads %q", ok.sourcePath())
+	}
 	if got := nasRestoreTestKey("rt-1", 9, "x/y/z.mp4"); got != "nas-restore-test/rt-1/9/z.mp4" {
 		t.Fatalf("test key %q", got)
 	}
@@ -97,8 +110,11 @@ UPDATE recording_clips SET purged_at=now() WHERE id IN (1,2,7);`); err != nil {
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatalf("apply 0157: %v", err)
 	}
-	// 0263's column; its gate needs the full schema (see the output test).
-	if _, err := pool.Exec(ctx, `ALTER TABLE nas_restore_requests ADD COLUMN output_id bigint`); err != nil {
+	// 0263's column and 0272's inventory scope; their gates need the full
+	// schema (see the output and stream-day inventory tests). Nothing here is inventoried.
+	if _, err := pool.Exec(ctx, `ALTER TABLE nas_restore_requests ADD COLUMN output_id bigint;
+CREATE TABLE nas_day_inventory_files(clip_id bigint, relative_path text);
+CREATE FUNCTION nas_restore_inventoried_original(text,bigint,bigint,text,bigint,text,text) RETURNS boolean LANGUAGE sql AS 'SELECT false'`); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()
