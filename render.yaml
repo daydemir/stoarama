@@ -81,6 +81,9 @@ services:
       go build -o bin/stoaramactl ./cmd/stoaramactl
       bash ./scripts/install-pinned-media-tools.sh
     startCommand: ./bin/stoarama-api
+    # Render routes traffic to a new or restarted instance only after this
+    # returns 200, and restarts an instance that stops answering it.
+    healthCheckPath: /healthz
     # Fail a new release before cutover if legacy/stale recorder identity data
     # would make a live cloud recorder unable to authenticate. The currently
     # healthy API instance remains serving if this check fails.
@@ -92,6 +95,11 @@ services:
           property: connectionString
       - key: AUTO_MIGRATE
         value: "true"
+      # Starter instances are killed at 512Mi. A soft Go heap limit makes the
+      # GC collect before that instead of letting garbage double the heap;
+      # the rest is headroom for ffmpeg probes and non-heap memory.
+      - key: GOMEMLIMIT
+        value: 400MiB
       - key: R2_ACCOUNT_ID
         sync: false
       - key: R2_ACCESS_KEY_ID

@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -147,14 +148,18 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	}
 	s.globalDeliveryMu.Lock()
 	defer s.globalDeliveryMu.Unlock()
-	if public && generation != "" && s.publicGlobalDeliveryRegistry != nil && s.publicGlobalDeliveryRegistry.Generation == generation {
-		return s.publicGlobalDeliveryRegistry, nil
-	}
-	if public && generation != "" && s.publicPinnedDeliveryRegistry != nil && s.publicPinnedDeliveryRegistry.Generation == generation {
-		return s.publicPinnedDeliveryRegistry, nil
-	}
-	if public && generation == "" && s.publicGlobalDeliveryRegistry != nil && time.Since(s.publicGlobalDeliveryRegistryAt) < 15*time.Second {
-		return s.publicGlobalDeliveryRegistry, nil
+	if public {
+		fresh := generation == "" && time.Since(s.publicDeliveryCurrentAt) < 15*time.Second
+		want := generation
+		if fresh {
+			want = s.publicDeliveryCurrent
+		}
+		for i, cached := range s.publicDeliveryRegistries {
+			if (generation != "" || fresh) && cached.Generation == want {
+				s.publicDeliveryRegistries[0], s.publicDeliveryRegistries[i] = cached, s.publicDeliveryRegistries[0]
+				return cached, nil
+			}
+		}
 	}
 	if !public && s.globalDeliveryRegistry != nil && time.Since(s.globalDeliveryRegistryAt) < 15*time.Second {
 		return s.globalDeliveryRegistry, nil
@@ -183,8 +188,8 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 		return nil, errors.New("dataset registry changed")
 	}
 	defer body.Close()
-	bytes, err := io.ReadAll(io.LimitReader(body, head.SizeBytes+1))
-	if err != nil || int64(len(bytes)) != head.SizeBytes {
+	bytes, err := readGlobalDeliveryExact(body, head.SizeBytes)
+	if err != nil {
 		return nil, errors.New("dataset registry length differs")
 	}
 	bytes, err = decodeGlobalDeliveryRegistry(bytes)
@@ -223,18 +228,114 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 				return nil, err
 			}
 		}
-		if generation != "" {
-			s.publicPinnedDeliveryRegistry = &result
-		} else {
-			s.publicGlobalDeliveryRegistry = &result
-			s.publicGlobalDeliveryRegistryAt = time.Now()
+		if generation == "" {
+			s.publicDeliveryCurrent, s.publicDeliveryCurrentAt = result.Generation, time.Now()
 		}
+		s.cachePublicDeliveryRegistry(&result)
 	} else {
 		s.globalDeliveryRegistry = &result
 		s.globalDeliveryRegistryAt = time.Now()
 	}
 	return &result, nil
 }
+
+// globalDeliveryAssetSlots bounds asset bodies held in memory at once: each is
+// verified whole before it is sent, so a burst of large manifest or growth.json
+// requests cannot add up past the instance's memory.
+var globalDeliveryAssetSlots = make(chan struct{}, 4)
+
+// publicDeliveryRegistryCacheSize bounds parsed public generations held in
+// memory: the served one plus one other (the cleanup pin, or the generation an
+// older tab or a running download command still names). A 55k-file registry
+// retains ~22 MB once parsed and allocates ~84 MB while loading.
+const publicDeliveryRegistryCacheSize = 2
+
+// cachePublicDeliveryRegistry puts reg first, replacing a same-generation entry
+// and evicting the least recently used one past the bound.
+func (s *Server) cachePublicDeliveryRegistry(reg *globalDeliveryRegistry) {
+	kept := []*globalDeliveryRegistry{reg}
+	for _, cached := range s.publicDeliveryRegistries {
+		if cached.Generation != reg.Generation && len(kept) < publicDeliveryRegistryCacheSize {
+			kept = append(kept, cached)
+		}
+	}
+	s.publicDeliveryRegistries = kept
+}
+
+// readGlobalDeliveryExact reads exactly size bytes into one allocation and fails
+// unless the body then ends cleanly (for gzip, that read also checks the CRC).
+func readGlobalDeliveryExact(body io.Reader, size int64) ([]byte, error) {
+	data := make([]byte, size)
+	if _, err := io.ReadFull(body, data); err != nil {
+		return nil, err
+	}
+	if n, err := body.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		return nil, errors.New("object length or checksum differs")
+	}
+	return data, nil
+}
+
+// writeGlobalDeliveryManifest writes a verified manifest stamped with its
+// serving generation. Outputs, the bulk of a manifest, are rewritten one at a
+// time straight to w, so a request holds ~2x the manifest bytes instead of a
+// fully decoded tree (a 4,000-output manifest decoded into map[string]any
+// allocated ~59 MB per request).
+// scriptSHA is empty when the generation has no download script.
+func writeGlobalDeliveryManifest(w http.ResponseWriter, data []byte, generation, scriptSHA, contentType string) {
+	var manifest map[string]json.RawMessage
+	if json.Unmarshal(data, &manifest) != nil {
+		util.WriteError(w, http.StatusConflict, "Manifest payload invalid.")
+		return
+	}
+	stamped, _ := json.Marshal(generation)
+	manifest["generation"] = stamped
+	if scriptSHA != "" {
+		manifest["download_script_sha256"], _ = json.Marshal(scriptSHA)
+	}
+	outputs, hasOutputs := manifest["outputs"]
+	delete(manifest, "outputs")
+	rest, _ := json.Marshal(manifest) // never "{}": it holds generation
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if !hasOutputs {
+		_, _ = w.Write(rest)
+		return
+	}
+	_, _ = io.WriteString(w, `{"outputs":`)
+	list := json.NewDecoder(bytes.NewReader(outputs))
+	if open, _ := list.Token(); open != json.Delim('[') {
+		_, _ = w.Write(outputs)
+	} else {
+		stamp := append([]byte(`"delivery_generation":`), stamped...)
+		_, _ = io.WriteString(w, "[")
+		for i := 0; list.More(); i++ {
+			var output json.RawMessage
+			if list.Decode(&output) != nil {
+				return
+			}
+			if i > 0 {
+				_, _ = io.WriteString(w, ",")
+			}
+			if output[0] != '{' {
+				_, _ = w.Write(output)
+				continue
+			}
+			body := bytes.TrimSpace(output[1 : len(output)-1])
+			_, _ = io.WriteString(w, "{")
+			if len(body) > 0 {
+				_, _ = w.Write(body)
+				_, _ = io.WriteString(w, ",")
+			}
+			_, _ = w.Write(stamp)
+			_, _ = io.WriteString(w, "}")
+		}
+		_, _ = io.WriteString(w, "]")
+	}
+	_, _ = io.WriteString(w, ",")
+	_, _ = w.Write(rest[1:])
+}
+
 func writeGlobalDeliveryRegistryError(w http.ResponseWriter, err error, unavailable string) {
 	if errors.Is(err, errGlobalDeliveryOutdatedGeneration) {
 		util.WriteError(w, http.StatusGone, err.Error())
@@ -291,40 +392,30 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 		http.NotFound(w, r)
 		return
 	}
+	// Keep only these past this point so a waiting or streaming request never
+	// pins an evicted registry in memory.
+	generation, scriptSHA := registry.Generation, registry.Assets["/download-script.py"].SHA256
+	select {
+	case globalDeliveryAssetSlots <- struct{}{}:
+		defer func() { <-globalDeliveryAssetSlots }()
+	case <-r.Context().Done():
+		return
+	}
 	body, err := s.globalDeliveryObjectStore().OpenExact(r.Context(), object.Key, object.ETag, object.VersionID)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "Dataset asset identity changed. Reload to retry.")
 		return
 	}
 	defer body.Close()
-	data, err := io.ReadAll(io.LimitReader(body, object.SizeBytes+1))
+	data, err := readGlobalDeliveryExact(body, object.SizeBytes)
 	sum := sha256.Sum256(data)
-	if err != nil || int64(len(data)) != object.SizeBytes || hex.EncodeToString(sum[:]) != object.SHA256 {
+	if err != nil || hex.EncodeToString(sum[:]) != object.SHA256 {
 		util.WriteError(w, http.StatusConflict, "Dataset asset verification failed.")
 		return
 	}
 	if public && (strings.HasPrefix(name, "/api/coverage-delivery/manifest?") || (strings.HasPrefix(name, "/public/manifest/") && strings.HasSuffix(name, ".json"))) {
-		var manifest map[string]any
-		if json.Unmarshal(data, &manifest) != nil {
-			util.WriteError(w, http.StatusConflict, "Manifest payload invalid.")
-			return
-		}
-		manifest["generation"] = registry.Generation
-		if script, ok := registry.Assets["/download-script.py"]; ok {
-			manifest["download_script_sha256"] = script.SHA256
-		}
-		if outputs, ok := manifest["outputs"].([]any); ok {
-			for _, entry := range outputs {
-				if output, ok := entry.(map[string]any); ok {
-					output["delivery_generation"] = registry.Generation
-				}
-			}
-		}
-		data, err = json.Marshal(manifest)
-		if err != nil {
-			util.WriteError(w, http.StatusConflict, "Manifest generation unavailable.")
-			return
-		}
+		writeGlobalDeliveryManifest(w, data, generation, scriptSHA, object.ContentType)
+		return
 	}
 	w.Header().Set("Content-Type", object.ContentType)
 	w.Header().Set("Cache-Control", "private, no-store")
@@ -484,8 +575,14 @@ func decodeGlobalDeliveryRegistry(raw []byte) ([]byte, error) {
 		return nil, errors.New("dataset registry compression invalid")
 	}
 	defer reader.Close()
-	decoded, err := io.ReadAll(io.LimitReader(reader, (64<<20)+1))
-	if err != nil || len(decoded) > 64<<20 {
+	// The gzip trailer records the decoded size; reading into one exact buffer
+	// avoids io.ReadAll's doubling copies of a ~30 MB registry.
+	size := binary.LittleEndian.Uint32(raw[len(raw)-4:])
+	if size > 64<<20 {
+		return nil, errors.New("dataset registry decompression failed")
+	}
+	decoded, err := readGlobalDeliveryExact(reader, int64(size))
+	if err != nil {
 		return nil, errors.New("dataset registry decompression failed")
 	}
 	return decoded, nil

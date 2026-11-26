@@ -213,7 +213,7 @@ func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
 	reg.Assets["/public/catalog.json"] = reg.Assets["/fixture.txt"]
 	delete(reg.Assets, "/fixture.txt")
 	m := &globalDeliveryTestStore{body: []byte("hello")}
-	s := &Server{globalDeliveryStore: m, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now()}
+	s := &Server{globalDeliveryStore: m, publicDeliveryRegistries: []*globalDeliveryRegistry{reg}, publicDeliveryCurrentAt: time.Now()}
 	w := httptest.NewRecorder()
 	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/public/catalog.json", "", nil))
 	if w.Code != 200 {
@@ -259,7 +259,7 @@ func TestPublicGlobalDeliveryEncodedFileIDThroughRouter(t *testing.T) {
 	delete(reg.Files, "1")
 	reg.Files["sha256:"+file.SHA256] = file
 	store := &globalDeliveryTestStore{body: []byte("hello")}
-	s := &Server{globalDeliveryStore: store, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now()}
+	s := &Server{globalDeliveryStore: store, publicDeliveryRegistries: []*globalDeliveryRegistry{reg}, publicDeliveryCurrentAt: time.Now()}
 	router := chi.NewRouter()
 	router.Get(publicGlobalDeliveryAPI+"/ticket/{fileID}", s.handleGlobalDeliveryTicket)
 	for _, tc := range []struct {
