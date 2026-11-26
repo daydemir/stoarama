@@ -418,3 +418,58 @@ func TestPublicGlobalDeliveryColdRegistryUsesFenceConnection(t *testing.T) {
 		t.Fatalf("changed current must reload: opens=%d err=%v", store.registryOpens, err)
 	}
 }
+
+func TestPublicGlobalDeliveryColdRegistryConcurrentSmallPool(t *testing.T) {
+	db := cleanupTestPool(t)
+	cfg := db.Config()
+	cfg.MaxConns = 2
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	held, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+
+	reg := globalDeliveryTestRegistry()
+	reg.Generation, reg.PublicDelivery, reg.SelectionScope = strings.Repeat("a", 32), true, "available"
+	asset := reg.Assets["/fixture.txt"]
+	reg.Assets = map[string]globalDeliveryObject{"/public/catalog.json": asset}
+	for _, object := range []globalDeliveryObject{asset, reg.Files["1"]} {
+		if _, err := db.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,$2,$3,'live_file')`, object.Key, object.ETag, object.SizeBytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &deliveryCurrentTestStore{globalDeliveryMapStore: globalDeliveryMapStore{globalDeliveryPrefix + "public/current.json": raw}}
+	s := &Server{globalDeliveryStore: store, pool: pool}
+
+	const readers = 64
+	start := make(chan struct{})
+	errs := make(chan error, readers)
+	for range readers {
+		go func() {
+			<-start
+			_, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+			errs <- err
+		}()
+	}
+	began := time.Now()
+	close(start)
+	for range readers {
+		if err := <-errs; err != nil {
+			t.Fatalf("cold public registry load starved with one of two connections held after %s: %v", time.Since(began), err)
+		}
+	}
+	if elapsed := time.Since(began); elapsed > 5*time.Second {
+		t.Fatalf("%d cold public registry loads took %s", readers, elapsed)
+	}
+}
