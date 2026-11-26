@@ -44,6 +44,10 @@ OUTCOMES = {'deleted', 'failed', 'skipped_protected', 'skipped_changed'}
 FINAL = OUTCOMES - {'failed'}  # a failed DELETE may still have removed the object
 ABSENT = 'absent_from_fresh_listing'
 CHUNK = 5000
+# Rows per catalog statement (source lookup, receipt dry run). One literal of every
+# row of a 293k-key backfill dropped the production connection; each statement's
+# checks are per row, so splitting changes no result.
+ROWS_PER_STATEMENT = 5000
 
 
 class Mode(enum.Enum):
@@ -103,6 +107,10 @@ def psql(cfg, args, *, read_only, script=None, cwd=None):
     res = subprocess.run([cfg.psql, '-XqAt', '-v', 'ON_ERROR_STOP=1'] + args, input=script or '', cwd=cwd,
                          env=e, capture_output=True, text=True)
     return res, (lambda s: s.replace(e['PGPASSWORD'], '[redacted]') if e['PGPASSWORD'] else s)
+
+
+def batches(rows):
+    return [rows[i:i + ROWS_PER_STATEMENT] for i in range(0, len(rows), ROWS_PER_STATEMENT)]
 
 
 def read_only_copy(cfg, sql, **literals):
@@ -169,7 +177,8 @@ def resolve_sources(cfg, manifest):
     """{key: receipt source} from the catalog, read-only; refuses any key it cannot account for."""
     bad = {k: 'no catalog kind for this prefix' for k in manifest if not kind_of(k)}
     found = {}
-    for key, kind, sid, stream, size, digest, etag in read_only_copy(cfg, SOURCES_SQL, keys=sorted(k for k in manifest if kind_of(k))):
+    rows = [row for keys in batches(sorted(k for k in manifest if kind_of(k))) for row in read_only_copy(cfg, SOURCES_SQL, keys=keys)]
+    for key, kind, sid, stream, size, digest, etag in rows:
         found.setdefault(key, []).append({'kind': kind, 'source_id': int(sid), 'stream_id': int(stream),
                                           'size': int(size), 'sha256': digest, 'etag': etag})
     sources = {}
@@ -309,23 +318,36 @@ def receipt_rows(deleted, manifest, sources, manifest_sha, policy_sha):
 
 
 def dry_run(cfg, W, tsv):
-    """dry-run.sql (plain read-only SELECTs) on receipt rows; any refusal stops. Returns
+    """dry-run.sql (plain read-only SELECTs) on receipt rows, ROWS_PER_STATEMENT rows per run;
+    any refusal stops. Every check is per row, so the merged output is the one-shot output:
+    the summary (action|kind|reasons|rows|bytes|raw_purged_at_updates) summed per group, then
+    every non-insert row (seq|action|reasons|kind|source_id|size) in seq order. Returns
     {action: rows}."""
     path = Path(W, 'preflight')
     path.mkdir(exist_ok=True)
-    durable_write(path / 'receipt-backfill.tsv', tsv)
-    res, redact = psql(cfg, ['-f', str(HERE / 'dry-run.sql')], read_only=True, cwd=path)
-    if res.returncode:
-        raise SystemExit('receipt preflight failed: ' + redact(res.stderr))
-    durable_write(path / 'dry-run.out', res.stdout)
-    blocked = [line for line in res.stdout.splitlines() if line.startswith('blocked|')]
+    summary, rows = {}, []
+    for part in batches(tsv.splitlines(keepends=True)):
+        durable_write(path / 'receipt-backfill.tsv', ''.join(part))
+        res, redact = psql(cfg, ['-f', str(HERE / 'dry-run.sql')], read_only=True, cwd=path)
+        if res.returncode:
+            raise SystemExit('receipt preflight failed: ' + redact(res.stderr))
+        for line in res.stdout.splitlines():
+            f = line.split('|')
+            if f[0].isdigit():
+                rows.append((int(f[0]), line))
+            else:
+                total = summary.setdefault(tuple(f[:3]), [0, 0, 0])
+                for i, n in enumerate(f[3:6]):
+                    total[i] += int(n)
+    durable_write(path / 'dry-run.out', ''.join('|'.join(k + tuple(map(str, v))) + '\n' for k, v in sorted(summary.items()))
+                  + ''.join(line + '\n' for _, line in sorted(rows)))
+    blocked = ['|'.join(k + tuple(map(str, v))) for k, v in sorted(summary.items()) if k[0] == 'blocked']
     if blocked:
         print('\n'.join(blocked), file=sys.stderr)
         raise SystemExit('the receipt path would refuse planned keys; see preflight/dry-run.out and remove them from the plan')
     actions = {}
-    for line in res.stdout.splitlines():
-        action, _, _, rows = line.split('|')[:4]
-        actions[action] = actions.get(action, 0) + int(rows)
+    for (action, _, _), (n, _, _) in summary.items():
+        actions[action] = actions.get(action, 0) + n
     return actions
 
 
