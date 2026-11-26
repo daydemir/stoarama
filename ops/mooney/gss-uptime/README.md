@@ -14,7 +14,7 @@ slower than `--slow-seconds` (default 10). Two consecutive down runs (about a
 minute) send one `darma msg send <agent>` alert, the same path and agent
 (`mooney`) as Rolly's finish dead-man. An unchanged outage reminds every six
 hours; a changed condition alerts again; the first passing run after an alert
-sends one recovery. A failed send is retried on the next run (exit 2).
+sends one recovery. A send is tried 3 times (waits 5 s, then 15 s); each failed try logs `rc` and a sanitized stderr tail to the probe log. If all fail, the next run retries (exit 2).
 
 Output is one line per run in `<state>/probe.log`: `probe ok` or
 `probe metadata=http_502 page=http_502`. State is `<state>/probe.json`.
