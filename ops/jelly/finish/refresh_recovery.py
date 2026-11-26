@@ -8,12 +8,19 @@ from pathlib import Path
 import subprocess
 from datetime import datetime
 import re
+import time
 
 from tick import notify
-from admission import Attempt, Latched, publish
+from admission import TRANSIENT_EXIT, Attempt, Latched, TransientFailure, publish, transient_record
 from cli_binding import bound_launcher
 
 FIELDS = ('plan_id', 'plan_sha256', 'delete_ever_issued', 'verified', 'problems', 'checked_at')
+# Three plan-source tries over about ten minutes inside one launchd run.
+RETRY_DELAYS = (120, 360)
+# Above the collector's own worst case (20 s snapshot wait, 5 s ps, 15 s API,
+# 25 s psql, 10 s probe). Running out latches: only the collector's own
+# classified exit-75 record holds.
+PLAN_SOURCE_TIMEOUT = 90
 
 
 def validate_checked_at(value):
@@ -28,6 +35,29 @@ def validate_checked_at(value):
     base, fraction, zone = match.groups()
     normalized = base + ('.' + fraction.ljust(6, '0')[:6] if fraction else '') + zone.replace('Z', '+00:00')
     datetime.fromisoformat(normalized)
+
+
+def select_plan(source):
+    result = subprocess.run([str(source)], capture_output=True, timeout=PLAN_SOURCE_TIMEOUT)
+    if result.returncode == TRANSIENT_EXIT:
+        raise TransientFailure(transient_record(json.loads(result.stdout), 'transient'))
+    result.check_returncode()
+    record = json.loads(result.stdout)
+    if not isinstance(record, dict):
+        raise ValueError('invalid plan source')
+    plan = record['plan_id']
+    if type(plan) is not int or plan <= 0:
+        raise ValueError('invalid plan')
+    return plan
+
+
+def select_plan_retrying(source):
+    for delay in RETRY_DELAYS:
+        try:
+            return select_plan(source)
+        except TransientFailure:
+            time.sleep(delay)
+    return select_plan(source)
 
 
 def main():
@@ -45,13 +75,7 @@ def main():
             args.state.mkdir(parents=True, exist_ok=True, mode=0o700)
             attempt = Attempt.start(args.state, 'recovery', stack)
             args.cli = bound_launcher(args.cli)
-            source = subprocess.run([str(args.plan_source)], capture_output=True, timeout=30, check=True)
-            source_record=json.loads(source.stdout)
-            if not isinstance(source_record,dict):
-                raise ValueError('invalid plan source')
-            plan = source_record['plan_id']
-            if type(plan) is not int or plan <= 0:
-                raise ValueError('invalid plan')
+            plan = select_plan_retrying(args.plan_source)
             publish(attempt.path / 'plan.json', {'plan_id': plan})
             # Keep potentially credential-bearing stderr and raw problem detail
             # out of logs and the published record. The CLI owns checked_at.
@@ -85,6 +109,19 @@ def main():
             if attempt.finish(reason, record):
                 return 0
             notify(args.notify_agent, reason or 'recovery_refresh_failed')
+            return 1
+        except TransientFailure as failure:
+            # No data, no finding: hold without latching or notifying. The old
+            # report is never restamped; its own 7 h limit still stops feeding
+            # and cleanup, and that stale stop alerts. The next run retries.
+            try:
+                if attempt.finish('', {}, held=True):
+                    print('finish recovery_transient_hold ' + failure.kind.value, flush=True)
+                    return TRANSIENT_EXIT
+            except Latched:
+                notify(args.notify_agent, 'admission_publication_failed')
+                return 1
+            notify(args.notify_agent, 'evidence_unavailable')
             return 1
         except Latched:
             if attempt is not None and attempt.abandoned:

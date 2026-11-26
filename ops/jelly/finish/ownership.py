@@ -4,13 +4,12 @@ from enum import Enum
 import fcntl
 import hashlib
 import json
-import os
-from pathlib import Path
 import re
 import subprocess
-import urllib.request
+import time
 
-from collector import timestamp, fresh, count, require, PLAN, PLAN_SHA, CLOSE_SHA, NAS_CLIENT_VERSIONS
+from collector import (timestamp, fresh, count, require, api_get, psql,
+                       PLAN, PLAN_SHA, CLOSE_SHA, NAS_CLIENT_VERSIONS)
 
 # The active cleanup plan binding. The owner manifest, its baseline plan and
 # every live plan it names must carry this digest; a keep28-bound owner is
@@ -27,6 +26,10 @@ class StopReason(str, Enum):
     # finish health is clean. D's admission latch stays the human gate.
     FINISH_ADMISSION_HOLD = 'finish_admission_hold'
 
+
+# The runner holds the snapshot lock only briefly. A longer wait is a wedged
+# runner, which latches; it is never a network transient.
+SNAPSHOT_WAIT_SECONDS = 20
 
 # Idle, execution-free boundaries. Failure containment is never one.
 IDLE_STOPS = frozenset((StopReason.NATURAL_BOUNDARY, StopReason.FINISH_ADMISSION_HOLD))
@@ -55,7 +58,13 @@ def owner_plan(status, owner):
     return pid
 
 
-def assemble_owned(status, owner, recovery, runner_report, api, db, now, running, selecting=False):
+def owned_api(api, pid):
+    require(api['id'] == pid and api['master_deletion_enabled'] is True)
+
+
+def owned_local(status, owner, recovery, runner_report, now, running, selecting):
+    """Every check on local evidence alone. It runs before any network call, so
+    a network failure can never hold over a local finding."""
     require(owner['schema'] == 'stoarama.cleanup-owner.v1'
             and re.fullmatch('[a-f0-9-]{36}', owner['owner_id'])
             and status['owner_id'] == owner['owner_id'])
@@ -68,16 +77,37 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
     if running:
         fresh(status['updated_at'], now)
     else:
-        require(status['phase'] in ('stopped', 'complete', 'day_complete') and db['enabled_plans'] == [])
+        require(status['phase'] in ('stopped', 'complete', 'day_complete'))
+    pid = owner_plan(status, owner)
+    if selecting:
+        return pid
+    checkpoint = status['recovery_plan_id']
+    # A D failure must dominate even when the runner has a newer success.
+    require('refresh_error' not in recovery and recovery['problems'] == 0
+            and recovery['verified'] == recovery['delete_ever_issued'])
+    prior = status['recovery_history'][str(recovery['plan_id'])]
+    require(prior['sha256'] == recovery['plan_sha256']
+            and prior['issued'] == recovery['delete_ever_issued'])
+    fresh(recovery['checked_at'], now, 7 * 3600)
+    report = recovery if recovery['plan_id'] == checkpoint else runner_report
+    require(report['plan_id'] == checkpoint and report['problems'] == 0
+            and count(report['delete_ever_issued']) == report['verified'])
+    fresh(report['checked_at'], now, 7 * 3600)
+    return pid
+
+
+def assemble_owned(status, owner, recovery, runner_report, api, db, now, running, selecting=False):
+    pid = owned_local(status, owner, recovery, runner_report, now, running, selecting)
+    if not running:
+        require(db['enabled_plans'] == [])
         if status['current_plan'] is not None:
             pending = db['plans'][str(status['current_plan'])]
             require(pending['mode'] == 'dry_run' and pending['issued'] == 0)
-    pid = owner_plan(status, owner)
     plan = db['plans'][str(pid)]
     checkpoint = status['recovery_plan_id']
     settled = db['plans'][str(checkpoint)]
-    require(api['id'] == pid and api['plan_sha256'] == plan['sha256']
-            and api['master_deletion_enabled'] is True)
+    owned_api(api, pid)
+    require(api['plan_sha256'] == plan['sha256'])
     require(plan['connection_id'] == 13 and plan['account_id'] == 47
             and plan['policy_sha256'] == owner['policy_sha256'] and not plan['allow_nas_only'])
     if checkpoint == PLAN:
@@ -101,22 +131,11 @@ def assemble_owned(status, owner, recovery, runner_report, api, db, now, running
         require(settled['sha256'] == status['recovery_history'][str(checkpoint)]['sha256']
                 and settled['issued'] == status['recovery_history'][str(checkpoint)]['issued'])
         return {'recovery_plan_id': checkpoint}
-    # A D failure must dominate even when the runner has a newer success.
-    require('refresh_error' not in recovery and recovery['problems'] == 0
-            and recovery['verified'] == recovery['delete_ever_issued'])
-    history = status['recovery_history']
-    prior = history[str(recovery['plan_id'])]
-    require(prior['sha256'] == recovery['plan_sha256']
-            and prior['issued'] == recovery['delete_ever_issued'])
-    fresh(recovery['checked_at'], now, 7 * 3600)
     require(timestamp(recovery['checked_at']) > timestamp(db['plans'][str(recovery['plan_id'])]['newest_issued_at']))
     report = recovery if recovery['plan_id'] == checkpoint else runner_report
-    require(report['plan_id'] == checkpoint and report['plan_sha256'] == settled['sha256']
-            and report['problems'] == 0
-            and count(report['delete_ever_issued']) == report['verified'] == settled['issued'])
-    require(checkpoint == status['recovery_plan_id'] and settled['mode'] in ('retired', 'paused', 'enabled'))
+    require(report['plan_sha256'] == settled['sha256'] and report['delete_ever_issued'] == settled['issued'])
+    require(settled['mode'] in ('retired', 'paused', 'enabled'))
     require(timestamp(report['checked_at']) > timestamp(settled['newest_issued_at']))
-    fresh(report['checked_at'], now, 7 * 3600)
     return dict(updated_at=now.isoformat(), recovery_problems=0,
                 recovery_checked_at=report['checked_at'], recovery_issued_items=report['delete_ever_issued'],
                 recovery_verified_items=report['verified'], recovery_plan_id=checkpoint,
@@ -136,7 +155,14 @@ def collect(root, repo, recovery_path, owner_sha256, now, plan_source=False):
     require(owner['finish_state'] == str(recovery_path.parent))
     require(digest((root / 'incident-recovery-1440-20261117/closed-verified.json').read_bytes()) == CLOSE_SHA)
     with (root / 'ownership.lock').open('a') as snapshot:
-        fcntl.flock(snapshot, fcntl.LOCK_SH)
+        deadline = time.monotonic() + SNAPSHOT_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(snapshot, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                require(time.monotonic() < deadline)
+                time.sleep(0.5)
         status = json.loads((root / 'status.json').read_bytes())
         try:
             stop = (root / 'STOP').read_bytes()
@@ -160,18 +186,12 @@ def collect(root, repo, recovery_path, owner_sha256, now, plan_source=False):
         recovery = None if plan_source else json.loads(recovery_path.read_bytes())
         checkpoint = status['recovery_plan_id']
         runner_report = None if plan_source else json.loads((root / ('recovery-' + str(checkpoint) + '.json')).read_bytes())
-        pid = owner_plan(status, owner)
+        pid = owned_local(status, owner, recovery, runner_report, datetime.now(timezone.utc), running, plan_source)
         ids = sorted(set([pid, checkpoint] + [int(k) for k in status['recovery_history']]))
         require(all(type(i) is int and i > 0 for i in ids))
-        req = urllib.request.Request('https://stoarama-api.onrender.com/api/v1/service/nas-cleanup/plans/' + str(pid),
-                headers={'Authorization': 'Bearer ' + os.environ['SERVICE_TOKEN'], 'User-Agent': 'stoarama-operator/1'})
-        with urllib.request.urlopen(req, timeout=15) as response:
-            raw = response.read(32 * 1024 * 1024 + 1)
-        require(len(raw) <= 32 * 1024 * 1024)
-        api = json.loads(raw)
-        import sys
-        sys.path.insert(0, str(repo / 'backend/scripts/nas-cleanup'))
-        from prepare_keep28_plans import pg_env
+        api = api_get('plans/' + str(pid))
+        # API-only contract first: a later DB failure must not mask an API mismatch.
+        owned_api(api, pid)
         query = """BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY;
 SET LOCAL ROLE stoarama; SET LOCAL statement_timeout='10s'; SET LOCAL lock_timeout='2s';
 SET LOCAL work_mem='16MB'; SET LOCAL max_parallel_workers_per_gather=0; SET LOCAL jit=off;
@@ -191,10 +211,7 @@ SELECT jsonb_build_object(
  'inventory_mismatches',inventory_mismatches,'replay_failed',(nas_cleanup_status->>'replay_failed')::bigint,
  'replay_pending',(nas_cleanup_status->>'replay_pending')::bigint,'r2_copy',nas_cleanup_status->'r2_copy')
  FROM connections WHERE id=13; ROLLBACK;""".replace('PLAN_IDS', ','.join(str(i) for i in ids))
-        result = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
-                                input=query, env=pg_env(), capture_output=True, text=True, timeout=25)
-        require(result.returncode == 0)
-        db = json.loads(result.stdout)
+        db = psql(repo, query)
         for old_id, old in status['recovery_history'].items():
             fact = db['plans'][old_id]
             require(fact['sha256'] == old['sha256'] and fact['issued'] == old['issued'])

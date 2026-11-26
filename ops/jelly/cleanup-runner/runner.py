@@ -7,6 +7,7 @@ and reducing"); every sweep re-reads the pinned 20-day manifest from origin/main
 """
 import argparse
 import base64
+import errno
 import fcntl
 import hashlib
 import html
@@ -17,6 +18,8 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -93,7 +96,7 @@ class Halt(Exception):
 
 
 class ReadFailure(Halt):
-    """A transient read error with a fixed, credential-free reason."""
+    """A transient failure of an idempotent read, with a fixed, credential-free reason. read() retries it."""
 
 
 class CommandFailed(Halt):
@@ -404,7 +407,23 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Halt('HTTP redirect refused')
 
 
+HTTP_TIMEOUT_SEC = 120
+PSQL_TIMEOUT_SEC = 330
 TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
+UNREACHABLE = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EHOSTDOWN}
+
+
+def network_transient(error):
+    """True for a failure that returned no data; mirrors ops/jelly/finish/collector.network_kind
+    except that a 4xx (429 included) never retries. TLS failures stop."""
+    if isinstance(error, urllib.error.HTTPError):
+        return 500 <= error.code <= 599
+    if isinstance(error, urllib.error.URLError):
+        error = error.reason
+    if isinstance(error, ssl.SSLError):
+        return False
+    return isinstance(error, (socket.gaierror, socket.timeout, TimeoutError, ConnectionError, http.client.IncompleteRead)) or (
+        isinstance(error, OSError) and error.errno in UNREACHABLE)
 
 
 def request(url, token, method='GET', body=None):
@@ -413,25 +432,33 @@ def request(url, token, method='GET', body=None):
             'Authorization': 'Bearer ' + token, 'User-Agent': 'stoarama-operator/1',
             'Content-Type': 'application/json'})
     try:
-        with urllib.request.build_opener(NoRedirect()).open(req, timeout=120) as response:
+        with urllib.request.build_opener(NoRedirect()).open(req, timeout=HTTP_TIMEOUT_SEC) as response:
             # One plan-status payload is ~2.8 KB per completed item; the
             # server caps a plan at 20000 items, so 64 MiB covers the worst case.
             raw = response.read(64 << 20)
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
-        retry = exc.code in TRANSIENT_HTTP
         exc.close()
-        error = RequestConflict if exc.code == 409 else (ReadFailure if method == 'GET' else MutationUnconfirmed) if retry else Halt
+        if method == 'GET':
+            error = ReadFailure if network_transient(exc) else Halt
+        else:
+            error = RequestConflict if exc.code == 409 else MutationUnconfirmed if exc.code in TRANSIENT_HTTP else Halt
         raise error('HTTP request failed (' + method + ')') from None
-    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead):
-        error = ReadFailure if method == 'GET' else MutationUnconfirmed
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as exc:
+        error = (ReadFailure if network_transient(exc) else Halt) if method == 'GET' else MutationUnconfirmed
         raise error('HTTP transport failed (' + method + ')') from None
     except Exception:
         # HTTP bodies, subprocess stderr and exception strings can contain credentials.
         raise Halt('HTTP request failed (' + method + ')') from None
 
 
-SHORT_READ_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)  # 120 s
+SHORT_READ_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)  # 120 s; day_control's mutation confirmation only
+# Idempotent reads: up to six attempts, 345 s of backoff. A Render API OOM restart
+# flaps 502 for about four minutes. A retry runs only if its delay and its own
+# timeout end within READ_RETRY_CAP_SEC of the first attempt, so a read returns or
+# halts within the cap (all six fast HTTP attempts fit: 345 + 120 <= 480).
+READ_RETRY_DELAYS = (15, 30, 60, 120, 120, None)
+READ_RETRY_CAP_SEC = 480
 COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep-window preparation on large streams exceeds six minutes
 STREAM_SUMMARY_TTL_SEC = 7 * 24 * 3600  # Ranking hints only; refreshes run with master OFF.
@@ -643,7 +670,7 @@ class Runner:
             try:
                 proc = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
                     input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
-                    env=self.prepare.pg_env(), capture_output=True, timeout=330)
+                    env=self.prepare.pg_env(), capture_output=True, timeout=PSQL_TIMEOUT_SEC)
             except subprocess.TimeoutExpired:
                 raise ReadFailure('psql process timeout') from None
             except OSError:
@@ -658,13 +685,13 @@ class Runner:
                 return json.loads(proc.stdout)
             except (ValueError, UnicodeError):
                 raise Halt(step + ': invalid database response') from None
-        return self.read(step, execute)
+        return self.read(step, execute, PSQL_TIMEOUT_SEC)
 
     def call(self, method, path, body=None):
         return request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
 
     def api(self, method, path, body=None):
-        return self.read('plan report GET', lambda: self.call('GET', path)) if method == 'GET' else self.call(method, path, body)
+        return self.read('plan report GET', lambda: self.call('GET', path), HTTP_TIMEOUT_SEC) if method == 'GET' else self.call(method, path, body)
 
     def day_control(self, pid, action, body, target):
         """POST a day-plan mutation. A 5xx or transport failure may follow a commit (a slow
@@ -717,28 +744,29 @@ class Runner:
         except Exception:
             pass  # Diagnostics must never block shutdown, even before initialize().
 
-    def read(self, step, action):
-        # Only emergency OFF may retry a failed check to converge to shutdown.
-        delays = SHORT_READ_RETRY_DELAYS if getattr(self, 'in_off', False) else (None,)
-        # Exhaustion is terminal to enclosing read wrappers, avoiding multiplied
-        # retry budgets. Mutations are never replayed here.
-        for delay in delays:
+    def containing(self):
+        """A latched failure or ownership loss: reads stop at once so containment proceeds."""
+        return any(self.status.get(key) for key in ('last_error', 'shutdown_or_recovery_failed', 'recovery_error'))
+
+    def read(self, step, action, attempt_timeout=None):
+        """Run an idempotent read; retry a ReadFailure with bounded backoff, never while containing.
+        attempt_timeout bounds one attempt; None never retries. Exhaustion raises Halt, which
+        enclosing reads never retry. Mutations never come here."""
+        deadline = time.monotonic() + READ_RETRY_CAP_SEC
+        for attempt, delay in enumerate(READ_RETRY_DELAYS, 1):
+            if attempt > 1 and self.containing():
+                break
             try:
                 return action()
-            except Exception as exc:
-                transient = isinstance(exc, (ReadFailure, TimeoutError, ConnectionError, urllib.error.URLError))
-                if isinstance(exc, urllib.error.HTTPError):
-                    transient = exc.code in TRANSIENT_HTTP
-                if not transient:
-                    raise
-                if delay is None:
-                    if isinstance(exc, ReadFailure):
-                        self.step_failed(step, str(exc))
-                        raise Halt(step + ': ' + str(exc)) from None
-                    self.step_failed(step)
-                    raise Halt(step + ': transient read retries exhausted') from None
-                self.step_failed(step, str(exc) if isinstance(exc, ReadFailure) else None)
-                time.sleep(delay)
+            except ReadFailure as exc:
+                reason = str(exc)
+            if (attempt_timeout is None or delay is None or self.containing()
+                    or time.monotonic() + delay + attempt_timeout > deadline):
+                break
+            self.step_failed(step, '%s; retry %d in %d s' % (reason, attempt, delay))
+            time.sleep(delay)
+        self.step_failed(step, reason)
+        raise Halt(step + ': ' + reason) from None
 
     def master(self, enabled, emergency=False):
         """The controller owns the global switch. OFF pauses only our plan."""
@@ -1257,7 +1285,7 @@ class Runner:
                 raise ReadFailure('recovery object HEAD failed')
             require(proc.returncode == 0, 'recovery CLI failed')
             return summary
-        r = self.read('recovery verification', check)
+        r = self.read('recovery verification', check)  # No attempt timeout: a verifier failure latches, as in finish.
         require(r['verified'] == issued and r['problems'] == 0, 'R2 recovery verification failed')
         require(timestamp(r['checked_at']) <= utcnow(), 'recovery time is in the future')
         if plan['mode'] == 'dry_run' and issued == 0:

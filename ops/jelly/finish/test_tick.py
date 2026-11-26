@@ -80,6 +80,87 @@ else:
                 self.assertIn('current_status_unavailable' if failure == 'status' else 'dependency_failed', notification)
 
 
+class TransientHoldTest(unittest.TestCase):
+    """A pure-network collector failure holds the tick without latching, for at most 2 h."""
+    OLD = '{"schema":"stoarama.finish-status.v1","updated_at":"2026-11-17T07:00:00Z"}'
+
+    def tick(self, root, collector_body, since=None):
+        from datetime import datetime, timedelta, timezone
+        wrapper = Path(__file__).with_name('tick.py')
+        state = root / 'state'
+        state.mkdir(exist_ok=True)
+        (state / 'status.json').write_text(self.OLD)
+        if since is not None:
+            (state / 'tick-hold.json').write_text(json.dumps({'since': (datetime.now(timezone.utc) - since).isoformat()}))
+        collector = root / 'collector'
+        collector.write_text('#!/bin/sh\n' + collector_body)
+        cli = root / 'cli'
+        cli.write_text('#!/bin/sh\nif [ "$1" = nas-r2-copy ]; then echo "{}"; exit 0; fi\n'
+                       'while [ "$1" != --status ]; do shift; done\n'
+                       'echo \'{"schema":"stoarama.finish-status.v1","updated_at":"2026-11-17T08:00:00Z"}\' > "$2"\n')
+        darma = root / 'darma'
+        darma.write_text('#!/bin/sh\necho "$*" > "' + str(root / 'notification') + '"\n')
+        for executable in (collector, cli, darma):
+            executable.chmod(0o700)
+        (root / 'notification').unlink(missing_ok=True)
+        result = subprocess.run([sys.executable, str(wrapper), '--cli', str(cli), '--state', str(state),
+                                 '--safety-collector', str(collector), '--notify-agent', 'deniz'],
+                                env={**os.environ, **binding_environment(root, cli), 'PATH': str(root) + ':' + os.environ['PATH']}, capture_output=True)
+        return result, json.loads((state / 'admission.json').read_text()), state
+
+    def transient(self, kind):
+        return "echo '{\"transient\":\"" + kind + "\"}'\nexit 75\n"
+
+    def test_each_pure_network_class_holds_quietly(self):
+        for kind in ('dns', 'network', 'timeout', 'http_unavailable', 'database_unavailable'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                result, admission, state = self.tick(root, self.transient(kind))
+                self.assertEqual(result.returncode, 75)
+                self.assertEqual(admission, {'failed': False, 'active': {}})
+                self.assertFalse((root / 'notification').exists())
+                self.assertEqual((state / 'status.json').read_text(), self.OLD, 'a hold never restamps status')
+                self.assertEqual(result.stdout.decode().strip(), 'finish transient_hold ' + kind)
+                self.assertTrue((state / 'tick-hold.json').exists())
+
+    def test_data_derived_unknown_and_malformed_transients_latch(self):
+        for body in [self.transient(k) for k in ('nas_report_lagging', 'master_off', 'recovery_held', 'runner_transition', 'bogus')] \
+                + ["echo 'not json'\nexit 75\n", "echo '{\"transient\":\"dns\",\"x\":1}'\nexit 75\n"]:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                result, admission, _ = self.tick(root, body)
+                self.assertEqual((result.returncode, admission['failed']), (1, True))
+                self.assertTrue((root / 'notification').exists())
+
+    def test_hold_latches_after_two_hours_continuous(self):
+        from datetime import timedelta
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result, admission, state = self.tick(root, self.transient('dns'), since=timedelta(hours=1, minutes=59))
+            self.assertEqual((result.returncode, admission['failed']), (75, False))
+            result, admission, state = self.tick(root, self.transient('dns'), since=timedelta(hours=2, seconds=1))
+            self.assertEqual((result.returncode, admission['failed']), (1, True))
+            self.assertIn('evidence_unavailable', (root / 'notification').read_text())
+            self.assertFalse((state / 'tick-hold.json').exists(), 'the latch ends the episode')
+
+    def test_hold_started_in_the_future_latches(self):
+        from datetime import timedelta
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result, admission, state = self.tick(root, self.transient('dns'), since=-timedelta(minutes=5))
+            self.assertEqual((result.returncode, admission['failed']), (1, True))
+            self.assertFalse((state / 'tick-hold.json').exists())
+
+    def test_collector_data_ends_the_hold_episode(self):
+        from datetime import timedelta
+        for body, code in (('echo "{}"\n', 0), ('exit 1\n', 1)):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                result, _, state = self.tick(root, body, since=timedelta(hours=3))
+                self.assertEqual(result.returncode, code)
+                self.assertFalse((state / 'tick-hold.json').exists())
+
+
 class StderrTailTest(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(Path(__file__).parent))

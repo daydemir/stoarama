@@ -72,6 +72,25 @@ and restarts (immediately after a run over an hour), so only STOP, the latch or
 A process crash may leave its plan enabled until restart or backend expiry; local
 STOP is not a backend deletion switch.
 
+Idempotent reads (API GETs and read-only psql) hold through brief network
+failures: up to six attempts with 15, 30, 60, 120 and 120 s backoff (345 s,
+enough for a Render API restart's ~4 min of 502s). A retry runs only when its
+delay plus its own timeout (HTTP 120 s, psql 330 s) ends within 480 s of the
+first attempt, so one read returns or halts within 480 s: all six fast HTTP
+attempts fit, a timed-out psql attempt is never retried, and the monitor's
+safety reads are at most about 480 s late, plus its 60 s poll. The first good
+read is checked as usual, so a master-off or mismatch still halts at once.
+Only a failure that returned no data retries, the
+network-transient class of `../finish/collector.network_kind`: DNS, connection
+refused or reset, unreachable network, timeout, and HTTP 5xx; for psql, the
+preparer's connection-class SQLSTATEs, statement timeout and process timeout.
+A 4xx (408 and 429 included), TLS failure, redirect, bad body or any other
+error stops at once. Each retry logs a `step_failed` line with a fixed reason.
+Exhaustion latches through the normal failure path. Mutations (controls,
+enables, closes, permits) never retry here; recovery verification never
+retries. No retry starts once `last_error`, `shutdown_or_recovery_failed` or
+`recovery_error` is set, so containment and its own reads are never delayed.
+
 Status is atomic, runner.jsonl and notes.jsonl append-only, fsynced and private.
 Confirmed deletion totals come from DB receipts, preserving restart accounting.
 A durable startup delivery note is required. Email is optional: empty

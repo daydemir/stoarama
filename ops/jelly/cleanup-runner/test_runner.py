@@ -1507,30 +1507,159 @@ class ReadFailureTests(unittest.TestCase):
                                       transient_sql_failure=PREPARER.transient_sql_failure)
         return job
 
-    def test_database_failures_and_nested_reads_stop_once(self):
-        for code in ('57014','08006','53300','57P03','40001','40P01','55P03','42601',None):
+    def http(self, code):
+        return r.urllib.error.HTTPError('https://invalid', code, 'fake-sensitive', {}, io.BytesIO(b'secret'))
+
+    def get(self, job, *outcomes):
+        """job.plan(42) against an opener that raises or returns each outcome in turn."""
+        opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=[
+            o if isinstance(o, BaseException) else io.BytesIO(json.dumps(o).encode()) for o in outcomes]))
+        with patch.dict(os.environ, SERVICE_TOKEN='fixture'), patch.object(r.urllib.request, 'build_opener', return_value=opener), \
+             patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+            try:
+                return job.plan(42), opener.open.call_count, sleep, stderr.getvalue()
+            except r.Halt as exc:
+                return exc, opener.open.call_count, sleep, stderr.getvalue()
+
+    def test_transient_get_succeeds_on_retry_without_latch(self):
+        plan, _ = fixture()
+        for failure in (self.http(502), self.http(503), self.http(504), self.http(500),
+                        r.urllib.error.URLError(ConnectionResetError(errno.ECONNRESET, 'reset')),
+                        r.urllib.error.URLError(r.socket.gaierror(8, 'nodename')), TimeoutError(),
+                        r.urllib.error.URLError(OSError(errno.ENETUNREACH, 'unreachable')), ConnectionResetError()):
+            with self.subTest(failure=repr(failure)), tempfile.TemporaryDirectory() as root:
+                job = self.job(root)
+                got, calls, sleep, stderr = self.get(job, failure, failure, plan)
+                self.assertEqual((got['id'], calls), (42, 3))
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [15, 30])
+                self.assertIsNone(job.status.get('last_error'))
+                log = (Path(root) / 'runner.jsonl').read_text()
+                self.assertIn('retry 1 in 15 s', log)
+                self.assertNotIn('fixture', log + stderr); self.assertNotIn('fake-sensitive', log + stderr)
+
+    def test_persistent_get_failure_halts_after_the_bounded_schedule(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job(root)
+            got, calls, sleep, _ = self.get(job, *[self.http(502)] * len(r.READ_RETRY_DELAYS))
+            self.assertIsInstance(got, r.Halt)
+            self.assertEqual(str(got), 'plan report GET: HTTP request failed (GET)')
+            self.assertEqual(calls, len(r.READ_RETRY_DELAYS))
+            delays = [c.args[0] for c in sleep.call_args_list]
+            self.assertEqual(delays, list(r.READ_RETRY_DELAYS[:-1]))
+            self.assertGreaterEqual(sum(delays), 300)  # Covers a ~4 min Render OOM restart.
+            self.assertLessEqual(sum(delays) + r.HTTP_TIMEOUT_SEC, r.READ_RETRY_CAP_SEC)
+
+    def test_no_retry_whose_timeout_could_end_past_the_cap(self):
+        # Retry 1 would end at 100 + 15 + 120 = 235 s; retry 2 at 365 + 30 + 120 = 515 s > 480 s.
+        clock = iter([0, 100, 365])
+        with tempfile.TemporaryDirectory() as root, patch.object(r.time, 'monotonic', side_effect=lambda: next(clock)):
+            got, calls, sleep, _ = self.get(self.job(root), self.http(503), self.http(503), fixture()[0])
+        self.assertIsInstance(got, r.Halt); self.assertEqual(calls, 2)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [15])
+
+    def test_a_psql_timeout_is_never_retried_past_the_cap(self):
+        clock = iter([0, r.PSQL_TIMEOUT_SEC])  # The first attempt used its whole timeout.
+        with tempfile.TemporaryDirectory() as root, patch.object(r.time, 'monotonic', side_effect=lambda: next(clock)), \
+             patch.object(r.subprocess, 'run', side_effect=[subprocess.TimeoutExpired(['psql'], 330), SimpleNamespace(returncode=0, stdout=b'7')]) as run, \
+             patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+            with self.assertRaises(r.Halt): self.job(root).query('SELECT 7', 'progress query')
+        self.assertEqual(run.call_count, 1); sleep.assert_not_called()
+
+    def test_first_good_read_after_a_retry_still_enforces_safety(self):
+        plan, _ = fixture()
+        plan.update(mode='enabled', master_deletion_enabled=False)
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job(root); job.finish_health = lambda: None
+            opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=[self.http(502), io.BytesIO(json.dumps(plan).encode())]))
+            with patch.dict(os.environ, SERVICE_TOKEN='fixture'), patch.object(r.urllib.request, 'build_opener', return_value=opener), \
+                 patch.object(job, 'active') as active, patch.object(job, 'progress') as progress, \
+                 patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+                with self.assertRaisesRegex(r.Halt, 'master switch mismatch'): job.monitor(42)
+            self.assertEqual(opener.open.call_count, 2)
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [15])  # Only the retry backoff; no poll sleep.
+            active.assert_not_called(); progress.assert_not_called()
+
+    def test_4xx_tls_and_unclassified_get_failures_are_not_retried(self):
+        for failure in [self.http(code) for code in (400, 401, 403, 404, 408, 409, 429)] + [
+                r.urllib.error.URLError(r.ssl.SSLError('certificate verify failed')), r.urllib.error.URLError('fake-sensitive')]:
+            with self.subTest(failure=repr(failure)), tempfile.TemporaryDirectory() as root:
+                got, calls, sleep, stderr = self.get(self.job(root), failure, fixture()[0])
+                self.assertIsInstance(got, r.Halt); self.assertEqual(calls, 1); sleep.assert_not_called()
+                self.assertNotIn('fake-sensitive', stderr)
+
+    def test_mutations_are_never_retried_by_read(self):
+        for method in ('POST', 'PUT'):
+            for failure in (self.http(503), self.http(429), self.http(401), r.urllib.error.URLError(ConnectionResetError())):
+                with self.subTest(method=method, failure=repr(failure)), tempfile.TemporaryDirectory() as root:
+                    job = self.job(root)
+                    opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=[failure, io.BytesIO(b'{}')]))
+                    with patch.dict(os.environ, SERVICE_TOKEN='fixture'), patch.object(r.urllib.request, 'build_opener', return_value=opener), \
+                         patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+                        with self.assertRaises(r.Halt): job.api(method, 'plans/42/control', {})
+                    self.assertEqual(opener.open.call_count, 1); sleep.assert_not_called()
+                    self.assertNotIn('fake-sensitive', stderr.getvalue())
+
+    def test_no_retry_while_containing(self):
+        for key in ('last_error', 'shutdown_or_recovery_failed', 'recovery_error'):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as root:
+                job = self.job(root); job.status[key] = 'x'
+                got, calls, sleep, _ = self.get(job, self.http(502), fixture()[0])
+                self.assertIsInstance(got, r.Halt); self.assertEqual(calls, 1); sleep.assert_not_called()
+        with tempfile.TemporaryDirectory() as root:  # A heartbeat loss during the backoff stops the next attempt.
+            job = self.job(root)
+            opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=[self.http(502), io.BytesIO(json.dumps(fixture()[0]).encode())]))
+            with patch.dict(os.environ, SERVICE_TOKEN='fixture'), patch.object(r.urllib.request, 'build_opener', return_value=opener), \
+                 patch.object(r.time, 'sleep', side_effect=lambda _: job.status.update(shutdown_or_recovery_failed=True)), \
+                 patch.object(r.sys, 'stderr', new=io.StringIO()):
+                with self.assertRaises(r.Halt): job.plan(42)
+            self.assertEqual(opener.open.call_count, 1)
+
+    def test_database_reads_retry_transient_failures_only(self):
+        for code in ('57014','08006','53300','57P03','40001','40P01','55P03',None):
             with self.subTest(code=code),tempfile.TemporaryDirectory() as root:
                 job=self.job(root)
                 bad=subprocess.TimeoutExpired(['psql'],330) if code is None else SimpleNamespace(returncode=1,stdout=b'',stderr=('ERROR:  '+code+' fake-sensitive').encode())
                 with patch.object(r.subprocess,'run',side_effect=[bad,SimpleNamespace(returncode=0,stdout=b'7')]) as run, \
                      patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()) as stderr:
-                    with self.assertRaises(r.Halt):job.read('outer',lambda:job.query('SELECT 7','progress query'))
-                self.assertEqual(run.call_count,1);sleep.assert_not_called()
-                self.assertNotIn('fake-sensitive',stderr.getvalue())
+                    self.assertEqual(job.query('SELECT 7','progress query'),7)
+                self.assertEqual(run.call_count,2);sleep.assert_called_once_with(15)
+                self.assertNotIn('fake-sensitive',stderr.getvalue()+(Path(root)/'runner.jsonl').read_text())
+        with tempfile.TemporaryDirectory() as root:
+            job=self.job(root)
+            with patch.object(r.subprocess,'run',return_value=SimpleNamespace(returncode=1,stdout=b'',stderr=b'ERROR:  42601 x')) as run, \
+                 patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()):
+                with self.assertRaises(r.Halt):job.query('SELECT 7','progress query')
+            self.assertEqual(run.call_count,1);sleep.assert_not_called()
 
-    def test_http_failures_never_replay_reads_or_writes(self):
-        for method in ('GET','POST','PUT'):
-            for code in (401,403,408,429,503):
-                with self.subTest(method=method,code=code),tempfile.TemporaryDirectory() as root:
-                    job=self.job(root)
-                    error=r.urllib.error.HTTPError('https://invalid',code,'fake-sensitive',{},io.BytesIO(b'secret'))
-                    opener=SimpleNamespace(open=unittest.mock.Mock(side_effect=[error,io.BytesIO(b'{}')]))
-                    with patch.dict(os.environ,SERVICE_TOKEN='fixture'),patch.object(r.urllib.request,'build_opener',return_value=opener), \
-                         patch.object(r.time,'sleep') as sleep,patch.object(r.sys,'stderr',new=io.StringIO()) as stderr:
-                        with self.assertRaises(r.Halt):job.api(method,'plans/42')
-                    self.assertEqual(opener.open.call_count,1);sleep.assert_not_called();self.assertNotIn('fake-sensitive',stderr.getvalue())
+    def test_nested_reads_do_not_multiply_the_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            job=self.job(root)
+            bad=SimpleNamespace(returncode=1,stdout=b'',stderr=b'ERROR:  08006 x')
+            with patch.object(r.subprocess,'run',return_value=bad) as run, \
+                 patch.object(r.time,'sleep'),patch.object(r.sys,'stderr',new=io.StringIO()):
+                with self.assertRaises(r.Halt):job.read('outer',lambda:job.query('SELECT 7','progress query'))
+            self.assertEqual(run.call_count,len(r.READ_RETRY_DELAYS))
 
-    def test_monitor_read_failure_reaches_failure_path_before_progress(self):
+    def test_network_classification_matches_finish_collector(self):
+        """The runner's retry class is #613's network transient class, minus 429."""
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'finish'))
+        try:
+            collector_spec = importlib.util.spec_from_file_location('finish_collector_fixture', Path(__file__).resolve().parents[1] / 'finish/collector.py')
+            collector = importlib.util.module_from_spec(collector_spec); collector_spec.loader.exec_module(collector)
+        finally:
+            sys.path.pop(0)
+        errors = [self.http(c) for c in (400, 401, 404, 408, 409, 500, 502, 503, 504)] + [
+            r.urllib.error.URLError(r.socket.gaierror(8, 'x')), r.urllib.error.URLError(ConnectionResetError()),
+            r.urllib.error.URLError(ConnectionRefusedError()), r.urllib.error.URLError(TimeoutError()), r.socket.timeout(),
+            r.http.client.IncompleteRead(b''), OSError(errno.EHOSTUNREACH, 'x'), OSError(errno.EACCES, 'x'),
+            r.urllib.error.URLError(r.ssl.SSLError('x')), r.urllib.error.URLError('x'), ValueError('x')]
+        for error in errors:
+            with self.subTest(error=repr(error)):
+                self.assertEqual(r.network_transient(error), collector.network_kind(error) is not None)
+        for error in errors[:9]:
+            error.close()
+
+    def test_monitor_read_failure_latches_only_after_retries(self):
         with tempfile.TemporaryDirectory() as root:
             job=self.job(root);job.finish_health=lambda:None;job.owner_validated=True;job.status.update(current_plan=42,live_commit='d'*40)
             with patch.dict(os.environ,SERVICE_TOKEN='fixture'),patch.object(r,'request',side_effect=r.ReadFailure('HTTP transport failed (GET)')) as request, \
@@ -1539,9 +1668,11 @@ class ReadFailureTests(unittest.TestCase):
                  patch.object(r.sys,'stderr',new=io.StringIO()):
                 try:job.monitor(42)
                 except r.Halt as exc:job.fail(str(exc))
-            master.assert_called_once_with(False,emergency=True);finish.assert_not_called();progress.assert_not_called();sleep.assert_not_called()
-            self.assertEqual(request.call_count,2)  # Failed monitor, then one read during fail-safe recovery.
-            self.assertTrue((Path(root)/'STOP').exists());self.assertIsNotNone(job.status['last_error'])
+            master.assert_called_once_with(False,emergency=True);finish.assert_not_called();progress.assert_not_called()
+            self.assertEqual(sleep.call_count,len(r.READ_RETRY_DELAYS)-1)
+            # The retried monitor read, then one unretried read during fail-safe recovery.
+            self.assertEqual(request.call_count,len(r.READ_RETRY_DELAYS)+1)
+            self.assertTrue((Path(root)/'STOP').exists());self.assertEqual(job.status['last_error'],'plan report GET: HTTP transport failed (GET)')
 
 
 class RecoveryRetryTests(unittest.TestCase):

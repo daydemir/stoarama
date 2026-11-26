@@ -2,13 +2,14 @@
 """Controller-installed metadata feeder. Never controls cleanup or deletion."""
 import argparse
 from contextlib import ExitStack
+from datetime import datetime, timezone
 import json
 import os
 import re
 import threading
 from pathlib import Path
 import subprocess
-from admission import Attempt, Latched, publish
+from admission import TICK_HOLD, TRANSIENT_EXIT, Attempt, Latched, publish, transient_record
 from cli_binding import bound_launcher
 
 STOPS = {'evidence_unavailable', 'cleanup_recovery_problems', 'unknown_enabled_cleanup',
@@ -17,6 +18,18 @@ STOPS = {'evidence_unavailable', 'cleanup_recovery_problems', 'unknown_enabled_c
 
 
 STDERR_TAIL_BYTES = 8192
+# A continuous pure-network hold longer than this latches (fail closed).
+HOLD_DEADLINE_SECONDS = 2 * 3600
+
+
+def hold_expired(path, now):
+    """Start the continuous hold, or report whether it outlived the deadline.
+    A start in the future (clock stepped back) also expires."""
+    if not path.exists():
+        publish(path, {'since': now.isoformat()})
+        return False
+    age = (now - datetime.fromisoformat(json.loads(path.read_text())['since'])).total_seconds()
+    return not 0 <= age <= HOLD_DEADLINE_SECONDS
 
 
 def run_cli(command, attempt, timeout=270):
@@ -86,10 +99,25 @@ def main():
                                   ([str(args.cli), 'nas-r2-copy', 'status', '--json'], copy)):
                 with path.open('wb') as output:
                     os.chmod(path, 0o600)
-                    subprocess.run(command, stdout=output, stderr=subprocess.DEVNULL,
-                                   timeout=90, check=True)
+                    result = subprocess.run(command, stdout=output, stderr=subprocess.DEVNULL, timeout=90)
                 if path.stat().st_size > 1024 * 1024:
                     raise ValueError('oversize evidence')
+                if path == safety and result.returncode == TRANSIENT_EXIT:
+                    # The collector obtained no data: nothing to feed or judge.
+                    kind = transient_record(json.loads(safety.read_bytes()), 'transient')
+                    reason = 'evidence_unavailable'
+                    if hold_expired(args.state / TICK_HOLD, datetime.now(timezone.utc)):
+                        (args.state / TICK_HOLD).unlink()  # The latch ends this episode.
+                        raise ValueError('transient hold deadline passed')
+                    if attempt.finish('', {}, held=True):
+                        print('finish transient_hold ' + kind.value, flush=True)
+                        return TRANSIENT_EXIT
+                    notify(args.notify_agent, reason)
+                    return 1
+                if path == safety:
+                    # Any non-transient collector outcome ends the hold episode.
+                    (args.state / TICK_HOLD).unlink(missing_ok=True)
+                result.check_returncode()
             command = [str(args.cli), 'finish', 'tick', '--safety', str(safety),
                        '--copy-status', str(copy), '--status', str(status)]
             if args.refresh_picks is not None:

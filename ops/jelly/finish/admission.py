@@ -1,6 +1,7 @@
 """Durable admission journal shared by the feeder and recovery wrapper."""
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from enum import Enum
 import fcntl
 import hashlib
 import json
@@ -16,6 +17,36 @@ LANES = {'tick': 'lock', 'recovery': 'recovery.lock'}
 
 class Latched(Exception):
     pass
+
+
+# sysexits EX_TEMPFAIL: a collector or plan source obtained no data for a
+# pure network reason. It reports no finding.
+TRANSIENT_EXIT = 75
+# The tick lane's continuous-hold start. Reconciliation clears it.
+TICK_HOLD = 'tick-hold.json'
+
+
+class Transient(str, Enum):
+    """The only failures that may hold without latching: no data was obtained.
+    Every data-derived refusal and every other failure latches."""
+    DNS = 'dns'
+    NETWORK = 'network'
+    TIMEOUT = 'timeout'
+    HTTP_UNAVAILABLE = 'http_unavailable'  # HTTP 5xx or 429
+    DATABASE_UNAVAILABLE = 'database_unavailable'  # psql timeout, or bad connection to an unreachable server
+
+
+class TransientFailure(Exception):
+    def __init__(self, kind: Transient):
+        super().__init__(kind.value)
+        self.kind = kind
+
+
+def transient_record(record, key: str) -> Transient:
+    """The class from an exact one-key record; anything else is malformed."""
+    if not isinstance(record, dict) or set(record) != {key}:
+        raise ValueError('invalid transient record')
+    return Transient(record[key])
 
 
 def sync_dir(path: Path) -> None:
@@ -150,7 +181,10 @@ class Attempt:
         record['active'][lane] = self.path.name
         publish(journal, record)
 
-    def finish(self, reason: str, output: dict) -> bool:
+    def finish(self, reason: str, output: dict, held: bool = False) -> bool:
+        """Latch on reason, publish success, or with held close a transient
+        attempt publishing nothing: admission stays unlatched, and the previous
+        status/report keeps its own timestamp and freshness limits."""
         if self.abandoned:
             raise Latched()
         # Serialize success publication with failure latching. A sibling that
@@ -180,14 +214,14 @@ class Attempt:
                         else:
                             stop_status(self.state, reason)
                     return False
-                publishing_success = True
-                if self.lane == 'tick':
-                    publish(self.state / 'status.json', output)
-                else:
-                    publish(self.state / 'recovery.json', output)
-                    publish(self.state / 'recovery-last-good.json', output)
-                if self.lane == 'recovery':
-                    record['recovery_required'] = False
+                if not held:
+                    publishing_success = True
+                    if self.lane == 'tick':
+                        publish(self.state / 'status.json', output)
+                    else:
+                        publish(self.state / 'recovery.json', output)
+                        publish(self.state / 'recovery-last-good.json', output)
+                        record['recovery_required'] = False
                 del record['active'][self.lane]
                 publish(self.state / 'admission.json', record)
                 # Scratch reclamation cannot reverse a committed success.
