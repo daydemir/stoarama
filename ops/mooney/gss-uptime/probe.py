@@ -12,6 +12,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import time
@@ -49,13 +50,33 @@ def write_state(path, record):
     os.replace(output.name, str(path))
 
 
-def notify(agent, message):
-    try:
-        subprocess.run(['darma', 'msg', 'send', agent, message],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=True)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return True
+ATTEMPTS = 3
+
+
+def sanitized_tail(text):
+    """One line, at most 300 chars, with long token-like runs and secret assignments redacted."""
+    line = ' '.join(text.split())
+    line = re.sub(r'(?i)\b(\w*(?:token|secret|key|password|authorization)\w*)\s*[=:]\s*\S+', r'\1=<redacted>', line)
+    line = re.sub(r'\S{32,}', '<redacted>', line)
+    return line[-300:]
+
+
+def notify(agent, message, retry_seconds):
+    """Send with up to ATTEMPTS tries, sleeping retry_seconds then 3x that between them. Logs each failure."""
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            done = subprocess.run(['darma', 'msg', 'send', agent, message],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=30)
+            if done.returncode == 0:
+                return True
+            reason = 'rc=%d stderr=%s' % (done.returncode, sanitized_tail(done.stderr))
+        except (OSError, subprocess.SubprocessError) as e:
+            stderr = getattr(e, 'stderr', None)
+            reason = '%s %s' % (type(e).__name__, sanitized_tail(stderr if isinstance(stderr, str) else str(e)))
+        print('notify attempt %d/%d failed: %s' % (attempt, ATTEMPTS, reason))
+        if attempt < ATTEMPTS:
+            time.sleep(retry_seconds * 3 ** (attempt - 1))
+    return False
 
 
 def main():
@@ -64,6 +85,7 @@ def main():
     ap.add_argument('--notify-agent', required=True, help='darma msg agent to alert')
     ap.add_argument('--origin', default='https://stoarama.com')
     ap.add_argument('--slow-seconds', type=float, default=10)
+    ap.add_argument('--retry-seconds', type=float, default=5, help='first notify retry delay; the second waits 3x')
     ap.add_argument('--remind-seconds', type=int, default=6 * 3600)
     a = ap.parse_args()
     state_path = a.state / 'probe.json'
@@ -87,7 +109,7 @@ def main():
         if due:
             message = 'GSS delivery DOWN since %s: %s (%s). Researchers see this page; check Render stoarama-api.' % (record['since'], condition, a.origin + PAGE)
     if message:
-        if not notify(a.notify_agent, message):
+        if not notify(a.notify_agent, message, a.retry_seconds):
             write_state(state_path, record if condition else previous)
             print('probe %s notification_failed' % (condition or 'ok'))
             return 2

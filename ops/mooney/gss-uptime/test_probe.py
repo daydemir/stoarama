@@ -41,7 +41,7 @@ class ProbeTest(unittest.TestCase):
         self.state.mkdir()
         (root / 'bin').mkdir()
         darma = root / 'bin' / 'darma'
-        darma.write_text('#!/bin/sh\n[ -e "%s" ] && exit 1\nprintf "%%s|%%s\\n" "$3" "$4" >> "%s"\n' % (self.fail, self.sent))
+        darma.write_text('#!/bin/sh\nif [ -s "%s" ] && [ "$(cat "%s")" -gt 0 ]; then n=$(cat "%s"); echo $((n - 1)) > "%s"; echo "boom token=abc123 relay down" >&2; exit 7; fi\nprintf "%%s|%%s\\n" "$3" "$4" >> "%s"\n' % (self.fail, self.fail, self.fail, self.fail, self.sent))
         darma.chmod(0o755)
         self.env = dict(os.environ, PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
         Handler.status, Handler.body = 200, b'{"streams": []}'
@@ -51,7 +51,7 @@ class ProbeTest(unittest.TestCase):
 
     def run_probe(self):
         origin = 'http://127.0.0.1:%d' % self.server.server_address[1]
-        return subprocess.run([sys.executable, '-I', str(PROBE), '--state', str(self.state), '--notify-agent', 'mooney', '--origin', origin],
+        return subprocess.run([sys.executable, '-I', str(PROBE), '--state', str(self.state), '--notify-agent', 'mooney', '--origin', origin, '--retry-seconds', '0'],
                               env=self.env, capture_output=True, text=True)
 
     def messages(self):
@@ -80,12 +80,32 @@ class ProbeTest(unittest.TestCase):
     def test_failed_notification_retries(self):
         Handler.status = 503
         self.run_probe()
-        self.fail.touch()
+        self.fail.write_text('99')
         self.assertEqual(self.run_probe().returncode, 2)
         self.fail.unlink()
         self.run_probe()
         self.assertEqual(len(self.messages()), 1)
         self.assertEqual(json.loads((self.state / 'probe.json').read_text())['alerted']['condition'], 'metadata=http_503 page=http_503')
+
+    def test_retry_then_success(self):
+        Handler.status = 503
+        self.run_probe()
+        self.fail.write_text('2')
+        result = self.run_probe()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(self.messages()), 1)
+        self.assertEqual(result.stdout.count('notify attempt'), 2)
+
+    def test_failed_notification_logs_reason(self):
+        Handler.status = 503
+        self.run_probe()
+        self.fail.write_text('99')
+        result = self.run_probe()
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout.count('notify attempt'), 3)
+        self.assertIn('rc=7 stderr=boom token=<redacted> relay down', result.stdout)
+        self.assertNotIn('abc123', result.stdout)
+        self.assertTrue(result.stdout.rstrip().endswith('notification_failed'))
 
 
 if __name__ == '__main__':
