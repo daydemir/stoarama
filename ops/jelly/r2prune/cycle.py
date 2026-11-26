@@ -24,6 +24,8 @@ R2ENV = os.path.expanduser('~/Build/stoarama/local/render.env')
 RELEASE = 'nas_keep_20,unresolved_best14_delivery_identity,delivery_repairs_and_unresolved_stitch_provenance'
 RECENT = '2026-11-18T18:00:00Z'
 DELETE_CLASS = 'delete_window_20d_on_nas'
+KINDS = ('raw', 'collated')
+ROWS_PER_STATEMENT = 5000
 
 # NAS evidence is name + size (Deniz, Nov 23: "yea we don tneed exreme intense
 # checkingm, if its the same size and same file name or whatever checks we have
@@ -181,14 +183,28 @@ def list_roots(sources):
     return roots
 
 
+def preflight_script(candidates):
+    """preflight.sql once per chunk, all in one read-only REPEATABLE READ snapshot, so
+    the vetoes equal one statement over every candidate. A single 137k-row JSON literal
+    preceded the 2026-11-26 production OOM; each chunk sends two short arrays instead."""
+    script = ["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;",
+              "SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='900s';"]
+    for i in range(0, len(candidates), ROWS_PER_STATEMENT):
+        chunk = candidates[i:i + ROWS_PER_STATEMENT]
+        if any(kind not in KINDS or type(sid) is not int for kind, sid in chunk):
+            raise ValueError(f'unexpected preflight candidate in chunk at {i}')
+        script += [r"\set kinds '{%s}'" % ','.join(kind for kind, _ in chunk),
+                   r"\set ids '{%s}'" % ','.join(str(sid) for _, sid in chunk),
+                   r"\i '%s'" % (HERE / 'preflight.sql')]
+    return '\n'.join(script + ['ROLLBACK;']) + '\n'
+
+
 def preflight(W, present, sources):
-    query = (HERE / 'preflight.sql').read_text()
-    candidates = [{'kind': sources[k]['kind'], 'source_id': sources[k]['source_id']} for k in present]
+    candidates = [(sources[k]['kind'], sources[k]['source_id']) for k in present]
     if not candidates:
         return set()
-    sql = query.replace('__CANDIDATES__', json.dumps(candidates, separators=(',', ':')))
     out = W + '/catalog-vetoes.tsv'
-    psql([], out, script="BEGIN READ ONLY; SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='900s';\n" + sql + ';\nROLLBACK;\n')
+    psql([], out, script=preflight_script(candidates))
     with open(out) as f:
         return {(kind, int(sid)) for kind, sid in (line.rstrip('\n').split('|') for line in f)}
 

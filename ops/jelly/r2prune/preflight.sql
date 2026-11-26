@@ -1,8 +1,10 @@
 -- Candidate identities come from the inventory evidence, after the R2 listing
 -- has matched size and (for raw) the recorded R2 ETag. Return catalog vetoes.
 -- Deniz (Nov 24): "just drop the recordings its fine"; delivery pages hold nothing (0244).
+-- cycle.py includes this once per chunk of at most ROWS_PER_STATEMENT candidates, with
+-- psql variables kinds (text[]) and ids (bigint[]) in step; every check is per row.
 WITH candidates AS MATERIALIZED (
-  SELECT * FROM jsonb_to_recordset('__CANDIDATES__'::jsonb) AS j(kind text, source_id bigint)
+  SELECT * FROM unnest(:'kinds'::text[], :'ids'::bigint[]) AS j(kind, source_id)
 )
 SELECT j.kind, j.source_id
 FROM candidates j
@@ -25,4 +27,4 @@ WHERE CASE WHEN j.kind='raw' THEN
   OR nas_cleanup_r2_file_reserved(j.kind,j.source_id)
   OR EXISTS(SELECT FROM r2_retirement_reservations r WHERE r.bucket='stoarama' AND r.object_key=coalesce(c.object_key,o.object_key))
   OR EXISTS(SELECT FROM r2_object_retirements r WHERE r.bucket='stoarama' AND r.object_key=coalesce(c.object_key,o.object_key))
-  OR EXISTS(SELECT FROM r2_object_retirements r WHERE r.kind=j.kind AND r.source_id=j.source_id)
+  OR EXISTS(SELECT FROM r2_object_retirements r WHERE r.kind=j.kind AND r.source_id=j.source_id);
