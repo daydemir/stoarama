@@ -9,6 +9,7 @@ product model; private thesis research lives in `social-isolation`.
   `backend/`. Go packages and tests live under `backend/`.
 - `infra/sql/migrations/`: schema; `render.yaml`: deployed services.
 - `ops/jelly/README.md`: Jelly-only jobs and their service controls.
+- `ops/mooney/gss-uptime/`: external uptime probe of the public GSS delivery.
 - `local/*.env`: gitignored runtime credentials; `.example` files show names.
 - `docs/operations.md`: product workflow, credential locations, Render env/deploy and
   DigitalOcean spend controls. Read it before those operations.

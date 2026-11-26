@@ -361,7 +361,7 @@ func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 		}
 	}
 	old := &globalDeliveryRegistry{Generation: "549402679c9d5f158cece1c4f77bad16"}
-	s := &Server{pool: pool, publicPinnedDeliveryRegistry: old}
+	s := &Server{pool: pool, publicDeliveryRegistries: []*globalDeliveryRegistry{old}}
 	got, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
 	if err != nil || got != old {
 		t.Fatalf("existing public delivery was not preserved: %v", err)
@@ -377,7 +377,7 @@ func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 		t.Fatal("in-flight grace fence disappeared on pause")
 	}
 	next := &globalDeliveryRegistry{Generation: strings.Repeat("2", 32)}
-	s.publicPinnedDeliveryRegistry = next
+	s.publicDeliveryRegistries = []*globalDeliveryRegistry{next}
 	if _, err = s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err == nil {
 		t.Fatal("unpinned generation served during cleanup")
 	}
