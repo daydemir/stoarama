@@ -76,7 +76,11 @@ Idempotent reads (API GETs and read-only psql) hold through brief network
 failures: up to six attempts with 15, 30, 60, 120 and 120 s backoff (345 s,
 enough for a Render API restart's ~4 min of 502s). A retry runs only when its
 delay plus its own timeout (HTTP 120 s, psql 330 s) ends within 480 s of the
-first attempt, so one read returns or halts within 480 s: all six fast HTTP
+first attempt. Each timeout is one wall clock over the whole call: an HTTP
+request runs in a worker thread joined for 120 s (DNS, connect and the full body,
+which urlopen's own per-socket timeout does not bound), and psql runs under
+subprocess.run's timeout. An expired GET is transient, an expired mutation is
+unconfirmed. So one read returns or halts within 480 s: all six fast HTTP
 attempts fit, a timed-out psql attempt is never retried, and the monitor's
 safety reads are at most about 480 s late, plus its 60 s poll. The first good
 read is checked as usual, so a master-off or mismatch still halts at once.
