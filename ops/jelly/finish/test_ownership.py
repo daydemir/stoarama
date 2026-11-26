@@ -1,5 +1,6 @@
 import copy
 import json
+import plistlib
 import sys
 import tempfile
 from pathlib import Path
@@ -9,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import unittest
 import ownership
 from ownership import assemble_owned, parse_stop, validate_stop, POLICY_SHA, StopReason
-from collector import PLAN, PLAN_SHA, timestamp
+from collector import PLAN, PLAN_SHA, runner_repo, timestamp
 
 NOW = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
 
@@ -242,6 +243,45 @@ class OwnershipTests(unittest.TestCase):
     def test_nano_timestamps_normalize_on_python39(self):
         for fraction in ('1', '12345', '123456789'):
             self.assertEqual(timestamp('2026-11-18T12:00:00.'+fraction+'Z').tzinfo, timezone.utc)
+
+
+
+class RunnerRepoTests(unittest.TestCase):
+    """The collector's runner repo comes from the installed plist and must match the CLI binding pin."""
+
+    def install(self, tmp, plist_repo, binding_repo, plist_bytes=None):
+        plist, binding = Path(tmp) / 'runner.plist', Path(tmp) / 'cli-binding.json'
+        arguments = ['/usr/bin/caffeinate', '-i', '/bin/sh', str(plist_repo / 'ops/jelly/cleanup-runner/run.sh')]
+        plist.write_bytes(plist_bytes if plist_bytes is not None
+                          else plistlib.dumps(dict(Label='com.stoarama.cleanup-runner', ProgramArguments=arguments)))
+        runner = dict(path=str(binding_repo / 'ops/jelly/cleanup-runner/runner.py'), sha256='a'*64)
+        binding.write_text(json.dumps(dict(references=dict(runner=runner))))
+        return plist, binding
+
+    def test_agreeing_plist_and_binding_name_the_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'worktrees/stoarama-runner-new'
+            self.assertEqual(runner_repo(*self.install(tmp, repo, repo)), repo)
+
+    def test_mismatched_plist_and_binding_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parts = self.install(tmp, Path(tmp) / 'worktrees/new', Path(tmp) / 'worktrees/old')
+            with self.assertRaises(ValueError): runner_repo(*parts)
+
+    def test_missing_plist_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plist, binding = self.install(tmp, Path(tmp) / 'repo', Path(tmp) / 'repo')
+            plist.unlink()
+            with self.assertRaises(FileNotFoundError): runner_repo(plist, binding)
+
+    def test_malformed_plist_is_refused(self):
+        repo = Path('/Users/jelly/Build/stoarama')
+        for raw in (b'not a plist', plistlib.dumps(dict(Label='x')),
+                    plistlib.dumps(dict(ProgramArguments=str(repo / 'ops/jelly/cleanup-runner/run.sh'))),
+                    plistlib.dumps(dict(ProgramArguments=['/bin/sh', 'ops/jelly/cleanup-runner/run.sh'])),
+                    plistlib.dumps(dict(ProgramArguments=['/bin/sh', '/Users/jelly/run.sh']))):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises((ValueError, KeyError)): runner_repo(*self.install(tmp, repo, repo, raw))
 
 
 if __name__ == '__main__': unittest.main()

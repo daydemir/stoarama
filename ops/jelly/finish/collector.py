@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import subprocess
 import sys
@@ -27,6 +28,23 @@ STOP = ("stoarama sole controller: intentional natural-boundary STOP\n"
 def require(condition):
     if not condition:
         raise ValueError('evidence unavailable')
+
+
+RUNNER_PLIST = Path.home() / 'Library/LaunchAgents/com.stoarama.cleanup-runner.plist'
+RUN_SH = Path('ops/jelly/cleanup-runner/run.sh')
+RUNNER_PY = Path('ops/jelly/cleanup-runner/runner.py')
+
+
+def runner_repo(plist, binding):
+    """The installed runner's repo: the launchd plist's run.sh, which the CLI binding's runner pin must agree with."""
+    with plist.open('rb') as source:
+        arguments = plistlib.load(source)['ProgramArguments']
+    require(isinstance(arguments, list))
+    scripts = [Path(a) for a in arguments if isinstance(a, str) and Path(a).name == RUN_SH.name]
+    require(len(scripts) == 1 and scripts[0].is_absolute() and scripts[0].parts[-4:] == RUN_SH.parts)
+    repo = scripts[0].parents[3]
+    require(Path(json.loads(binding.read_bytes())['references']['runner']['path']) == repo / RUNNER_PY)
+    return repo
 
 
 def timestamp(value):
@@ -95,7 +113,7 @@ def main():
     args = parser.parse_args()
     require(args.plan_source != (args.recovery_report is not None))
     root = Path.home() / 'stoarama-cleanup-runner'
-    repo = Path.home() / 'Build/stoarama/worktrees/stoarama-runner-3a0c3b23'
+    repo = runner_repo(RUNNER_PLIST, root / 'cli-binding.json')
     if args.owner_sha256:
         from ownership import collect
         record = collect(root, repo, args.state / 'recovery.json', args.owner_sha256, datetime.now(timezone.utc), args.plan_source)
