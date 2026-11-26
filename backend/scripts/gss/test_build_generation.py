@@ -429,6 +429,16 @@ class LedgerBuildTests(unittest.TestCase):
         self.assertEqual(md[rid]['availability'], 'available')  # every hour is complete in R2
         go_validate(self, os.path.join(out, 'registry.json.gz'))
 
+    def test_unservable_part_is_not_published(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[9]
+        p = w.new_part(rid, DAYS[2], 2, 9_200_001)
+        h = w.hours[(rid, DAYS[2], 2)]
+        w.hours[(rid, DAYS[2], 2)] = dataclasses.replace(h, served=tuple(dataclasses.replace(x, live=False) for x in h.served), in_r2=False)
+        store, present, added, file_holds, best14, lost = w.generation(self.store)
+        self.assertNotIn('9200001', present)
+        self.assertNotIn(p.key, {x['object_key'] for x in file_holds})
+
     def test_dropping_an_assembly_is_a_regression(self):
         w = LedgerWorld(self.fx)
         rid = RIDS[5]

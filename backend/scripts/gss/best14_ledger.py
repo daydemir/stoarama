@@ -44,7 +44,11 @@ Source of each served file:
   original        any other registered part
 
 complete = every part 1..parts of the record is registered; in_r2 = every file
-serving the record's parts is in the listing at its catalogued size. A day is
+serving the record's parts is servable: in the listing at its catalogued size
+and, for a part, keep-held already or clear of the delivery hold guard's
+collated-source closure (no collated retirement reservation, nonraw intent or
+retirement on the output, no raw reservation or inverse intent on a source
+clip). A blocked part leaves its hour incomplete (closed_parts counts them). A day is
 complete when every captured hour is complete and in R2; a stream is available
 when all 14 days are complete and at least one hour is captured.
 
@@ -122,6 +126,7 @@ class Part:
     end_at: str
     nas_path: str
     source: Source
+    closed: bool = False  # a retirement closure clause holds: no new keep hold can land on it
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,6 +167,7 @@ class Served:
     path: str
     source: Source
     registry_ids: tuple  # the parts this file serves: itself, or an assembly's inputs
+    live: bool = True    # servable: in R2, and held or holdable
 
 
 @dataclasses.dataclass(frozen=True)
@@ -251,18 +257,26 @@ SELECT h.recording_id, h.local_date, h.delivery_hour, h.id AS hour_row_id, h.hou
  to_char(o.end_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"') AS end_at,
  EXISTS (SELECT 1 FROM nas_restore_requests n WHERE n.target='output' AND n.output_id=o.id AND n.state='verified') AS nas_restored,
  EXISTS (SELECT 1 FROM r2_retirement_writer_operations w WHERE w.collation_recovery_hour_id IS NOT NULL
-   AND w.completed_at IS NOT NULL AND w.object_key=o.object_key) AS recovery_put
+   AND w.completed_at IS NOT NULL AND w.object_key=o.object_key) AS recovery_put,
+ EXISTS (SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='collated' AND x.source_id=o.id) AS reserved_collated,
+ EXISTS (SELECT 1 FROM r2_nonraw_intents i WHERE i.kind='collated' AND i.source_id=o.id) AS nonraw_intent_collated,
+ EXISTS (SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id) AS retired_collated,
+ EXISTS (SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='raw' AND x.source_id=ANY(o.source_clip_ids)) AS reserved_raw_source,
+ EXISTS (SELECT 1 FROM r2_inverse_intents i WHERE i.source_id=ANY(o.source_clip_ids)) AS inverse_intent_source
 FROM recording_collation_hours h JOIN d USING (recording_id, local_date)
 LEFT JOIN recording_collation_outputs o ON o.collation_hour_id=h.id
 ORDER BY 1, 2, 3, 4, o.part;
 """
 
 
+# The delivery hold guard's collated-source closure: any of these refuses a new
+# video_collated keep hold on the output, so an output not already held is not servable.
+CLOSURE_COLUMNS = ('reserved_collated', 'nonraw_intent_collated', 'retired_collated', 'reserved_raw_source', 'inverse_intent_source')
 HOLDS_SQL = "SELECT object_key, etag, size_bytes FROM delivery_keep_holds WHERE bucket='stoarama';\n"
 EXTRACT_COLUMNS = ('recording_id', 'local_date', 'delivery_hour', 'hour_row_id', 'hour_id', 'batch_id', 'status',
                    'registered_at', 'source_clip_count', 'included_clip_count', 'output_id', 'part', 'parts',
                    'object_key', 'nas_relative_path', 'size_bytes', 'sha256', 'start_at', 'end_at',
-                   'nas_restored', 'recovery_put')
+                   'nas_restored', 'recovery_put') + CLOSURE_COLUMNS
 
 
 def flag(v):
@@ -297,7 +311,8 @@ def read_extract(path):
         if r['output_id']:
             rows[row_id].append(Part(int(r['output_id']), int(r['part']), int(r['parts']), r['object_key'],
                                      int(r['size_bytes']), r['sha256'], r['start_at'], r['end_at'], r['nas_relative_path'],
-                                     part_source(r['batch_id'], r['object_key'], flag(r['nas_restored']), flag(r['recovery_put']))))
+                                     part_source(r['batch_id'], r['object_key'], flag(r['nas_restored']), flag(r['recovery_put'])),
+                                     any(flag(r[c]) for c in CLOSURE_COLUMNS)))
     out = collections.defaultdict(list)
     for row_id, (slot, hour_id, batch, status, registered_at, clips, included) in meta.items():
         parts = tuple(sorted(rows[row_id], key=lambda p: p.part))
@@ -417,7 +432,7 @@ def check_assembly_run(a, records_of):
             raise LedgerError(f'assembly {a.file_id}: parts {ords} of {rec.hour_id} are not consecutive')
 
 
-def serving_set(record, by_input, registry, listing):
+def serving_set(record, by_input, registry, listing, holds):
     """(files listed on record's hour, assemblies listed earlier that serve its first parts)."""
     files = registry['files']
     path = lambda p: files[str(p.output_id)]['path'] if str(p.output_id) in files else p.nas_path
@@ -426,7 +441,9 @@ def serving_set(record, by_input, registry, listing):
     for p in record.parts:
         a = by_input.get(p.output_id)
         if a is None:
-            served.append(Served(str(p.output_id), p.key, p.size_bytes, listing.get(p.key, (0, None))[1], p.sha256, path(p), p.source, (str(p.output_id),)))
+            etag = listing.get(p.key, (0, None))[1]
+            live = in_r2(listing, p.key, p.size_bytes) and (not p.closed or holds.get(p.key) == (etag, p.size_bytes))
+            served.append(Served(str(p.output_id), p.key, p.size_bytes, etag, p.sha256, path(p), p.source, (str(p.output_id),), live))
         elif a.file_id not in seen:
             seen.add(a.file_id)
             if a.input_ids[0] not in ids:
@@ -478,8 +495,8 @@ def select(inputs):
                     continue
                 cands = []
                 for r in collated:
-                    served, carried = serving_set(r, by_input, inputs.registry, listing)
-                    live = all(in_r2(listing, s.key, s.size_bytes) for s in served)
+                    served, carried = serving_set(r, by_input, inputs.registry, listing, inputs.holds)
+                    live = all(s.live for s in served)
                     ok = r.complete() and live
                     cands.append((not ok, r.batch_id.startswith(RECOVERY_BATCH_PREFIX), r.registered_at, r.row_id,
                                   r, served, carried, live, ok))
@@ -589,6 +606,10 @@ def stream_rows(hours, days):
     return out
 
 
+def closed_keys(h):
+    return {p.key for p in h.record.parts if p.closed} if h.record else set()
+
+
 def summary_line(hours, streams, unheld):
     captured = [h for h in hours if h.captured]
     ok = [h for h in captured if h.ok]
@@ -597,7 +618,8 @@ def summary_line(hours, streams, unheld):
             f"days_complete={sum(s['days_complete'] for s in streams)}/{sum(s['days'] for s in streams)} "
             f"hours_complete={len(ok)}/{len(captured)} "
             + ' '.join(f'{s.value}={counts[s]}' for s in Source)
-            + f' alternates={sum(h.alternates > 0 for h in ok)} unheld_assemblies={unheld}')
+            + f' alternates={sum(h.alternates > 0 for h in ok)} unheld_assemblies={unheld}'
+            + f' closed_parts={sum(1 for h in hours for s in h.served if s.key in closed_keys(h) and not s.live)}')
 
 
 def write_tsv(path, columns, rows):
