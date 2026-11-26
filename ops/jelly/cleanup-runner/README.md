@@ -80,7 +80,8 @@ notes/alerts. No credential values, response bodies or private subprocess errors
 enter logs. Delivery acknowledgment means provider acceptance, not human reading.
 
 Use the final hashed deployment packet and OWNERSHIP.md for activation/rollback.
-Actual installed runner paths come from the loaded plist, not the template.
+Actual installed runner paths come from the loaded plist, not the template
+(see [Installing a runner](#installing-a-runner)).
 `--dry-run` can submit metadata and send progress; it is not an offline test.
 It never enables a plan and cannot adopt an enabled saved execution.
 No automatic rollback, stale status restore, hold removal, failure clear or item
@@ -111,3 +112,27 @@ The runner reuses D's installed admission module to detect abandoned attempts an
 orphan directories under its admission gate, including before borrowing its tick
 lock. A live recovery can coexist. A stopped selected plan remains pending only
 with fresh dry-run/zero-issued proof; neither prepared plan is discarded.
+
+## Installing a runner
+
+D's collector (`ops/jelly/finish/collector.py`) finds the runner repo in one place:
+the `run.sh` in `ProgramArguments` of the installed
+`~/Library/LaunchAgents/com.stoarama.cleanup-runner.plist` (repo = run.sh's
+`parents[3]`). `references.runner.path` in `~/stoarama-cleanup-runner/cli-binding.json`
+must name `runner.py` in that same repo, and a running runner's `ps` command must
+contain it. A mismatch, a missing file or a parse error fails collection closed,
+and a failed recovery refresh latches D. Steps:
+
+1. Make the new worktree and run the tests there.
+2. Boot out `com.stoarama.finish-recovery` and make sure no refresh is running.
+   Never repoint the plist while a recovery refresh could run: a refresh that sees
+   the new plist alongside the old binding (or the old process) latches D.
+3. Stop the runner at an idle boundary (natural STOP, or `launchctl bootout`).
+4. Set `references.runner.path` to the new `runner.py`, and `references.runner.sha256`
+   to its `shasum -a 256`. Do the same for every other reference whose file changed.
+   Then set `STOARAMA_CLI_BINDING_SHA256` in `cli-binding.env` to the new
+   `shasum -a 256 cli-binding.json`.
+5. Point the plist's run.sh at the new worktree, run `plutil -lint`, and bootstrap
+   the runner.
+6. Check that the plan source succeeds (`collector.py --plan-source --owner-sha256 ...`),
+   then bootstrap `com.stoarama.finish-recovery` again.

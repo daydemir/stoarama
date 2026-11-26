@@ -223,6 +223,15 @@ time, then install D. A v4 observation packet is not late-budget eligible.
    `launchctl bootout gui/$(id -u)/com.stoarama.finish-tick`.
    To stop its independent refresh, boot out `com.stoarama.finish-recovery`.
 
+### Runner repo
+
+The collector takes the cleanup runner's repo from the installed
+`com.stoarama.cleanup-runner.plist` run.sh path and requires
+`~/stoarama-cleanup-runner/cli-binding.json` `references.runner.path` to name
+`runner.py` in that same repo. Any mismatch, missing file or parse error fails closed.
+Follow [Installing a runner](../cleanup-runner/README.md#installing-a-runner) before
+you repoint the plist or change `runner.py`.
+
 ## Stops
 
 | `stop_reason` | Meaning / controller action |
