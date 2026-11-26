@@ -1114,11 +1114,15 @@ func TestNASCleanupDayDeletedMediaCountsEachUnitOnce(t *testing.T) {
 		// partial 429 is inside the final 441.
 		{flat, []nasCleanupDayReceipt{receipt(1, nasCleanupDayPartial, 429, 4290), receipt(2, nasCleanupDayDeleted, 441, 4410)}},
 		{named, []nasCleanupDayReceipt{receipt(1, nasCleanupDayPartial, 1, 10), receipt(2, nasCleanupDayDeleted, 2, 20)}},
+		// A refusal after a partial (e.g. the permit expires too soon) unlinks
+		// nothing; the partial's deletions still count.
+		{flat, []nasCleanupDayReceipt{receipt(1, nasCleanupDayPartial, 7, 70), receipt(2, nasCleanupDayRefused, 0, 0)}},
+		{flat, []nasCleanupDayReceipt{receipt(1, nasCleanupDayRefused, 0, 0)}},
 		// A dir receipt counts only what its own attempt unlinked.
 		{plaza, []nasCleanupDayReceipt{receipt(1, nasCleanupDayPartial, 1, 100), receipt(2, nasCleanupDayDeleted, 1, 200)}},
 		{flat, nil},
 	})
-	if files != 441+2+2 || bytes != 4410+20+300 {
+	if files != 441+2+7+2 || bytes != 4410+20+70+300 {
 		t.Fatalf("deleted media %d files %d bytes", files, bytes)
 	}
 }

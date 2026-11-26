@@ -1547,13 +1547,37 @@ class ReadFailureTests(unittest.TestCase):
             delays = [c.args[0] for c in sleep.call_args_list]
             self.assertEqual(delays, list(r.READ_RETRY_DELAYS[:-1]))
             self.assertGreaterEqual(sum(delays), 300)  # Covers a ~4 min Render OOM restart.
-            self.assertLessEqual(sum(delays), r.READ_RETRY_CAP_SEC)
+            self.assertLessEqual(sum(delays) + r.HTTP_TIMEOUT_SEC, r.READ_RETRY_CAP_SEC)
 
-    def test_no_retry_starts_after_the_wall_clock_cap(self):
-        clock = iter([0, r.READ_RETRY_CAP_SEC - 10])  # The first attempt took almost the whole cap.
+    def test_no_retry_whose_timeout_could_end_past_the_cap(self):
+        # Retry 1 would end at 100 + 15 + 120 = 235 s; retry 2 at 365 + 30 + 120 = 515 s > 480 s.
+        clock = iter([0, 100, 365])
         with tempfile.TemporaryDirectory() as root, patch.object(r.time, 'monotonic', side_effect=lambda: next(clock)):
-            got, calls, sleep, _ = self.get(self.job(root), self.http(503), fixture()[0])
-        self.assertIsInstance(got, r.Halt); self.assertEqual(calls, 1); sleep.assert_not_called()
+            got, calls, sleep, _ = self.get(self.job(root), self.http(503), self.http(503), fixture()[0])
+        self.assertIsInstance(got, r.Halt); self.assertEqual(calls, 2)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [15])
+
+    def test_a_psql_timeout_is_never_retried_past_the_cap(self):
+        clock = iter([0, r.PSQL_TIMEOUT_SEC])  # The first attempt used its whole timeout.
+        with tempfile.TemporaryDirectory() as root, patch.object(r.time, 'monotonic', side_effect=lambda: next(clock)), \
+             patch.object(r.subprocess, 'run', side_effect=[subprocess.TimeoutExpired(['psql'], 330), SimpleNamespace(returncode=0, stdout=b'7')]) as run, \
+             patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+            with self.assertRaises(r.Halt): self.job(root).query('SELECT 7', 'progress query')
+        self.assertEqual(run.call_count, 1); sleep.assert_not_called()
+
+    def test_first_good_read_after_a_retry_still_enforces_safety(self):
+        plan, _ = fixture()
+        plan.update(mode='enabled', master_deletion_enabled=False)
+        with tempfile.TemporaryDirectory() as root:
+            job = self.job(root); job.finish_health = lambda: None
+            opener = SimpleNamespace(open=unittest.mock.Mock(side_effect=[self.http(502), io.BytesIO(json.dumps(plan).encode())]))
+            with patch.dict(os.environ, SERVICE_TOKEN='fixture'), patch.object(r.urllib.request, 'build_opener', return_value=opener), \
+                 patch.object(job, 'active') as active, patch.object(job, 'progress') as progress, \
+                 patch.object(r.time, 'sleep') as sleep, patch.object(r.sys, 'stderr', new=io.StringIO()):
+                with self.assertRaisesRegex(r.Halt, 'master switch mismatch'): job.monitor(42)
+            self.assertEqual(opener.open.call_count, 2)
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [15])  # Only the retry backoff; no poll sleep.
+            active.assert_not_called(); progress.assert_not_called()
 
     def test_4xx_tls_and_unclassified_get_failures_are_not_retried(self):
         for failure in [self.http(code) for code in (400, 401, 403, 404, 408, 409, 429)] + [

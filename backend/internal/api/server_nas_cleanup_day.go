@@ -995,13 +995,20 @@ type nasCleanupDayStatusUnit struct {
 // cleanupDayDeletedMedia totals the media unlinked under a plan's permits. A dir
 // permit's receipt counts what that attempt found and unlinked, so a unit's
 // receipts add up. A names permit's receipt counts every listed name now absent,
-// including those an earlier attempt unlinked, so only the unit's last receipt
-// counts. Receipts are appended in attempt order.
+// including those an earlier attempt unlinked, so only the unit's last
+// non-refused receipt counts: a refusal unlinks nothing and reports zero.
+// Receipts are appended in attempt order.
 func cleanupDayDeletedMedia(units []nasCleanupDayStatusUnit) (files, bytes int64) {
 	for _, u := range units {
 		receipts := u.Receipts
-		if cleanupDayModeOf(u.nasCleanupDayUnit) == nasCleanupDayNames && len(receipts) > 0 {
-			receipts = receipts[len(receipts)-1:]
+		if cleanupDayModeOf(u.nasCleanupDayUnit) == nasCleanupDayNames {
+			receipts = nil
+			for i := len(u.Receipts) - 1; i >= 0; i-- {
+				if u.Receipts[i].Outcome != nasCleanupDayRefused {
+					receipts = u.Receipts[i : i+1]
+					break
+				}
+			}
 		}
 		for _, rc := range receipts {
 			files += rc.MediaFiles

@@ -407,6 +407,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Halt('HTTP redirect refused')
 
 
+HTTP_TIMEOUT_SEC = 120
+PSQL_TIMEOUT_SEC = 330
 TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
 UNREACHABLE = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EHOSTDOWN}
 
@@ -430,7 +432,7 @@ def request(url, token, method='GET', body=None):
             'Authorization': 'Bearer ' + token, 'User-Agent': 'stoarama-operator/1',
             'Content-Type': 'application/json'})
     try:
-        with urllib.request.build_opener(NoRedirect()).open(req, timeout=120) as response:
+        with urllib.request.build_opener(NoRedirect()).open(req, timeout=HTTP_TIMEOUT_SEC) as response:
             # One plan-status payload is ~2.8 KB per completed item; the
             # server caps a plan at 20000 items, so 64 MiB covers the worst case.
             raw = response.read(64 << 20)
@@ -451,10 +453,12 @@ def request(url, token, method='GET', body=None):
 
 
 SHORT_READ_RETRY_DELAYS = (5, 10, 20, 30, 30, 25, None)  # 120 s; day_control's mutation confirmation only
-# Idempotent reads: six attempts, 345 s of backoff. A Render API OOM restart flaps
-# 502 for about four minutes. No retry starts after READ_RETRY_CAP_SEC.
+# Idempotent reads: up to six attempts, 345 s of backoff. A Render API OOM restart
+# flaps 502 for about four minutes. A retry runs only if its delay and its own
+# timeout end within READ_RETRY_CAP_SEC of the first attempt, so a read returns or
+# halts within the cap (all six fast HTTP attempts fit: 345 + 120 <= 480).
 READ_RETRY_DELAYS = (15, 30, 60, 120, 120, None)
-READ_RETRY_CAP_SEC = 420
+READ_RETRY_CAP_SEC = 480
 COMMAND_TIMEOUT_SEC = 360
 PREPARE_TIMEOUT_SEC = 1800  # keep-window preparation on large streams exceeds six minutes
 STREAM_SUMMARY_TTL_SEC = 7 * 24 * 3600  # Ranking hints only; refreshes run with master OFF.
@@ -666,7 +670,7 @@ class Runner:
             try:
                 proc = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
                     input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
-                    env=self.prepare.pg_env(), capture_output=True, timeout=330)
+                    env=self.prepare.pg_env(), capture_output=True, timeout=PSQL_TIMEOUT_SEC)
             except subprocess.TimeoutExpired:
                 raise ReadFailure('psql process timeout') from None
             except OSError:
@@ -681,13 +685,13 @@ class Runner:
                 return json.loads(proc.stdout)
             except (ValueError, UnicodeError):
                 raise Halt(step + ': invalid database response') from None
-        return self.read(step, execute)
+        return self.read(step, execute, PSQL_TIMEOUT_SEC)
 
     def call(self, method, path, body=None):
         return request(API + '/api/v1/service/nas-cleanup/' + path, os.environ['SERVICE_TOKEN'], method, body)
 
     def api(self, method, path, body=None):
-        return self.read('plan report GET', lambda: self.call('GET', path)) if method == 'GET' else self.call(method, path, body)
+        return self.read('plan report GET', lambda: self.call('GET', path), HTTP_TIMEOUT_SEC) if method == 'GET' else self.call(method, path, body)
 
     def day_control(self, pid, action, body, target):
         """POST a day-plan mutation. A 5xx or transport failure may follow a commit (a slow
@@ -744,9 +748,10 @@ class Runner:
         """A latched failure or ownership loss: reads stop at once so containment proceeds."""
         return any(self.status.get(key) for key in ('last_error', 'shutdown_or_recovery_failed', 'recovery_error'))
 
-    def read(self, step, action, retry=True):
+    def read(self, step, action, attempt_timeout=None):
         """Run an idempotent read; retry a ReadFailure with bounded backoff, never while containing.
-        Exhaustion raises Halt, which enclosing reads never retry. Mutations never come here."""
+        attempt_timeout bounds one attempt; None never retries. Exhaustion raises Halt, which
+        enclosing reads never retry. Mutations never come here."""
         deadline = time.monotonic() + READ_RETRY_CAP_SEC
         for attempt, delay in enumerate(READ_RETRY_DELAYS, 1):
             if attempt > 1 and self.containing():
@@ -755,7 +760,8 @@ class Runner:
                 return action()
             except ReadFailure as exc:
                 reason = str(exc)
-            if not retry or delay is None or time.monotonic() + delay > deadline or self.containing():
+            if (attempt_timeout is None or delay is None or self.containing()
+                    or time.monotonic() + delay + attempt_timeout > deadline):
                 break
             self.step_failed(step, '%s; retry %d in %d s' % (reason, attempt, delay))
             time.sleep(delay)
@@ -1279,7 +1285,7 @@ class Runner:
                 raise ReadFailure('recovery object HEAD failed')
             require(proc.returncode == 0, 'recovery CLI failed')
             return summary
-        r = self.read('recovery verification', check, retry=False)  # A verifier failure latches, as in finish.
+        r = self.read('recovery verification', check)  # No attempt timeout: a verifier failure latches, as in finish.
         require(r['verified'] == issued and r['problems'] == 0, 'R2 recovery verification failed')
         require(timestamp(r['checked_at']) <= utcnow(), 'recovery time is in the future')
         if plan['mode'] == 'dry_run' and issued == 0:

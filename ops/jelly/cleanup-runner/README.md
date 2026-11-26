@@ -73,9 +73,14 @@ A process crash may leave its plan enabled until restart or backend expiry; loca
 STOP is not a backend deletion switch.
 
 Idempotent reads (API GETs and read-only psql) hold through brief network
-failures: six attempts with 15, 30, 60, 120 and 120 s backoff (345 s, enough
-for a Render API restart's ~4 min of 502s), and no retry starts more than 420 s
-after the first. Only a failure that returned no data retries, the
+failures: up to six attempts with 15, 30, 60, 120 and 120 s backoff (345 s,
+enough for a Render API restart's ~4 min of 502s). A retry runs only when its
+delay plus its own timeout (HTTP 120 s, psql 330 s) ends within 480 s of the
+first attempt, so one read returns or halts within 480 s: all six fast HTTP
+attempts fit, a timed-out psql attempt is never retried, and the monitor's
+safety reads are at most about 480 s late, plus its 60 s poll. The first good
+read is checked as usual, so a master-off or mismatch still halts at once.
+Only a failure that returned no data retries, the
 network-transient class of `../finish/collector.network_kind`: DNS, connection
 refused or reset, unreachable network, timeout, and HTTP 5xx; for psql, the
 preparer's connection-class SQLSTATEs, statement timeout and process timeout.
