@@ -1101,3 +1101,24 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 		t.Fatalf("unit %s: %q %v", state, refusal, err)
 	}
 }
+
+func TestNASCleanupDayDeletedMediaCountsEachUnitOnce(t *testing.T) {
+	receipt := func(attempt int, outcome nasCleanupDayOutcome, files, bytes int64) nasCleanupDayReceipt {
+		return nasCleanupDayReceipt{Attempt: attempt, Outcome: outcome, MediaFiles: files, MediaBytes: bytes}
+	}
+	plaza := nasCleanupDayUnit{RelativeDir: dayPlazaDir(dayFixtureFolder, dayDate("2026-09-12"))}
+	flat := nasCleanupDayUnit{RelativeDir: "recordings/898/continuous"}
+	named := nasCleanupDayUnit{RelativeDir: plaza.RelativeDir, Names: []nasCleanupDayName{{Name: "a.mp4", SizeBytes: 1}}}
+	files, bytes := cleanupDayDeletedMedia([]nasCleanupDayStatusUnit{
+		// Plan 78 unit 898: a names receipt counts every absent name, so the
+		// partial 429 is inside the final 441.
+		{flat, []nasCleanupDayReceipt{receipt(1, nasCleanupDayPartial, 429, 4290), receipt(2, nasCleanupDayDeleted, 441, 4410)}},
+		{named, []nasCleanupDayReceipt{receipt(1, nasCleanupDayPartial, 1, 10), receipt(2, nasCleanupDayDeleted, 2, 20)}},
+		// A dir receipt counts only what its own attempt unlinked.
+		{plaza, []nasCleanupDayReceipt{receipt(1, nasCleanupDayPartial, 1, 100), receipt(2, nasCleanupDayDeleted, 1, 200)}},
+		{flat, nil},
+	})
+	if files != 441+2+2 || bytes != 4410+20+300 {
+		t.Fatalf("deleted media %d files %d bytes", files, bytes)
+	}
+}

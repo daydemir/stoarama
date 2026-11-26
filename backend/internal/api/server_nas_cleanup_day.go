@@ -651,11 +651,7 @@ func (s *Server) handleServiceNASCleanupDayStatus(w http.ResponseWriter, r *http
  'units',(SELECT coalesce(jsonb_agg(jsonb_build_object('unit_id',u.id,'ordinal',u.ordinal,'stream_id',u.stream_id,
    'relative_dir',u.relative_dir,'local_date',u.local_date::text,'files',u.files,'bytes',u.bytes,'names',u.names,'dropped_names',u.dropped_names,'state',u.state,
    'attempt',u.attempt,'permit_live',u.state='permitted' AND u.permit_expires_at>clock_timestamp(),
-   'refusal',u.refusal,'receipts',u.receipts) ORDER BY u.ordinal),'[]') FROM nas_cleanup_day_units u WHERE u.plan_id=p.id),
- 'deleted_media_files',(SELECT coalesce(sum((e->>'media_files')::bigint),0) FROM nas_cleanup_day_units u
-   CROSS JOIN LATERAL jsonb_array_elements(u.receipts) e WHERE u.plan_id=p.id),
- 'deleted_media_bytes',(SELECT coalesce(sum((e->>'media_bytes')::bigint),0) FROM nas_cleanup_day_units u
-   CROSS JOIN LATERAL jsonb_array_elements(u.receipts) e WHERE u.plan_id=p.id))
+   'refusal',u.refusal,'receipts',u.receipts) ORDER BY u.ordinal),'[]') FROM nas_cleanup_day_units u WHERE u.plan_id=p.id))
  FROM nas_cleanup_day_plans p WHERE p.id=$1 AND p.account_id=47 AND p.connection_id=13`, id).Scan(&body)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, 404, "day cleanup plan not found")
@@ -666,10 +662,14 @@ func (s *Server) handleServiceNASCleanupDayStatus(w http.ResponseWriter, r *http
 		return
 	}
 	var out map[string]any
-	if json.Unmarshal(body, &out) != nil {
+	var plan struct {
+		Units []nasCleanupDayStatusUnit `json:"units"`
+	}
+	if json.Unmarshal(body, &out) != nil || json.Unmarshal(body, &plan) != nil {
 		util.WriteError(w, 500, "day cleanup plan unavailable")
 		return
 	}
+	out["deleted_media_files"], out["deleted_media_bytes"] = cleanupDayDeletedMedia(plan.Units)
 	out["master_deletion_enabled"] = s.cfg.NASCleanupDeletionEnabled
 	util.WriteJSON(w, 200, out)
 }
@@ -984,6 +984,31 @@ func (rc nasCleanupDayReceipt) valid() bool {
 	default:
 		return false
 	}
+}
+
+// nasCleanupDayStatusUnit is a unit as the status read returns it.
+type nasCleanupDayStatusUnit struct {
+	nasCleanupDayUnit
+	Receipts []nasCleanupDayReceipt `json:"receipts"`
+}
+
+// cleanupDayDeletedMedia totals the media unlinked under a plan's permits. A dir
+// permit's receipt counts what that attempt found and unlinked, so a unit's
+// receipts add up. A names permit's receipt counts every listed name now absent,
+// including those an earlier attempt unlinked, so only the unit's last receipt
+// counts. Receipts are appended in attempt order.
+func cleanupDayDeletedMedia(units []nasCleanupDayStatusUnit) (files, bytes int64) {
+	for _, u := range units {
+		receipts := u.Receipts
+		if cleanupDayModeOf(u.nasCleanupDayUnit) == nasCleanupDayNames && len(receipts) > 0 {
+			receipts = receipts[len(receipts)-1:]
+		}
+		for _, rc := range receipts {
+			files += rc.MediaFiles
+			bytes += rc.MediaBytes
+		}
+	}
+	return files, bytes
 }
 
 // One receipt per directory permit; a retried identical receipt is a no-op.
