@@ -854,32 +854,60 @@ COMMIT`)
 	if files, bytes, err := keCheck(all); err != nil || files != 2 || bytes != 200 {
 		t.Fatalf("KE evidence: %d files %d bytes %v", files, bytes, err)
 	}
-	// The catalogue is not R2: each catalogue-live counterpart is HEADed, and a
-	// missing object, another live size or an R2 error refuses the whole unit.
-	for label, c := range map[string]struct {
+	// The catalogue is not R2: each permitted file needs at least one
+	// catalogue-live counterpart R2 holds at its catalogued size, and any R2
+	// error refuses the whole unit. Clip 11 is also covered, clip-exactly, by a
+	// stitched output for these cases.
+	out11 := "joined/goodplus-x/objects/" + strings.Repeat("f", 64) + ".mp4"
+	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica;
+INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,
+ manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
+ VALUES(2,'goodplus-x__recording-31__date-2026-10-10__hour-09__generation-2','goodplus-x',2,31,'2026-10-10',9,'collated','m/2',repeat('a',64),'{}',1,1,0,0,0);
+INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
+ VALUES(3,2,1,1,'%s','x/3.mp4',700,repeat('f',64),'2026-10-10T00:00:00Z','2026-10-10T01:00:00Z',ARRAY[11],now());
+COMMIT`, out11))
+	bucket.put(out11, make([]byte, 700))
+	type object struct {
 		key  string
-		body []byte
-		fail bool
-		want string
+		body []byte // nil: missing from R2
+	}
+	for label, c := range map[string]struct {
+		objects []object
+		fail    bool
+		want    string // "" permits both live files
 	}{
-		"catalogue-live raw missing from R2":   {key: raw11, want: raw11 + " is missing"},
-		"raw of another live size":             {key: raw11, body: make([]byte, 99), want: raw11 + " is 99 bytes, catalogued 100"},
-		"stitched output of another live size": {key: out13, body: make([]byte, 901), want: out13 + " is 901 bytes, catalogued 900"},
-		"stitched output missing from R2":      {key: out13, want: out13 + " is missing"},
-		"R2 error":                             {key: raw11, body: make([]byte, 100), fail: true, want: "unverified"},
+		"all counterparts live":                     {},
+		"raw gone, stitched output live":            {objects: []object{{key: raw11}}},
+		"raw live, stitched output missing":         {objects: []object{{key: out11}}},
+		"raw of another size, stitched output live": {objects: []object{{key: raw11, body: make([]byte, 99)}}},
+		"raw and stitched output both gone": {objects: []object{{key: raw11}, {key: out11}},
+			want: "is live: " + raw11 + " is missing; " + out11 + " is missing"},
+		"only stitched output of another live size": {objects: []object{{key: out13, body: make([]byte, 901)}},
+			want: out13 + " is 901 bytes, catalogued 900"},
+		"only stitched output missing": {objects: []object{{key: out13}}, want: out13 + " is missing"},
+		"R2 error":                     {fail: true, want: "unverified"},
 	} {
-		good := bucket.objects[c.key]
-		delete(bucket.objects, c.key)
-		if c.body != nil {
-			bucket.put(c.key, c.body)
+		saved := map[string][]byte{}
+		for _, o := range c.objects {
+			saved[o.key] = bucket.objects[o.key]
+			delete(bucket.objects, o.key)
+			if o.body != nil {
+				bucket.put(o.key, o.body)
+			}
 		}
 		bucket.headFailures = map[bool]int{true: 1}[c.fail]
-		if files, _, err := keCheck(all); err == nil || !strings.Contains(err.Error(), c.want) {
+		files, _, err := keCheck(all)
+		if c.want == "" && (err != nil || files != 2) || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
 			t.Errorf("%s: %d files, %v", label, files, err)
 		}
 		bucket.headFailures = 0
-		bucket.put(c.key, good)
+		for key, body := range saved {
+			bucket.put(key, body)
+		}
 	}
+	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM recording_collation_outputs WHERE id=3;
+DELETE FROM recording_collation_hours WHERE id=2; COMMIT`)
+	delete(bucket.objects, out11)
 	// A non-KE unit never reads R2.
 	at := dayAt("2026-10-10", "103000")
 	insert(21, "2026-10-10", "103000", 500, at, at.Add(time.Minute))

@@ -53,8 +53,9 @@ import (
 // The catalogue is known to drift from R2 (objects gone while purged_at is
 // null), so every admission, enable and permit also HEADs each catalogue-live
 // counterpart of every named file it would permit (Deniz: KE footage leaves the
-// NAS only when R2 actually has the same name and size). A missing object, a
-// live size other than the catalogued one, or any R2 error refuses the unit.
+// NAS only when R2 actually has the same name and size). Each such file needs
+// at least one counterpart R2 holds at its catalogued size, or the unit is
+// refused; any R2 error refuses the unit.
 
 //go:embed nas_cleanup_folder_streams.json
 var cleanupFolderStreamsJSON []byte
@@ -357,28 +358,37 @@ type cleanupDayCounterpart struct {
 	size int64
 }
 
-// cleanupDayR2Verify HEADs every counterpart with bounded concurrency. Any
-// absent object, other live size or R2 error refuses the unit.
-func cleanupDayR2Verify(ctx context.Context, store *r2.Client, counterparts map[cleanupDayCounterpart]bool) error {
+// cleanupDayR2Verify HEADs every counterpart with bounded concurrency and
+// returns why each one is not live ("" when R2 holds it at its catalogued
+// size). Any R2 error other than absence fails the whole check.
+func cleanupDayR2Verify(ctx context.Context, store *r2.Client, counterparts []cleanupDayCounterpart) (map[cleanupDayCounterpart]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, nasCleanupDayHeadTimeout)
 	defer cancel()
 	group, ctx := errgroup.WithContext(ctx)
 	group.SetLimit(nasCleanupDayHeads)
-	for c := range counterparts {
+	reasons := make([]string, len(counterparts))
+	for i, c := range counterparts {
 		group.Go(func() error {
 			head, err := store.Head(ctx, c.key)
 			switch {
 			case r2.IsNotFound(err):
-				return fmt.Errorf("R2 counterpart %s is missing", c.key)
+				reasons[i] = fmt.Sprintf("%s is missing", c.key)
 			case err != nil:
 				return fmt.Errorf("R2 counterpart %s unverified: %w", c.key, err)
 			case head.SizeBytes != c.size:
-				return fmt.Errorf("R2 counterpart %s is %d bytes, catalogued %d", c.key, head.SizeBytes, c.size)
+				reasons[i] = fmt.Sprintf("%s is %d bytes, catalogued %d", c.key, head.SizeBytes, c.size)
 			}
 			return nil
 		})
 	}
-	return group.Wait()
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	out := make(map[cleanupDayCounterpart]string, len(counterparts))
+	for i, c := range counterparts {
+		out[c] = reasons[i]
+	}
+	return out, nil
 }
 
 // nasCleanupDayEntry is one inventoried file of the unit: a media file or the
@@ -403,8 +413,8 @@ func cleanupDayMedia(entries []nasCleanupDayEntry) (files, bytes int64) {
 // cleanupDayCheck returns the unit's inventoried NAS media and sidecars, or
 // why the whole directory-day must stay. A Keep Everything unit returns only
 // its named files whose NAS size is the catalogued size and whose R2
-// counterpart is live in the catalogue; its other files stay on the NAS. Every
-// catalogue-live counterpart of a returned file is then verified in R2 itself.
+// counterpart is live in the catalogue; its other files stay on the NAS. Each
+// returned file then needs one of those counterparts verified in R2 itself.
 func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit, store *r2.Client) ([]nasCleanupDayEntry, error) {
 	w, day, loc, err := cleanupDayStatic(u)
 	if err != nil {
@@ -508,23 +518,43 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		}
 	}
 	var entries []nasCleanupDayEntry
-	counterparts := map[cleanupDayCounterpart]bool{}
+	var kept []present
+	seen := map[cleanupDayCounterpart]bool{}
+	var counterparts []cleanupDayCounterpart
 	for _, f := range files {
 		if keep(f) {
+			kept = append(kept, f)
 			entries = append(entries, f.media)
 			if f.sidecar != nil {
 				entries = append(entries, *f.sidecar)
 			}
 			for _, c := range live[f.id] {
-				counterparts[c] = true
+				if !seen[c] {
+					seen[c] = true
+					counterparts = append(counterparts, c)
+				}
 			}
 		}
 	}
 	if len(entries) == 0 {
 		return nil, errors.New("no named NAS media with a live R2 counterpart in the directory-day")
 	}
-	if err := cleanupDayR2Verify(ctx, store, counterparts); err != nil {
+	if !w.KeepEverything {
+		return entries, nil
+	}
+	// Each permitted file needs at least one counterpart R2 holds at its size.
+	reasons, err := cleanupDayR2Verify(ctx, store, counterparts)
+	if err != nil {
 		return nil, err
+	}
+	for _, f := range kept {
+		var why []string
+		for _, c := range live[f.id] {
+			why = append(why, reasons[c])
+		}
+		if !slices.Contains(why, "") {
+			return nil, fmt.Errorf("no R2 counterpart of %s is live: %s", f.media.Name, strings.Join(why, "; "))
+		}
 	}
 	return entries, nil
 }
