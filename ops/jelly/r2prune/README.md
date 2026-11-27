@@ -148,3 +148,27 @@ Tests (offline stubs for `psql` and `r2prune`, a local HTTP server for R2 HEAD):
 ```sh
 /usr/bin/python3 -I ops/jelly/r2prune/test_manual_apply.py -q
 ```
+
+## The lane
+
+`cycle.py`, `preflight.sql`, `protect.sql` and `receipt-apply.sql` here are the
+installed copies in `~/stoarama-r2prune-lane/` (launchd `com.stoarama.r2prune-lane`,
+every 15 minutes). Install them by copying between cycles, while
+`~/stoarama-r2prune-lane/cycle.lock` is free.
+
+While `~/stoarama-r2prune-lane/STOP` exists, each cycle logs
+`{"cycle": ..., "skipped": "STOP"}` to `runs.jsonl` and exits 0 before any replay, DB
+or R2 work. Remove the file to resume.
+
+The catalog preflight sends at most 5,000 candidates per statement
+(`ROWS_PER_STATEMENT`), as two arrays, all in one `REPEATABLE READ READ ONLY`
+transaction, so its vetoes equal one statement over every candidate: a single
+137k-row JSON literal preceded the 2026-11-26 production OOM. Any failed chunk
+fails the cycle before planning.
+
+```sh
+STOARAMA_TEST_DATABASE_URL=... /usr/bin/python3 -I ops/jelly/r2prune/test_cycle.py -q
+```
+
+With a test database it also checks the chunked vetoes equal the old JSON-literal
+statement on a stub catalog, and that chunks read one snapshot.
