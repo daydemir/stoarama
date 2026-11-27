@@ -17,7 +17,7 @@ ALL of these hold:
   - the frame-diff ratio at the seam is below FRAME_DIFF_VETO. Frame-diff is a veto
     only, never a reason to join.
 A seam collation split as frame_jump or packet_replay therefore joins only with the
-clock proof; every other seam stays split. A recording without a CLOCK_CROPS profile
+clock proof; every other seam stays split. A recording without a clock-profiles.tsv row
 never joins. There is no class rule: an independent check found 10 of 199 within-lease
 0 s seams with matching media whose clock jumps -8.7 to +19.9 s
 (seam-audit-20261126/independent-verify/zero-gap-exceptions.tsv). Those 10 and the final scaled
@@ -76,11 +76,25 @@ FFMPEG = os.environ.get('FFMPEG_BIN', 'ffmpeg')
 FFPROBE = os.environ.get('FFPROBE_BIN', 'ffprobe')
 DECODE_THREADS = os.environ.get('FFMPEG_THREADS', '0')  # 0 = ffmpeg's choice
 
-# Per-recording clock crop (ffmpeg crop on the decoded frame), from the seam audit's
-# clockocr.py, where it read 433's clock on 64 seams.
-CLOCK_CROPS = {433: 'crop=500:50:1420:1030'}
+
+
+def read_clock_profiles(path):
+    """{recording_id: ffmpeg crop} from clock-profiles.tsv: each clocked stream's clock region on its
+    frame scaled to PROFILE_WIDTH wide (the scaled seam census's crops, seam-audit-20261126/scaled/raw/crops.tsv.gz)."""
+    with open(path, encoding='utf-8') as f:
+        rows = list(csv.DictReader(f, delimiter='\t'))
+    out = {int(r['recording_id']): r['crop'] for r in rows}
+    bad = [c for c in out.values() if not re.fullmatch(r'crop=\d+:\d+:\d+:\d+', c)]
+    if bad or len(out) != len(rows):
+        raise SystemExit(f'{path}: crops must be unique crop=W:H:X:Y rows, got {bad[:3]}')
+    return out
+
+
+PROFILE_WIDTH = 1920
+CLOCK_CROPS = read_clock_profiles(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clock-profiles.tsv'))
 CLOCK_THRESHOLDS = (190, 150, 220)
-CLOCK_RX = (re.compile(r'([0-2]\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)'), re.compile(r'([0-2]\d):([0-5]\d)([0-5]\d)(?!\d)'))
+CLOCK_RX = (re.compile(r'([0-2]?\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)(?!\d)(AM|PM)?'),
+            re.compile(r'([0-2]?\d):([0-5]\d)([0-5]\d)(?!\d)(AM|PM)?'))
 
 # Collation split reasons that are themselves a time or stream discontinuity.
 HARD_SPLITS = frozenset({'different_capture_lease', 'capture_sequence_not_consecutive', 'codec_params_differ'})
@@ -242,7 +256,8 @@ def read_clock(src, t, crop, tmp):
     """Burned-in clock seconds-of-day at file time t, or None."""
     raw = os.path.join(tmp, f'{t:.3f}.png')
     subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-ss', f'{t:.3f}', '-i', src, '-frames:v', '1',
-                    '-vf', crop + ',scale=iw*3:ih*3,format=gray', '-y', raw], capture_output=True, timeout=300)
+                    '-vf', f'scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray', '-y', raw],
+                   capture_output=True, timeout=300)
     if not os.path.exists(raw):
         return None
     for th in CLOCK_THRESHOLDS:
@@ -256,13 +271,14 @@ def read_clock(src, t, crop, tmp):
 
 
 def parse_clock(txt):
-    """Seconds of day of the last HH:MM:SS in OCR text, or None."""
+    """Seconds of day of the last H:MM:SS or HH:MM:SS (12-hour with AM/PM, or 24-hour) in OCR text, or None."""
     txt = txt.replace(' ', '').replace('O', '0').replace('o', '0').strip()
     for rx in CLOCK_RX:
         m = rx.findall(txt)
         if m:
-            h, mi, s = map(int, m[-1])
-            return h * 3600 + mi * 60 + s
+            h, mi, sec, ap = m[-1]
+            h = int(h) % 12 + (12 if ap == 'PM' else 0) if ap else int(h)
+            return h * 3600 + int(mi) * 60 + int(sec) if h < 24 else None
     return None
 
 

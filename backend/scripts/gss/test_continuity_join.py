@@ -97,6 +97,21 @@ class RuleTests(unittest.TestCase):
         self.assertRegex(C.seam_timing_problems(a + [(1.2 + t, d) for t, d in b], [(1.2, a), (0.5, b)], f)[0], 'video ends 0.2000')
         self.assertRegex(C.seam_timing_problems(ok[:-1], [(1.02, a), (0.5, b)], f)[0], 'video packets')
 
+    def test_parse_clock(self):
+        for txt, want in (('Mierové námestie 19/09/26 16:45:38', 60338), ('08-05-2026 11:20:46 AM', 40846),
+                          ('08-05-2026 01:20:46 PM', 4846 + 12 * 3600), ('12:00:05 AM', 5), ('12:00:05 PM', 43205),
+                          ('2026-08-03 7:26:40', 26800), ('16:4538', 60338), ('no clock', None), ('29:00:00', None)):
+            self.assertEqual(C.parse_clock(txt), want, txt)
+
+    def test_clock_profiles(self):
+        self.assertEqual(len(C.CLOCK_CROPS), 18)
+        self.assertEqual(C.CLOCK_CROPS[433], 'crop=500:50:1420:1030')  # the pilot's crop, unchanged
+        with tempfile.NamedTemporaryFile('w', suffix='.tsv', delete=False) as f:
+            f.write('recording_id\tcrop\n1\tcrop=1:2:3:4,lutyuv=y=0\n')
+        with self.assertRaisesRegex(SystemExit, 'crop=W:H:X:Y'):
+            C.read_clock_profiles(f.name)
+        os.remove(f.name)
+
     def test_runs(self):
         self.assertEqual(C.runs('abcde', [True, False, True, True]), [['a', 'b'], ['c', 'd', 'e']])
         self.assertEqual(C.runs('ab', [False]), [['a'], ['b']])
