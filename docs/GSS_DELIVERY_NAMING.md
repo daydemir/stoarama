@@ -47,3 +47,14 @@ It is used by:
 
 1. Its `build_generation.py --clock-assemblies` path must not set `path` from `AssemblyPath`. Publish clock-join assemblies through `--ledger` instead.
 2. Better still, drop `AssemblyPath`, and name the assembly with `delivery_naming.delivery_path` at its place among the hour's current files, renumbering the hour's later parts.
+
+## Known exception: stream 339 stays "Unresolved"
+
+Recording 339 is the only delivered stream on naming profile `stoarama_v1` with empty
+`naming_metadata_jsonb`, so its published folder is
+`339_Unresolved_Continent_Unresolved_Country_Unresolved_City_Public_square_052_Marktplatz` and the page shows
+"Location unverified". Its location is resolved (Marktplatz, Schwäbisch Gmünd, Germany; source and evidence chain in
+the delivery records, `records/finish-plan-20261117/gss-delivery/stream-339-location.md`), but the folder is kept
+(2026-11-27) because the spec above forbids renaming a published folder and researchers are downloading it.
+Applying it later needs the DB row set, the builder taking catalog `metadata` from that row, and an explicit one-time
+rename exception for 339 in `delivery_naming.catalog_names` and here.
