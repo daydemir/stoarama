@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -330,5 +332,130 @@ func TestGlobalDeliveryMemoryBudgetWithAssetCache(t *testing.T) {
 	// and a copy, ~16 MiB each for these assets). Hits allocate almost nothing.
 	if warm > 16<<20 || cold > 96<<20 || pressure > globalDeliveryAssetCacheBytes+4*16<<20 {
 		t.Fatalf("heap peaks: warm +%d B, cold +%d B, overfilled +%d B", warm, cold, pressure)
+	}
+}
+
+// blockedResponse holds its first write until release closes, like a client
+// that stops reading.
+type blockedResponse struct {
+	header  http.Header
+	code    int
+	n       int
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (b *blockedResponse) Header() http.Header  { return b.header }
+func (b *blockedResponse) WriteHeader(code int) { b.code = code }
+func (b *blockedResponse) Write(p []byte) (int, error) {
+	if b.started != nil {
+		b.started <- struct{}{}
+		b.started = nil
+		<-b.release
+	}
+	b.n += len(p)
+	return len(p), nil
+}
+
+// TestGlobalDeliveryMemoryBudgetSlowWriters stalls gzip and identity clients
+// mid-response across more distinct assets than the cache bound holds, so
+// bodies would be evicted while still being written. The cache's charge must
+// stay within its bound and the heap within the bound plus the slot reads.
+func TestGlobalDeliveryMemoryBudgetSlowWriters(t *testing.T) {
+	gen := strings.Repeat("9", 32)
+	reg := globalDeliveryTestRegistry()
+	reg.Generation, reg.PublicDelivery, reg.SelectionScope = gen, true, "available"
+	store := globalDeliveryMapStore{}
+	bodies := map[string][]byte{}
+	for i := range 20 { // 2.7 MiB JSON each, stored by gzip: 53 MiB in all
+		random := make([]byte, 2<<20)
+		_, _ = rand.Read(random)
+		bodies[fmt.Sprintf("/public/pad-%d.json", i)] = []byte(`{"pad":"` + base64.StdEncoding.EncodeToString(random) + `"}`)
+	}
+	for i := range 8 {
+		image := make([]byte, 3<<20)
+		_, _ = rand.Read(image)
+		image[0] = 0xff
+		bodies[fmt.Sprintf("/public/images/%d.jpg", i)] = image
+	}
+	globalDeliveryCacheTestAssets(reg, store, bodies)
+	sizes := map[string]int{}
+	for name, body := range bodies {
+		sizes[name] = len(body)
+	}
+	bodies = nil
+	s := publicDeliveryTestServer(t, store, reg)
+	defer debug.SetGCPercent(debug.SetGCPercent(10))
+	baseline := heapAfterGC()
+
+	started, release := make(chan struct{}, 64), make(chan struct{})
+	type stalled struct {
+		name    string
+		gzipped bool
+		w       *blockedResponse
+	}
+	var requests []stalled
+	for name := range sizes {
+		requests = append(requests, stalled{name, true, nil}, stalled{name, false, nil})
+	}
+	var wg sync.WaitGroup
+	for i := range requests {
+		requests[i].w = &blockedResponse{header: http.Header{}, started: started, release: release}
+		wg.Go(func() {
+			r := requests[i]
+			s.handleGlobalDeliveryAsset(r.w, globalDeliveryCacheTestRequest(r.name, gen, r.gzipped))
+		})
+	}
+	var peakHeap uint64
+	var peakCharge int64
+	stalledWriters := 0
+	// Sample until no further response starts: hits stall holding their
+	// bodies, and slot-path responses stall holding every slot.
+	for idle := time.NewTimer(2 * time.Second); ; {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		if m.HeapAlloc > peakHeap {
+			peakHeap = m.HeapAlloc
+		}
+		s.globalDeliveryAssets.mu.Lock()
+		if s.globalDeliveryAssets.bytes > peakCharge {
+			peakCharge = s.globalDeliveryAssets.bytes
+		}
+		s.globalDeliveryAssets.mu.Unlock()
+		select {
+		case <-started:
+			stalledWriters++
+			idle.Reset(2 * time.Second)
+			continue
+		case <-idle.C:
+		case <-time.After(time.Millisecond):
+			continue
+		}
+		break
+	}
+	stalledLive := heapAfterGC() - baseline
+	close(release)
+	wg.Wait()
+	for _, r := range requests {
+		h := r.w.header
+		gzipped := h.Get("Content-Encoding") == "gzip"
+		if (r.w.code != 0 && r.w.code != http.StatusOK) || gzipped != (r.gzipped && strings.HasSuffix(r.name, ".json")) ||
+			(!gzipped && r.w.n != sizes[r.name]) || (h.Get("Content-Length") != "" && h.Get("Content-Length") != strconv.Itoa(r.w.n)) {
+			t.Errorf("%s gzip=%v: status %d, %d B, headers %v", r.name, r.gzipped, r.w.code, r.w.n, h)
+		}
+	}
+	mb := func(b uint64) float64 { return float64(b) / (1 << 20) }
+	t.Logf("%d responses over %.0f MiB of distinct assets, %d stalled mid-write: cache charge peak %.1f MiB of %d MiB; heap while stalled +%.1f MiB live, +%.1f MiB sampled peak",
+		len(requests), mb(uint64(20*2.7*(1<<20)+8*3<<20)), stalledWriters, mb(uint64(peakCharge)), globalDeliveryAssetCacheBytes>>20, mb(stalledLive), mb(peakHeap-baseline))
+	if peakCharge > globalDeliveryAssetCacheBytes {
+		t.Fatalf("cache charged %d B past its bound", peakCharge)
+	}
+	// Live: the cache plus 4 slot-path responses stalled mid-stream (a raw body
+	// and gzip state, under 8 MiB each). The sampled peak adds 4 fills'
+	// transient buffers and garbage awaiting collection (fills past the bound
+	// build a body and drop it).
+	const live = globalDeliveryAssetCacheBytes + 4*8<<20
+	if stalledLive > live || peakHeap-baseline > 2*live {
+		t.Fatalf("heap with stalled writers: +%d B live, +%d B peak", stalledLive, peakHeap-baseline)
 	}
 }

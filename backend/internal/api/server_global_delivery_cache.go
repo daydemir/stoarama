@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"sync"
@@ -17,12 +18,15 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-// globalDeliveryAssetCacheBytes bounds the verified asset bodies kept between
-// requests. It is part of the instance's memory budget (512 MiB, GOMEMLIMIT
-// 400 MiB) beside the parsed registry (~22 MB) and the bodies read under
+// globalDeliveryAssetCacheBytes bounds the memory the asset cache owns: every
+// resident body, including those responses are still writing (a referenced
+// body is never evicted), plus each identity response's inflate buffers. It is
+// part of the instance's memory budget (512 MiB, GOMEMLIMIT 400 MiB) beside
+// the parsed registry (~22 MB) and the bodies read under
 // globalDeliveryAssetSlots; TestGlobalDeliveryMemoryBudget measures all three.
 // A production generation's public assets gzip to ~12 MB (2026-11-26:
-// growth.json 1.3 MB, 60 stream manifests ~9 MB).
+// growth.json 1.3 MB, 60 stream manifests ~9 MB). Past the bound, requests
+// take the slot path.
 const globalDeliveryAssetCacheBytes = 48 << 20
 
 // globalDeliveryAssetEntryBytes caps one cached body. A body that encodes
@@ -32,6 +36,14 @@ const globalDeliveryAssetEntryBytes = 4 << 20
 // globalDeliveryAssetEntryOverhead is charged per entry besides its body, so
 // bodyless entries (uncached markers) are bounded too.
 const globalDeliveryAssetEntryOverhead = 512
+
+// globalDeliveryInflateBytes is charged while an identity response inflates a
+// gzipped body: a gzip reader (~42 KB measured) and a 32 KB copy buffer.
+const globalDeliveryInflateBytes = 128 << 10
+
+// globalDeliveryAssetPendingFills bounds distinct fills waiting on or holding
+// a slot; further misses take the slot path within their own request.
+const globalDeliveryAssetPendingFills = 32
 
 // globalDeliveryAssetFillTimeout bounds a fill's slot wait and R2 read. A fill
 // outlives the request that started it, so it ends with the API's 60 s
@@ -43,13 +55,17 @@ var (
 	errGlobalDeliveryAssetUnverified = errors.New("Dataset asset verification failed.")
 	errGlobalDeliveryManifestInvalid = errors.New("Manifest payload invalid.")
 	errGlobalDeliveryAssetBusy       = errors.New("Dataset asset temporarily unavailable. Reload to retry.")
+	errGlobalDeliveryAssetFailed     = errors.New("Dataset asset could not be prepared. Reload to retry.")
 	errGlobalDeliveryAssetLarge      = errors.New("dataset asset exceeds the cache entry cap")
 )
 
 func writeGlobalDeliveryAssetError(w http.ResponseWriter, err error) {
 	status := http.StatusConflict
-	if errors.Is(err, errGlobalDeliveryAssetBusy) {
+	switch {
+	case errors.Is(err, errGlobalDeliveryAssetBusy):
 		status = http.StatusServiceUnavailable
+	case errors.Is(err, errGlobalDeliveryAssetFailed):
+		status = http.StatusInternalServerError
 	}
 	util.WriteError(w, status, err.Error())
 }
@@ -62,9 +78,8 @@ type globalDeliveryServedAsset struct {
 	generation, scriptSHA string
 }
 
-// identity names the served bytes: the content-addressed object and, for a
-// manifest, the generation and tool digest stamped into it. An entry keyed by
-// it is never stale.
+// identity is the string the public ETag hashes; it names the same bytes as
+// key.
 func (a globalDeliveryServedAsset) identity() string {
 	identity := a.object.ContentType + ":" + a.object.SHA256
 	if a.manifest {
@@ -73,8 +88,26 @@ func (a globalDeliveryServedAsset) identity() string {
 	return identity
 }
 
+// globalDeliveryAssetKey names served bytes: the content-addressed object and,
+// for a manifest, the generation and tool digest stamped into it. An entry
+// keyed by it is never stale.
+type globalDeliveryAssetKey struct {
+	contentType, sha256   string
+	size                  int64
+	manifest              bool
+	generation, scriptSHA string // set only for a manifest
+}
+
+func (a globalDeliveryServedAsset) key() globalDeliveryAssetKey {
+	k := globalDeliveryAssetKey{contentType: a.object.ContentType, sha256: a.object.SHA256, size: a.object.SizeBytes, manifest: a.manifest}
+	if a.manifest {
+		k.generation, k.scriptSHA = a.generation, a.scriptSHA
+	}
+	return k
+}
+
 // globalDeliveryAssetBody is one verified served body: gzip for JSON, as
-// stored otherwise. uncached marks a body over globalDeliveryAssetEntryBytes.
+// stored otherwise. uncached marks a body served on the slot path instead.
 type globalDeliveryAssetBody struct {
 	data     []byte
 	gzipped  bool
@@ -82,6 +115,8 @@ type globalDeliveryAssetBody struct {
 	uncached bool
 }
 
+// serve writes the body; an identity response to a gzipped body must hold a
+// globalDeliveryInflateBytes charge.
 func (b globalDeliveryAssetBody) serve(w http.ResponseWriter, r *http.Request, contentType, etag string) {
 	setGlobalDeliveryAssetHeaders(w, contentType, etag)
 	h := w.Header()
@@ -101,70 +136,137 @@ func (b globalDeliveryAssetBody) serve(w http.ResponseWriter, r *http.Request, c
 }
 
 type globalDeliveryAssetEntry struct {
-	key  string
+	key  globalDeliveryAssetKey
 	done chan struct{} // closed once body or err is set
 	body globalDeliveryAssetBody
 	err  error
+	refs int           // waiters and responses holding body
 	lru  *list.Element // set while resident
 }
 
 func (e *globalDeliveryAssetEntry) cost() int64 {
-	return int64(len(e.key)+len(e.body.data)) + globalDeliveryAssetEntryOverhead
+	return int64(len(e.body.data)) + globalDeliveryAssetEntryOverhead
 }
 
-// globalDeliveryAssetCache holds verified bodies by served identity, least
-// recently used evicted past globalDeliveryAssetCacheBytes. Concurrent misses
-// for one identity share one fill; a failed fill is not kept. The zero value is
-// ready to use.
+// globalDeliveryAssetCache holds verified bodies by served identity. Bodies
+// no response references are evicted least recently used first to stay within
+// globalDeliveryAssetCacheBytes; a body that does not fit is served on the
+// slot path. Concurrent misses for one key share one fill; a failed fill is
+// not kept. The zero value is ready to use.
 type globalDeliveryAssetCache struct {
 	mu      sync.Mutex
-	entries map[string]*globalDeliveryAssetEntry
-	order   list.List // front is most recently used
-	bytes   int64
+	entries map[globalDeliveryAssetKey]*globalDeliveryAssetEntry
+	order   list.List // resident entries, front most recently used
+	bytes   int64     // resident entries and inflate charges
+	pending int       // fills not yet done
 }
 
-// get returns key's body, starting fill on a miss. The fill runs detached from
-// ctx so a departed requester does not fail the others sharing it.
-func (c *globalDeliveryAssetCache) get(ctx context.Context, key string, fill func() (globalDeliveryAssetBody, error)) (globalDeliveryAssetBody, error) {
+// get returns key's body, starting fill on a miss, and a release to call once
+// the response is written. A body served from the cache stays resident until
+// released. The fill runs detached from ctx so a departed requester does not
+// fail the others sharing it.
+func (c *globalDeliveryAssetCache) get(ctx context.Context, key globalDeliveryAssetKey, fill func() (globalDeliveryAssetBody, error)) (globalDeliveryAssetBody, func(), error) {
 	c.mu.Lock()
 	e, ok := c.entries[key]
 	switch {
-	case !ok:
+	case ok:
+		if e.lru != nil {
+			c.order.MoveToFront(e.lru)
+		}
+	case c.pending >= globalDeliveryAssetPendingFills:
+		c.mu.Unlock()
+		return globalDeliveryAssetBody{uncached: true}, func() {}, nil
+	default:
 		if c.entries == nil {
-			c.entries = map[string]*globalDeliveryAssetEntry{}
+			c.entries = map[globalDeliveryAssetKey]*globalDeliveryAssetEntry{}
 		}
 		e = &globalDeliveryAssetEntry{key: key, done: make(chan struct{})}
 		c.entries[key] = e
+		c.pending++
 		go c.fill(e, fill)
-	case e.lru != nil:
-		c.order.MoveToFront(e.lru)
 	}
+	e.refs++
 	c.mu.Unlock()
 	select {
 	case <-e.done:
-		return e.body, e.err
 	case <-ctx.Done():
-		return globalDeliveryAssetBody{}, ctx.Err()
+		c.release(e)
+		return globalDeliveryAssetBody{}, func() {}, ctx.Err()
 	}
+	if e.err != nil || e.body.uncached {
+		c.release(e)
+		return e.body, func() {}, e.err
+	}
+	return e.body, func() { c.release(e) }, nil
 }
 
-func (c *globalDeliveryAssetCache) fill(e *globalDeliveryAssetEntry, fill func() (globalDeliveryAssetBody, error)) {
-	body, err := fill()
+func (c *globalDeliveryAssetCache) release(e *globalDeliveryAssetEntry) {
 	c.mu.Lock()
+	e.refs--
+	c.mu.Unlock()
+}
+
+// fill runs one fill. A panic fails it like any error, so it is never kept.
+func (c *globalDeliveryAssetCache) fill(e *globalDeliveryAssetEntry, fill func() (globalDeliveryAssetBody, error)) {
+	body, err := func() (body globalDeliveryAssetBody, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				log.Printf("global delivery asset fill panicked sha256=%s: %v", e.key.sha256, p)
+				body, err = globalDeliveryAssetBody{}, errGlobalDeliveryAssetFailed
+			}
+		}()
+		return fill()
+	}()
+	c.mu.Lock()
+	c.pending--
 	e.body, e.err = body, err
-	if err != nil {
-		delete(c.entries, e.key)
-	} else {
+	if err == nil && c.reserve(e.cost()) {
 		e.lru = c.order.PushFront(e)
-		c.bytes += e.cost()
-		for c.bytes > globalDeliveryAssetCacheBytes {
-			old := c.order.Remove(c.order.Back()).(*globalDeliveryAssetEntry)
-			delete(c.entries, old.key)
-			c.bytes -= old.cost()
+	} else {
+		// Not kept: a failure is retried, and a body past the bound is served
+		// on the slot path until room frees.
+		delete(c.entries, e.key)
+		if err == nil {
+			e.body = globalDeliveryAssetBody{uncached: true}
 		}
 	}
 	c.mu.Unlock()
 	close(e.done)
+}
+
+// reserve charges n bytes, first evicting unreferenced entries least recently
+// used first; it reports false, charging nothing, if they cannot make room.
+// The caller holds mu.
+func (c *globalDeliveryAssetCache) reserve(n int64) bool {
+	for el := c.order.Back(); el != nil && c.bytes+n > globalDeliveryAssetCacheBytes; {
+		prev := el.Prev()
+		if old := el.Value.(*globalDeliveryAssetEntry); old.refs == 0 {
+			c.order.Remove(el)
+			old.lru = nil
+			delete(c.entries, old.key)
+			c.bytes -= old.cost()
+		}
+		el = prev
+	}
+	if c.bytes+n > globalDeliveryAssetCacheBytes {
+		return false
+	}
+	c.bytes += n
+	return true
+}
+
+// charge reserves n bytes outside any entry and returns its release, or false.
+func (c *globalDeliveryAssetCache) charge(n int64) (func(), bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.reserve(n) {
+		return nil, false
+	}
+	return func() {
+		c.mu.Lock()
+		c.bytes -= n
+		c.mu.Unlock()
+	}, true
 }
 
 func withGlobalDeliveryAssetSlot(ctx context.Context, fn func() error) error {
@@ -204,6 +306,10 @@ func (a globalDeliveryServedAsset) body(data []byte) (func(io.Writer), error) {
 // fillGlobalDeliveryAsset reads, verifies and encodes one body under a slot:
 // JSON gzipped, anything else as stored.
 func (s *Server) fillGlobalDeliveryAsset(a globalDeliveryServedAsset) (globalDeliveryAssetBody, error) {
+	if a.manifest && !globalDeliveryJSON(a.object.ContentType) {
+		// Stamped per request on the slot path; only JSON is cached stamped.
+		return globalDeliveryAssetBody{uncached: true}, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), globalDeliveryAssetFillTimeout)
 	defer cancel()
 	var body globalDeliveryAssetBody

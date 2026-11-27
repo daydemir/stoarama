@@ -368,7 +368,7 @@ func readGlobalDeliveryExact(body io.Reader, size int64) ([]byte, error) {
 // scriptSHA is empty when the generation has no download script.
 func globalDeliveryManifestBody(data []byte, generation, scriptSHA string) (func(io.Writer), error) {
 	var manifest map[string]json.RawMessage
-	if json.Unmarshal(data, &manifest) != nil {
+	if json.Unmarshal(data, &manifest) != nil || manifest == nil { // JSON null decodes to a nil map
 		return nil, errGlobalDeliveryManifestInvalid
 	}
 	stamped, _ := json.Marshal(generation)
@@ -544,17 +544,27 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 			}
 		}
 	}
-	body, err := s.globalDeliveryAssets.get(r.Context(), asset.identity(), func() (globalDeliveryAssetBody, error) {
+	body, release, err := s.globalDeliveryAssets.get(r.Context(), asset.key(), func() (globalDeliveryAssetBody, error) {
 		return s.fillGlobalDeliveryAsset(asset)
 	})
+	defer release()
+	contentType := asset.object.ContentType
 	switch {
 	case r.Context().Err() != nil:
 	case err != nil:
 		writeGlobalDeliveryAssetError(w, err)
 	case body.uncached:
 		s.streamGlobalDeliveryAsset(w, r, asset, etag)
+	case body.gzipped && !acceptsGlobalDeliveryGzip(r, contentType, etag):
+		uncharge, ok := s.globalDeliveryAssets.charge(globalDeliveryInflateBytes)
+		if !ok {
+			s.streamGlobalDeliveryAsset(w, r, asset, etag)
+			return
+		}
+		defer uncharge()
+		body.serve(w, r, contentType, etag)
 	default:
-		body.serve(w, r, asset.object.ContentType, etag)
+		body.serve(w, r, contentType, etag)
 	}
 }
 func globalDeliveryFileID(r *http.Request) string {

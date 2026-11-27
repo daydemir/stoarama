@@ -21,6 +21,8 @@ import (
 	"time"
 )
 
+func testAssetKey(name string) globalDeliveryAssetKey { return globalDeliveryAssetKey{sha256: name} }
+
 func TestGlobalDeliveryAssetCacheSharesOneFill(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var c globalDeliveryAssetCache
@@ -38,7 +40,8 @@ func TestGlobalDeliveryAssetCacheSharesOneFill(t *testing.T) {
 			var wg sync.WaitGroup
 			for i := range errs {
 				wg.Go(func() {
-					body, got := c.get(context.Background(), key, fill(err))
+					body, done, got := c.get(context.Background(), testAssetKey(key), fill(err))
+					defer done()
 					if got == nil && string(body.data) != "body" {
 						t.Errorf("waiter %d got %q", i, body.data)
 					}
@@ -65,14 +68,14 @@ func TestGlobalDeliveryAssetCacheSharesOneFill(t *testing.T) {
 				t.Fatal("shared failure", err)
 			}
 		}
-		if _, kept := c.entries["bad"]; kept || c.entries["good"] == nil {
-			t.Fatal("failed fill cached or verified fill dropped")
+		if _, kept := c.entries[testAssetKey("bad")]; kept || c.entries[testAssetKey("good")] == nil || c.entries[testAssetKey("good")].refs != 0 {
+			t.Fatal("failed fill cached, verified fill dropped, or a reference leaked")
 		}
 		// A waiter whose request ends leaves without failing the fill.
 		ctx, cancel := context.WithCancel(context.Background())
 		var wg sync.WaitGroup
 		wg.Go(func() {
-			if _, err := c.get(ctx, "slow", fill(nil)); err != context.Canceled {
+			if _, _, err := c.get(ctx, testAssetKey("slow"), fill(nil)); err != context.Canceled {
 				t.Error("departed waiter", err)
 			}
 		})
@@ -81,42 +84,131 @@ func TestGlobalDeliveryAssetCacheSharesOneFill(t *testing.T) {
 		wg.Wait()
 		release <- struct{}{}
 		synctest.Wait()
-		if c.entries["slow"] == nil || c.entries["slow"].lru == nil {
+		if e := c.entries[testAssetKey("slow")]; e == nil || e.lru == nil || e.refs != 0 {
 			t.Fatal("fill abandoned with its requester")
 		}
 	})
 }
 
+func TestGlobalDeliveryAssetCachePanickingFillFailsClosed(t *testing.T) {
+	var c globalDeliveryAssetCache
+	_, _, err := c.get(context.Background(), testAssetKey("p"), func() (globalDeliveryAssetBody, error) { panic("boom") })
+	if err != errGlobalDeliveryAssetFailed || c.entries[testAssetKey("p")] != nil || c.pending != 0 {
+		t.Fatal("panicking fill", err)
+	}
+	body, done, err := c.get(context.Background(), testAssetKey("p"), func() (globalDeliveryAssetBody, error) {
+		return globalDeliveryAssetBody{data: []byte("ok"), length: 2}, nil
+	})
+	defer done()
+	if err != nil || string(body.data) != "ok" {
+		t.Fatal("panicked fill was kept", err)
+	}
+}
+
+const testAssetSize = 3 << 20
+
+func testAssetFill(fills map[string]int, key string) func() (globalDeliveryAssetBody, error) {
+	return func() (globalDeliveryAssetBody, error) {
+		fills[key]++
+		return globalDeliveryAssetBody{data: make([]byte, testAssetSize), length: testAssetSize}, nil
+	}
+}
+
 func TestGlobalDeliveryAssetCacheByteBoundEvictsLRU(t *testing.T) {
 	var c globalDeliveryAssetCache
-	const size = 3 << 20
 	fills := map[string]int{}
 	get := func(key string) {
-		_, err := c.get(context.Background(), key, func() (globalDeliveryAssetBody, error) {
-			fills[key]++
-			return globalDeliveryAssetBody{data: make([]byte, size), length: size}, nil
-		})
+		_, done, err := c.get(context.Background(), testAssetKey(key), testAssetFill(fills, key))
 		if err != nil {
 			t.Fatal(err)
 		}
+		done()
 		if c.bytes > globalDeliveryAssetCacheBytes {
 			t.Fatalf("cache holds %d B past its %d B bound", c.bytes, globalDeliveryAssetCacheBytes)
 		}
 	}
-	fit := int(globalDeliveryAssetCacheBytes / (size + 1024))
+	fit := int(globalDeliveryAssetCacheBytes / (testAssetSize + globalDeliveryAssetEntryOverhead))
 	for i := range fit {
 		get(fmt.Sprint(i))
 	}
 	get("0") // most recently used: survives the next evictions
 	get("new-1")
 	get("new-2")
-	if fills["0"] != 1 || c.entries["0"] == nil || c.entries["1"] != nil || c.entries["2"] != nil || c.entries["3"] == nil {
+	if fills["0"] != 1 || c.entries[testAssetKey("0")] == nil || c.entries[testAssetKey("1")] != nil || c.entries[testAssetKey("2")] != nil || c.entries[testAssetKey("3")] == nil {
 		t.Fatalf("eviction is not least recently used: fills=%v", fills)
 	}
 	get("1")
 	if fills["1"] != 2 || c.order.Len() != len(c.entries) {
 		t.Fatal("evicted entry not refilled")
 	}
+}
+
+// A body a response still writes is never evicted, so slow clients cannot
+// push the cache's memory past its bound: past it, misses and inflating
+// responses go to the slot path.
+func TestGlobalDeliveryAssetCacheHeldBodiesStayWithinBound(t *testing.T) {
+	var c globalDeliveryAssetCache
+	fills := map[string]int{}
+	fit := int(globalDeliveryAssetCacheBytes / (testAssetSize + globalDeliveryAssetEntryOverhead))
+	var held []func()
+	for i := range fit {
+		body, done, err := c.get(context.Background(), testAssetKey(fmt.Sprint(i)), testAssetFill(fills, fmt.Sprint(i)))
+		if err != nil || body.uncached {
+			t.Fatal(i, err)
+		}
+		held = append(held, done)
+	}
+	body, done, err := c.get(context.Background(), testAssetKey("late"), testAssetFill(fills, "late"))
+	done()
+	if err != nil || !body.uncached || c.entries[testAssetKey("late")] != nil || len(c.entries) != fit {
+		t.Fatal("a body was admitted past the bound by evicting one still being written")
+	}
+	if c.bytes > globalDeliveryAssetCacheBytes {
+		t.Fatalf("cache charges %d B past its bound", c.bytes)
+	}
+	uncharge, ok := c.charge(globalDeliveryInflateBytes)
+	for ; ok; uncharge, ok = c.charge(globalDeliveryInflateBytes) {
+		defer uncharge()
+	}
+	if c.bytes > globalDeliveryAssetCacheBytes || c.bytes+globalDeliveryInflateBytes <= globalDeliveryAssetCacheBytes {
+		t.Fatalf("inflate charges stop at %d B of a %d B bound", c.bytes, globalDeliveryAssetCacheBytes)
+	}
+	held[0]()
+	body, done, err = c.get(context.Background(), testAssetKey("late"), testAssetFill(fills, "late"))
+	defer done()
+	if err != nil || body.uncached || c.entries[testAssetKey("0")] != nil {
+		t.Fatal("released body not evicted for a new one")
+	}
+	for _, release := range held[1:] {
+		release()
+	}
+}
+
+func TestGlobalDeliveryAssetCacheBoundsPendingFills(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var c globalDeliveryAssetCache
+		release := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range globalDeliveryAssetPendingFills {
+			wg.Go(func() {
+				_, done, _ := c.get(context.Background(), testAssetKey(fmt.Sprint(i)), func() (globalDeliveryAssetBody, error) {
+					<-release
+					return globalDeliveryAssetBody{}, nil
+				})
+				done()
+			})
+		}
+		synctest.Wait()
+		body, _, err := c.get(context.Background(), testAssetKey("next"), func() (globalDeliveryAssetBody, error) {
+			t.Error("fill started past the pending bound")
+			return globalDeliveryAssetBody{}, nil
+		})
+		if err != nil || !body.uncached || c.entries[testAssetKey("next")] != nil {
+			t.Fatal("miss past the pending bound not sent to the slot path")
+		}
+		close(release)
+		wg.Wait()
+	})
 }
 
 func TestGlobalDeliveryAssetGzipCapsEntries(t *testing.T) {
@@ -254,4 +346,39 @@ func TestGlobalDeliveryAssetOverEntryCapStreamsEachRequest(t *testing.T) {
 	if s.globalDeliveryAssets.bytes > 1024 {
 		t.Fatal("over-cap body counted in the cache", s.globalDeliveryAssets.bytes)
 	}
+}
+
+func TestPublicGlobalDeliveryManifestEdgeBodies(t *testing.T) {
+	generation := strings.Repeat("f", 32)
+	serve := func(t *testing.T, body []byte, contentType string) (*globalDeliveryTestStore, func() *httptest.ResponseRecorder) {
+		sum := sha256.Sum256(body)
+		reg := &globalDeliveryRegistry{Generation: generation, Assets: map[string]globalDeliveryObject{
+			memoryTestManifestPath: {Key: "k", ETag: "etag", ContentType: contentType, SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(body))},
+		}}
+		store := &globalDeliveryTestStore{body: body}
+		s := publicDeliveryTestServer(t, store, reg)
+		return store, func() *httptest.ResponseRecorder {
+			w := httptest.NewRecorder()
+			s.handleGlobalDeliveryAsset(w, globalDeliveryCacheTestRequest(memoryTestManifestPath, generation, true))
+			return w
+		}
+	}
+	t.Run("null manifest fails closed", func(t *testing.T) {
+		store, get := serve(t, []byte("null"), "application/json")
+		for i := 1; i <= 2; i++ {
+			if w := get(); w.Code != http.StatusConflict || store.opened != i {
+				t.Fatalf("request %d: status %d after %d reads", i, w.Code, store.opened)
+			}
+		}
+	})
+	t.Run("non-JSON manifest is stamped every time", func(t *testing.T) {
+		store, get := serve(t, []byte(`{"outputs":[{"id":1}]}`), "application/octet-stream")
+		for i := 1; i <= 2; i++ {
+			w := get()
+			if w.Code != http.StatusOK || store.opened != i || w.Header().Get("Content-Encoding") != "" ||
+				!strings.Contains(w.Body.String(), `"delivery_generation":"`+generation+`"`) || !strings.Contains(w.Body.String(), `"generation":"`+generation+`"`) {
+				t.Fatalf("request %d: status %d after %d reads: %s", i, w.Code, store.opened, w.Body.String())
+			}
+		}
+	})
 }
