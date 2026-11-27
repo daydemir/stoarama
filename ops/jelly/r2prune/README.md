@@ -138,7 +138,9 @@ owner approved by count. `r2prune` decides `delete_best14_raw_stitched` for a
 non-KE raw with a matching row even inside its 20-day window (the window keeps the
 NAS copy, not the R2 one), but never for Keep Everything, a key with any key or
 prefix protection (a raw still in `gss-protect.tsv` stays `protect_live_site`), a
-window stitch-closure key, a derived identity or a recent write. Tests:
+derived identity, an unmapped stream or interval, or a recent write. The window
+stitch closure (every source of an output overlapping a window) does not hold a
+covered raw: being such a source is what the coverage row proves. Tests:
 
 ```sh
 /usr/bin/python3 -I ops/jelly/r2prune/best14/test_best14_coverage.py -q

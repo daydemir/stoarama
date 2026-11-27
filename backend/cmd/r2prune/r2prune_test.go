@@ -736,7 +736,7 @@ func TestBest14CoverageDecide(t *testing.T) {
 	for n, want := range map[string]class{
 		"cov":     deleteBest14RawStitched, // inside its window, covered: the window keeps the NAS copy only
 		"page":    protectLiveSite,         // still page-linked: the swap has not released it
-		"closure": protectWindowNotOnNAS,   // a NAS stitch input of its window
+		"closure": deleteBest14RawStitched, // a source of a window output: what coverage proves, not a hold
 		"hold":    protectWindowNotOnNAS,   // any key protection wins
 		"absent":  protectWindowNotOnNAS,   // its output is not in the listing
 		"derived": protectWindowNotOnNAS,   // no direct catalog identity

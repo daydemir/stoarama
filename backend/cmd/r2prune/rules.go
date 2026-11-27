@@ -463,7 +463,9 @@ func (r *rules) loadIdentityFile(path string, derived bool) error {
 // owner's coverage rows: every identity is a direct catalog raw clip at the
 // listed size, the listed size matches a row whose output is in this same
 // listing at the recorded size, and nothing protects the key: no key or prefix
-// protection of any reason, no window stitch closure, not a recent write.
+// protection of any reason, not a recent write. The window stitch closure is
+// every source of an output overlapping a window, which is what a coverage row
+// proves, so it never holds a covered raw.
 func (r *rules) coveredDelete(o object, ids []identity, rows []keCoverage) (string, bool) {
 	if len(rows) == 0 || len(ids) == 0 || strings.HasPrefix(o.Key, keManifestPrefix) || r.OutputKeys[o.Key] {
 		return "", false
@@ -473,7 +475,7 @@ func (r *rules) coveredDelete(o object, ids []identity, rows []keCoverage) (stri
 			return "", false
 		}
 	}
-	if _, ok := r.Keys[o.Key]; ok || r.Closure[o.Key] || o.MTime >= r.RecentFrom {
+	if _, ok := r.Keys[o.Key]; ok || o.MTime >= r.RecentFrom {
 		return "", false
 	}
 	for _, p := range r.Prefixes {
