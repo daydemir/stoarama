@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -513,7 +514,9 @@ func TestPublicGlobalDeliveryColdRegistryConcurrentSmallPool(t *testing.T) {
 
 // Cache hits take neither the registry mutex nor R2: while the account
 // registry load holds the mutex, stalled on R2, 64 concurrent hits on a
-// two-connection pool (one held elsewhere) finish in about one hit's time.
+// two-connection pool (one held elsewhere) complete without an R2 HEAD. With
+// both connections free and the cleanup fence held exclusively, two hits wait
+// on the shared fence lock at the same time: they overlap, not serialize.
 func TestPublicGlobalDeliveryCacheHitsRunConcurrently(t *testing.T) {
 	db := cleanupTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -526,16 +529,13 @@ func TestPublicGlobalDeliveryCacheHitsRunConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Release()
-	hit := func() time.Duration {
-		began := time.Now()
+	hit := func() error {
 		got, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
-		if err != nil || got.Generation != reg.Generation {
-			t.Errorf("hit: %v", err)
+		if err == nil && got.Generation != reg.Generation {
+			err = fmt.Errorf("served %s", got.Generation)
 		}
-		return time.Since(began)
+		return err
 	}
-	single := hit()
 
 	latest := globalDeliveryPrefix + "latest.json"
 	store.globalDeliveryMapStore[latest] = raw
@@ -553,38 +553,61 @@ func TestPublicGlobalDeliveryCacheHitsRunConcurrently(t *testing.T) {
 		}
 	}()
 	_, headsBefore := store.counts()
-
 	const readers = 64
-	start := make(chan struct{})
-	done := make(chan time.Duration, readers)
+	done := make(chan error, readers)
 	for range readers {
-		go func() {
-			<-start
-			done <- hit()
-		}()
+		go func() { done <- hit() }()
 	}
-	began := time.Now()
-	close(start)
 	for range readers {
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("hit: %v", err)
+			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("cache hits waited behind the stalled load")
 		}
 	}
-	wall := time.Since(began)
-	_, headsAfter := store.counts()
+	if _, headsAfter := store.counts(); headsAfter != headsBefore {
+		t.Fatalf("cache hits sent %d R2 HEADs", headsAfter-headsBefore)
+	}
+
+	held.Release()
+	fence, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Rollback(ctx)
+	if _, err := fence.Exec(ctx, `SELECT pg_advisory_xact_lock(7343226011101)`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		go func() { done <- hit() }()
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		var waiting int
+		if err := db.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND (classid::bigint<<32 | objid::bigint)=7343226011101`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of 2 warm hits reached the shared fence lock together", waiting)
+		}
+	}
+	if err := fence.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatalf("hit after fence release: %v", err)
+		}
+	}
 	released = true
 	close(store.release)
 	if err := <-loaded; err != nil {
 		t.Fatalf("stalled load: %v", err)
-	}
-	t.Logf("one hit %s; %d concurrent hits %s", single, readers, wall)
-	if headsAfter != headsBefore {
-		t.Fatalf("cache hits sent %d R2 HEADs", headsAfter-headsBefore)
-	}
-	if limit := 16*single + 250*time.Millisecond; wall > limit {
-		t.Fatalf("%d concurrent hits took %s (one hit %s): serialized", readers, wall, single)
 	}
 }
 
