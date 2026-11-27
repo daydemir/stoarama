@@ -37,9 +37,15 @@ class RuleTests(unittest.TestCase):
             for before, after, why in (((), (), K.CLOCK_UNREADABLE), ((None, None, None), CLOCK, K.CLOCK_UNREADABLE),
                                        ((60338.5, None, None), CLOCK, K.CLOCK_UNREADABLE),
                                        (CLOCK, (60338.5, None, None), K.CLOCK_UNREADABLE),
-                                       ((60338.5, 60400.5, 60338.5), CLOCK, K.CLOCK_INCONSISTENT),
+                                       ((60338.5, 60341.0, 60343.5), CLOCK, K.CLOCK_INCONSISTENT),
                                        ((60338.5, 60340.5, None), CLOCK, K.CLOCK_INCONSISTENT)):
                 self.assertEqual(C.decide(seam(reason, before=before, after=after, ratio=0.1))[:2], (False, why))
+
+    def test_one_misread_among_three_is_outvoted(self):
+        self.assertEqual(C.side_offset((60338.5, 60400.5, 60338.5)), (60338.5, None))
+        self.assertEqual(C.decide(seam(before=(60338.5, 60344.5, 60338.5)))[:2], (True, None))
+        self.assertEqual(C.decide(seam(after=(60458.5, 60338.5, 60458.5)))[:2], (False, K.CLOCK_DISAGREES))  # the majority decides
+        self.assertEqual(C.side_offset((60338.5, 60340.0, None)), (None, K.CLOCK_INCONSISTENT))  # two that disagree: no majority
 
     def test_frame_diff_only_vetoes(self):
         self.assertEqual(C.decide(seam(ratio=1.5))[:2], (False, K.FRAME_DIFF_VETO))
@@ -65,24 +71,30 @@ class RuleTests(unittest.TestCase):
         ev = {'collation_reason': 'frame_jump', 'db_gap_s': 0.0, 'prev_span_s': 300.0, 'error': 'timeout'}
         self.assertEqual(C.verdict(ev)[:2], (False, K.EVIDENCE_FAILED))
 
-    def test_independent_review_counterexamples_never_join(self):
-        """The 10 within-lease 0 s seams with matching media whose clock jumps -8.7 to +19.9 s,
-        read through the same parser and rule (offset = clock minus seam-relative time)."""
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'testdata', 'zero_gap_exceptions.json')) as f:
-            fixture = json.load(f)['seams']
-        self.assertEqual(len(fixture), 10)
-        got = {}
-        for x in fixture:
-            parse = lambda t, txt: None if C.parse_clock(txt) is None else C.parse_clock(txt) - t
-            before = [parse(t - x['prev_duration_s'], txt) for t, txt in x['prev_reads']]
-            after = [parse(t, txt) for t, txt in x['next_reads']]
-            join, why, delta = C.decide(seam(x['seam_class'], x['db_gap_s'], before, after, ratio=0.5,
-                                             span=x['prev_duration_s'], prev=C.Media(VIDEO, AUDIO, 0.0, x['prev_duration_s'], 0.04)))
-            self.assertFalse(join, x['index'])
-            got[x['index']] = why
-        self.assertEqual(got, {4: K.CLOCK_DISAGREES, 5: K.CLOCK_UNREADABLE, 7: K.CLOCK_DISAGREES, 66: K.CLOCK_DISAGREES,
-                               107: K.CLOCK_DISAGREES, 114: K.CLOCK_INCONSISTENT, 120: K.CLOCK_INCONSISTENT,
-                               126: K.CLOCK_INCONSISTENT, 139: K.CLOCK_UNREADABLE, 154: K.CLOCK_INCONSISTENT})
+    def test_known_clock_discontinuities_never_join(self):
+        """Every known 0 s seam whose clock jumps (115 cases from the scaled audit and the independent
+        review), through the rule with offset = clock minus seam-relative time."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'testdata', 'clock_discontinuities.json')) as f:
+            cases = json.load(f)['cases']
+        self.assertEqual(len(cases), 115)
+        for x in cases:
+            before = tuple(None if c is None else c - (t - x['prev_duration_s']) for t, c in x['prev_reads'])
+            after = tuple(None if c is None else c - t for t, c in x['next_reads'])
+            join, why, _ = C.decide(seam('frame_jump', before=before, after=after, ratio=0.5, span=x['prev_duration_s'],
+                                         prev=C.Media(VIDEO, AUDIO, 0.0, x['prev_duration_s'], 0.04)))
+            self.assertFalse(join, (x['source'], x['stream'], x['seam']))
+            self.assertIn(why, (K.CLOCK_DISAGREES, K.CLOCK_INCONSISTENT, K.CLOCK_UNREADABLE))
+
+    def test_seam_timing(self):
+        f = 1 / 30
+        a = [(i * f, f) for i in range(30)]           # 1.000 s of video
+        b = [(i * f, f) for i in range(15)]
+        ok = a + [(1.02 + t, d) for t, d in b]        # audio outlasts a's video by 20 ms: the file ends at 1.02
+        self.assertEqual(C.seam_timing_problems(ok, [(1.02, a), (0.5, b)], f), [])
+        gap = a + [(1.12 + t, d) for t, d in b]       # 100 ms more than the container explains
+        self.assertRegex(C.seam_timing_problems(gap, [(1.02, a), (0.5, b)], f)[0], 'video dts step')
+        self.assertRegex(C.seam_timing_problems(a + [(1.2 + t, d) for t, d in b], [(1.2, a), (0.5, b)], f)[0], 'video ends 0.2000')
+        self.assertRegex(C.seam_timing_problems(ok[:-1], [(1.02, a), (0.5, b)], f)[0], 'video packets')
 
     def test_runs(self):
         self.assertEqual(C.runs('abcde', [True, False, True, True]), [['a', 'b'], ['c', 'd', 'e']])
