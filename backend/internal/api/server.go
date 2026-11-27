@@ -52,6 +52,7 @@ type Server struct {
 	globalDeliveryRegistry   *globalDeliveryRegistry
 	globalDeliveryRegistryAt time.Time
 	publicDelivery           atomic.Pointer[publicDeliveryEntry]
+	globalDeliveryAssets     globalDeliveryAssetCache
 
 	cfg                      config.Config
 	pool                     *pgxpool.Pool

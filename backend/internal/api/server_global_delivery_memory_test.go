@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,7 +15,9 @@ import (
 	"net/url"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,7 +58,7 @@ func memoryTestSHA(i int) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func memoryTestManifest(outputs int) []byte {
+func memoryTestManifest(stream, outputs int) []byte {
 	type proof struct {
 		ID           int    `json:"id"`
 		RecordingID  int    `json:"recording_id"`
@@ -70,13 +73,13 @@ func memoryTestManifest(outputs int) []byte {
 	list := make([]map[string]any, outputs)
 	for i := range list {
 		sha := memoryTestSHA(i)
-		list[i] = map[string]any{"recording_id": 1, "local_date": "2026-09-22", "delivery_hour": 1, "collation_hour_id": 646, "id": i, "size_bytes": 2734018, "sha256": sha,
+		list[i] = map[string]any{"recording_id": stream, "local_date": "2026-09-22", "delivery_hour": 1, "collation_hour_id": 646, "id": i, "size_bytes": 2734018, "sha256": sha,
 			"source_clip_ids": []int{1556541}, "part": 1, "parts": 9, "start_at": "2026-09-22T15:00:19+00:00", "end_at": "2026-09-22T15:00:38.999+00:00",
-			"current_r2_proof": proof{i, 1, "joined/nightly-collation-v2/objects/" + sha + ".mp4", sha, 2734018, "2026-09-24T22:26:38.365917+00:00", true, `"dec80a5acbf4fecfc3f8469cb01ad3bc"`, false},
+			"current_r2_proof": proof{i, stream, "joined/nightly-collation-v2/objects/" + sha + ".mp4", sha, 2734018, "2026-09-24T22:26:38.365917+00:00", true, `"dec80a5acbf4fecfc3f8469cb01ad3bc"`, false},
 			"available":        true, "collections": []string{"expanded60", "available"}, "scope": "expanded60", "timezone": "America/Los_Angeles", "file_url": fmt.Sprintf("/api/v1/global-street-scores-delivery/file/%d", i),
 			"path": "1_North_America_United_States_Seattle_7th_Ave_and_Bell_St/September/Tuesday/1_7th_Ave_and_Bell_St_2026_September_W4_Tuesday_hour_01_part_01.mp4", "ticket_presentation_path": true}
 	}
-	raw, _ := json.Marshal(map[string]any{"schema": 2, "collection": "verified-assembled", "recording_id": 1, "period": []string{"2026-09-22", "2026-10-05"}, "outputs": list})
+	raw, _ := json.Marshal(map[string]any{"schema": 2, "collection": "verified-assembled", "recording_id": stream, "period": []string{"2026-09-22", "2026-10-05"}, "outputs": list})
 	return raw
 }
 
@@ -84,7 +87,7 @@ func memoryTestManifest(outputs int) []byte {
 // memoryTestFiles files per generation, all listing one memoryTestOutputs-output
 // manifest for stream 1.
 func memoryTestDelivery(t testing.TB, generations ...string) (globalDeliveryMapStore, []byte) {
-	manifest := memoryTestManifest(memoryTestOutputs)
+	manifest := memoryTestManifest(1, memoryTestOutputs)
 	sum := sha256.Sum256(manifest)
 	manifestKey := globalDeliveryPrefix + "assets/" + hex.EncodeToString(sum[:]) + "/manifest"
 	store := globalDeliveryMapStore{manifestKey: manifest}
@@ -199,16 +202,18 @@ func TestGlobalDeliveryManifestRewriteEdgeShapes(t *testing.T) {
 		{`{"outputs":{"id":1},"download_script_sha256":"kept"}`, "", `{"outputs":{"id":1},"download_script_sha256":"kept","generation":"g"}`},
 		{`{"schema":2}`, "", `{"generation":"g","schema":2}`},
 	} {
-		w := httptest.NewRecorder()
-		writeGlobalDeliveryManifest(w, httptest.NewRequest(http.MethodGet, "/", nil), []byte(c.in), "g", c.script, "application/json", "")
-		if w.Body.String() != c.want {
-			t.Fatalf("%s:\n got %s\nwant %s", c.in, w.Body.String(), c.want)
+		write, err := globalDeliveryManifestBody([]byte(c.in), "g", c.script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got bytes.Buffer
+		write(&got)
+		if got.String() != c.want {
+			t.Fatalf("%s:\n got %s\nwant %s", c.in, got.String(), c.want)
 		}
 	}
-	w := httptest.NewRecorder()
-	writeGlobalDeliveryManifest(w, httptest.NewRequest(http.MethodGet, "/", nil), []byte(`{"outputs":[`), "g", "", "application/json", "")
-	if w.Code != http.StatusConflict {
-		t.Fatal("invalid manifest served", w.Code)
+	if _, err := globalDeliveryManifestBody([]byte(`{"outputs":[`), "g", ""); err != errGlobalDeliveryManifestInvalid {
+		t.Fatal("invalid manifest accepted", err)
 	}
 }
 
@@ -229,5 +234,101 @@ func TestGlobalDeliveryRegistryDecodeRejectsCorruptGzip(t *testing.T) {
 		if _, err := decodeGlobalDeliveryRegistry(raw); err == nil {
 			t.Fatalf("corrupt %s accepted", name)
 		}
+	}
+}
+
+type discardResponse struct {
+	header http.Header
+	code   int
+}
+
+func (d *discardResponse) Header() http.Header         { return d.header }
+func (d *discardResponse) Write(p []byte) (int, error) { return len(p), nil }
+func (d *discardResponse) WriteHeader(code int)        { d.code = code }
+
+// TestGlobalDeliveryMemoryBudgetWithAssetCache serves production-shaped page loads
+// (metadata, catalog, an 8.3 MB growth.json and a stream manifest each) at
+// once, plus non-JSON assets that overfill the cache, and measures the heap
+// above the retained 55k-file registry: the peak while they run and what the
+// cache keeps afterwards.
+func TestGlobalDeliveryMemoryBudgetWithAssetCache(t *testing.T) {
+	gen := "549402679c9d5f158cece1c4f77bad16"
+	store, _ := memoryTestDelivery(t, gen)
+	reg, err := (&Server{globalDeliveryStore: store}).readPublicDeliveryRegistry(context.Background(), gen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodies := map[string][]byte{"/public/metadata.json": benchJSON(150 << 10), "/public/catalog.json": benchJSON(90 << 10), "/public/growth.json": benchJSON(8_300_000)}
+	for id := 2; id <= 60; id++ {
+		bodies[fmt.Sprintf("/api/coverage-delivery/manifest?stream=%d&scope=available", id)] = memoryTestManifest(id, 415)
+	}
+	var images []string
+	for i := range 24 {
+		image := make([]byte, 3<<20)
+		_, _ = rand.Read(image)
+		image[0] = 0xff // not JSON: stored as is
+		name := fmt.Sprintf("/public/images/%d.jpg", i)
+		bodies[name], images = image, append(images, name)
+	}
+	globalDeliveryCacheTestAssets(reg, store, bodies)
+	s := publicDeliveryTestServer(t, store, reg)
+	var pages []string
+	for i := range 20 {
+		pages = append(pages, "/public/metadata.json", "/public/catalog.json", "/public/growth.json", fmt.Sprintf("/api/coverage-delivery/manifest?stream=%d&scope=available", i%60+1))
+	}
+	bodies = nil
+	// Collect often so HeapAlloc tracks live bytes, not GC pacing.
+	defer debug.SetGCPercent(debug.SetGCPercent(10))
+	baseline := heapAfterGC()
+	burst := func(names []string) uint64 {
+		done := make(chan struct{})
+		var peak uint64
+		sampled := make(chan struct{})
+		go func() {
+			defer close(sampled)
+			var m runtime.MemStats
+			for {
+				runtime.ReadMemStats(&m)
+				if m.HeapAlloc > peak {
+					peak = m.HeapAlloc
+				}
+				select {
+				case <-done:
+					return
+				case <-time.After(time.Millisecond):
+				}
+			}
+		}()
+		var wg sync.WaitGroup
+		for _, name := range names {
+			wg.Go(func() {
+				w := &discardResponse{header: http.Header{}}
+				s.handleGlobalDeliveryAsset(w, globalDeliveryCacheTestRequest(name, gen, true))
+				if w.code != 0 && w.code != http.StatusOK {
+					t.Errorf("%s: %d", name, w.code)
+				}
+			})
+		}
+		wg.Wait()
+		close(done)
+		<-sampled
+		return peak - baseline
+	}
+	mb := func(b uint64) float64 { return float64(b) / (1 << 20) }
+	cold := burst(pages)
+	pageCache := heapAfterGC() - baseline
+	pageEntries := len(s.globalDeliveryAssets.entries)
+	warm := burst(pages)
+	pressure := burst(append(images, pages...))
+	retained := heapAfterGC() - baseline
+	t.Logf("above the registry and fake R2 (%.1f MiB): page-load cache %.1f MiB (%d entries); %d concurrent requests: cold peak +%.1f MiB, warm peak +%.1f MiB; %d with %d MiB of images: peak +%.1f MiB, cache %.1f MiB accounted, %.1f MiB retained",
+		mb(baseline), mb(pageCache), pageEntries, len(pages), mb(cold), mb(warm), len(images)+len(pages), 24*3, mb(pressure), mb(uint64(s.globalDeliveryAssets.bytes)), mb(retained))
+	if s.globalDeliveryAssets.bytes > globalDeliveryAssetCacheBytes || retained > globalDeliveryAssetCacheBytes+4<<20 {
+		t.Fatalf("cache retains %d B past its %d B bound", retained, globalDeliveryAssetCacheBytes)
+	}
+	// Live bytes: the cache, plus at most 4 slot reads (raw body, its encoding
+	// and a copy, ~16 MiB each for these assets). Hits allocate almost nothing.
+	if warm > 16<<20 || cold > 96<<20 || pressure > globalDeliveryAssetCacheBytes+4*16<<20 {
+		t.Fatalf("heap peaks: warm +%d B, cold +%d B, overfilled +%d B", warm, cold, pressure)
 	}
 }

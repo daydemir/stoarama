@@ -37,9 +37,10 @@ func (c delayedConn) Write(b []byte) (int, error) {
 }
 
 // TestPublicGlobalDeliveryPageLoadBench measures what concurrent researchers
-// see: loaders each fetch metadata, catalog and growth at once, through the
-// API router, a seeded PostgreSQL pool (production's 20 connections) and a
-// fake R2 over HTTP. Set STOARAMA_GSS_DELIVERY_BENCH=1; override with
+// see: loaders each fetch metadata, catalog, growth and one stream manifest at
+// once, through the API router, a seeded PostgreSQL pool (production's 20
+// connections) and a fake R2 over HTTP. Assets are production-sized
+// (2026-11-26: growth.json 8.3 MB, a 415-output manifest 0.48 MB). Set STOARAMA_GSS_DELIVERY_BENCH=1; override with
 // STOARAMA_GSS_DELIVERY_BENCH_{LOADERS,ROUNDS,DB_RTT_MS,HEAD_MS,GET_MS}.
 func TestPublicGlobalDeliveryPageLoadBench(t *testing.T) {
 	if os.Getenv("STOARAMA_GSS_DELIVERY_BENCH") == "" {
@@ -77,10 +78,13 @@ func TestPublicGlobalDeliveryPageLoadBench(t *testing.T) {
 	}
 	reg := globalDeliveryTestRegistry()
 	reg.Generation, reg.PublicDelivery, reg.SelectionScope = strings.Repeat("d", 32), true, "available"
-	assets := []string{"/public/metadata.json", "/public/catalog.json", "/public/growth.json"}
+	bodies := map[string][]byte{"/public/metadata.json": benchJSON(150 << 10), "/public/catalog.json": benchJSON(90 << 10), "/public/growth.json": benchJSON(8_300_000)}
+	streams := 49
+	for id := 1; id <= streams; id++ {
+		bodies[fmt.Sprintf("/api/coverage-delivery/manifest?stream=%d&scope=available", id)] = memoryTestManifest(id, 415)
+	}
 	reg.Assets = map[string]globalDeliveryObject{}
-	for i, name := range assets {
-		body := []byte(fmt.Sprintf(`{"asset":%q,"pad":%q}`, name, strings.Repeat("x", 64<<10+i)))
+	for name, body := range bodies {
 		sha, etag := sha256.Sum256(body), md5.Sum(body)
 		o := globalDeliveryObject{Key: globalDeliveryPrefix + "assets" + name, ETag: hex.EncodeToString(etag[:]), SHA256: hex.EncodeToString(sha[:]), SizeBytes: int64(len(body)), ContentType: "application/json", Verified: true}
 		reg.Assets[name] = o
@@ -116,7 +120,7 @@ func TestPublicGlobalDeliveryPageLoadBench(t *testing.T) {
 		}
 		return time.Since(began)
 	}
-	fetch(assets[0]) // cold load
+	fetch("/public/metadata.json") // cold load
 	bucket.mu.Lock()
 	bucket.headDelay = time.Duration(env("HEAD_MS", 30)) * time.Millisecond
 	bucket.getDelay = time.Duration(env("GET_MS", 60)) * time.Millisecond
@@ -125,17 +129,21 @@ func TestPublicGlobalDeliveryPageLoadBench(t *testing.T) {
 	var mu sync.Mutex
 	latency := map[string][]time.Duration{}
 	var wg sync.WaitGroup
-	for range loaders {
+	for loader := range loaders {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for range rounds {
+			for round := range rounds {
 				var page sync.WaitGroup
-				for _, name := range assets {
+				stream := fmt.Sprintf("/api/coverage-delivery/manifest?stream=%d&scope=available", (loader*rounds+round)%streams+1)
+				for _, name := range []string{"/public/metadata.json", "/public/catalog.json", "/public/growth.json", stream} {
 					page.Add(1)
 					go func() {
 						defer page.Done()
 						d := fetch(name)
+						if name == stream {
+							name = "stream manifest"
+						}
 						mu.Lock()
 						latency[name] = append(latency[name], d)
 						mu.Unlock()
@@ -148,10 +156,31 @@ func TestPublicGlobalDeliveryPageLoadBench(t *testing.T) {
 	wg.Wait()
 	gets, heads := bucket.counts()
 	t.Logf("loaders=%d rounds=%d db_rtt=%s r2_head=%s r2_get=%s r2_gets=%d r2_heads=%d", loaders, rounds, rtt, bucket.headDelay, bucket.getDelay, gets, heads)
-	for _, name := range assets {
+	var all []time.Duration
+	for _, name := range []string{"/public/metadata.json", "/public/catalog.json", "/public/growth.json", "stream manifest", "all"} {
 		d := latency[name]
+		if name == "all" {
+			d = all
+		} else {
+			all = append(all, d...)
+		}
 		slices.Sort(d)
 		pct := func(p int) time.Duration { return d[(len(d)-1)*p/100] }
 		t.Logf("%-22s n=%d p50=%s p95=%s max=%s", name, len(d), pct(50).Round(time.Millisecond), pct(95).Round(time.Millisecond), d[len(d)-1].Round(time.Millisecond))
 	}
+}
+
+// benchJSON is a JSON document of about size bytes that gzips like the
+// published metadata (~6x).
+func benchJSON(size int) []byte {
+	var b strings.Builder
+	b.WriteString(`{"rows":[`)
+	for i := 0; b.Len() < size; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"stream":%d,"date":"2026-%02d-%02d","hour":%d,"parts":%d,"bytes":%d}`, i%60+1, i%12+1, i%28+1, i%24, (i*7919)%97, (i*104729)%9999991)
+	}
+	b.WriteString("]}")
+	return []byte(b.String())
 }

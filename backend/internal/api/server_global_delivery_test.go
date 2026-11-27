@@ -127,21 +127,30 @@ func TestGlobalDeliveryRegistryAcceptsGrowingPublishedMetadata(t *testing.T) {
 }
 func TestGlobalDeliveryAssetSHAGuardAndExactLookup(t *testing.T) {
 	p := &accountPrincipal{AccountID: 47}
-	m := &globalDeliveryTestStore{body: []byte("hello")}
+	m := &globalDeliveryTestStore{body: []byte("wrong")}
 	s := &Server{globalDeliveryStore: m, globalDeliveryRegistry: globalDeliveryTestRegistry(), globalDeliveryRegistryAt: time.Now()}
-	w := httptest.NewRecorder()
-	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", "/?path=/fixture.txt", "", p))
-	if w.Code != 200 || w.Body.String() != "hello" {
+	get := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", "/?path=/fixture.txt", "", p))
+		return w
+	}
+	// A body failing its sha256 fails closed and is never cached.
+	for i := 1; i <= 2; i++ {
+		if w := get(); w.Code != 409 || m.opened != i {
+			t.Fatalf("mismatched payload: status %d after %d reads", w.Code, m.opened)
+		}
+	}
+	m.body = []byte("hello")
+	if w := get(); w.Code != 200 || w.Body.String() != "hello" || w.Header().Get("Content-Length") != "5" {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
+	// The verified body is served from memory, content-addressed by its sha256.
 	m.body = []byte("wrong")
-	w = httptest.NewRecorder()
-	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", "/?path=/fixture.txt", "", p))
-	if w.Code != 409 {
-		t.Fatalf("changed payload %d", w.Code)
+	if w := get(); w.Code != 200 || w.Body.String() != "hello" || m.opened != 3 {
+		t.Fatalf("cached payload: %d %s after %d reads", w.Code, w.Body.String(), m.opened)
 	}
 	before := m.opened
-	w = httptest.NewRecorder()
+	w := httptest.NewRecorder()
 	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", "/?path=../secrets.env", "", p))
 	if w.Code != 404 || m.opened != before {
 		t.Fatal("unregistered path reached storage")
@@ -329,8 +338,9 @@ func TestPublicGlobalDeliveryRevalidatesAssetRepresentations(t *testing.T) {
 		!bytes.Contains(decoded, []byte(`"path":"unchanged.mp4"`)) {
 		t.Fatalf("identity and gzip must carry the same stamped manifest: %q", decoded)
 	}
+	// One verified read serves both representations.
 	w := request("gzip", `"unrelated", `+etag)
-	if w.Code != http.StatusNotModified || w.Body.Len() != 0 || store.opened != 2 {
+	if w.Code != http.StatusNotModified || w.Body.Len() != 0 || store.opened != 1 {
 		t.Fatalf("revalidation opened storage or wrote a body: status=%d opens=%d", w.Code, store.opened)
 	}
 	// An unchanged R2 asset must be stamped again after publication moves.
@@ -339,7 +349,7 @@ func TestPublicGlobalDeliveryRevalidatesAssetRepresentations(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = request("identity", etag)
-	if w.Code != http.StatusOK || etag == w.Header().Get("ETag") || store.opened != 3 {
+	if w.Code != http.StatusOK || etag == w.Header().Get("ETag") || store.opened != 2 {
 		t.Fatalf("new generation reused old manifest: status=%d opens=%d", w.Code, store.opened)
 	}
 }
