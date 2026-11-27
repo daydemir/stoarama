@@ -485,15 +485,28 @@ def serving_set(record, slot, by_input, listing, holds, names):
                  for k, x in enumerate(served, 1)), tuple(carried)
 
 
+def live_after_clock_joins(assemblies):
+    """The assemblies that serve: a clock-join assembly (from a proof, path None) replaces
+    every live generation assembly wholly inside its inputs, which then stays in R2, held
+    and unreferenced. A live assembly it only partly covers fails."""
+    claimed = {i: a.file_id for a in assemblies if a.path is None for i in a.input_ids}
+    out = []
+    for a in assemblies:
+        over = {claimed.get(i) for i in a.input_ids}
+        if a.path is None or over == {None}:
+            out.append(a)
+        elif len(over) > 1:
+            raise LedgerError(f'assembly {a.file_id} is only partly inside clock-join assemblies {sorted(over - {None})}')
+    return out
+
+
 def assembly_index(inputs):
     """{part output_id: live assembly} for assemblies touching a best-14 hour; checks each run."""
     records_of = {p.output_id: (r, p) for rs in inputs.records.values() for r in rs for p in r.parts}
     window = {(rid, d, h) for rid, (_, days) in inputs.best14.items() for d, _ in days for h in HOURS}
     slot_of = {p.output_id: slot for slot, rs in inputs.records.items() for r in rs for p in r.parts}
     by_input = {}
-    for a in inputs.assemblies:
-        if a.file_id in VETOED:
-            continue  # its parts serve in its place
+    for a in live_after_clock_joins(inputs.assemblies):
         inside = [i in slot_of and slot_of[i] in window for i in a.input_ids]
         if not any(inside):
             continue
