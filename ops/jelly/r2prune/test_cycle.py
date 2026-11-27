@@ -59,6 +59,20 @@ class Script(Lane):
         self.assertEqual([(k, int(s)) for ck, cs in zip(kinds, ids) for k, s in zip(ck, cs)], candidates)
         self.assertLess(max(map(len, lines)), 100_000)
 
+    def test_stop_file_skips_the_cycle(self):
+        L = str(self.dir)
+        Path(L, 'STOP').write_text('')
+        with unittest.mock.patch.object(cycle, 'psql', side_effect=AssertionError('read')), \
+             unittest.mock.patch.object(cycle, 'run', side_effect=AssertionError('run')), \
+             unittest.mock.patch.object(cycle, 'finish_receipts', side_effect=AssertionError('replay')), \
+             unittest.mock.patch('sys.stdout'):
+            cycle.main(L)
+        rows = [json.loads(l) for l in Path(L, 'runs.jsonl').read_text().splitlines()]
+        self.assertEqual([r['skipped'] for r in rows], ['STOP'])
+        self.assertRegex(rows[0]['cycle'], r'^\d{8}T\d{6}Z$')
+        self.assertFalse(Path(L, 'cycle.lock').exists())
+        self.assertFalse(Path(L, 'cycles').exists())
+
     def test_receipts_read_is_memory_capped(self):
         sets = [l for l in cycle.RECEIPTS.splitlines() if l.startswith('SET ')]
         self.assertIn("SET LOCAL work_mem='32MB';", sets)

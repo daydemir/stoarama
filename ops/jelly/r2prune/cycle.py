@@ -317,6 +317,10 @@ def finish_receipts(W, lock_fd, replay=False):
 
 
 def main(L):
+    # <lane>/STOP pauses the lane: no replay, DB or R2 work until it is removed.
+    if os.path.exists(L + '/STOP'):
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        return log(L, {'cycle': stamp, 'skipped': 'STOP'})
     # The kernel releases the lock after a crash so the journal can replay.
     with open(L + '/cycle.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

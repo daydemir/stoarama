@@ -156,6 +156,10 @@ installed copies in `~/stoarama-r2prune-lane/` (launchd `com.stoarama.r2prune-la
 every 15 minutes). Install them by copying between cycles, while
 `~/stoarama-r2prune-lane/cycle.lock` is free.
 
+While `~/stoarama-r2prune-lane/STOP` exists, each cycle logs
+`{"cycle": ..., "skipped": "STOP"}` to `runs.jsonl` and exits 0 before any replay, DB
+or R2 work. Remove the file to resume.
+
 The catalog preflight sends at most 5,000 candidates per statement
 (`ROWS_PER_STATEMENT`), as two arrays, all in one `REPEATABLE READ READ ONLY`
 transaction, so its vetoes equal one statement over every candidate: a single
