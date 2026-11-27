@@ -51,12 +51,24 @@ RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'}
 # if its in the keep 20? otherwise it can be deleted right?"; "lift nas cleanup
 # dialy limit please".
 # Keep Everything (verbatim: "nas shoul dnot have any of the keep everything
-# (except the keep 20)"): KE streams come after the others, and a KE unit names
-# only media whose R2 counterpart is live and listed with the same size.
-DAY_REASON = ('Deniz approval (verbatim: "yes, delete"; "nas shoul dnot have any of the keep everything (except the keep 20)"): '
-              'NAS raw day directories outside the pinned 20-day window; server and independent folder/window/hold check PASS; '
-              'Keep Everything days name only media with a live same-size R2 counterpart; no daily cap; one owned plan.')
+# (except the keep 20)"): a KE unit names only media whose own raw R2 object is
+# live and listed with the same size.
+# Redundancy gate (Deniz, 2026-11-27, verbatim: "yuea double check everything be
+# 100% sure redundancy before deleting"): a NAS file leaves only against another
+# verified copy of the same content. A KE name's raw R2 object is that copy: live
+# at the same size, the same sha256 wherever the catalogue and the NAS inventory
+# both record one, and before every enable RESTORE_SAMPLE random hashed names are
+# fetched from R2 and hash-matched. A stitched output is not the same content.
+# Non-KE day units prove no second copy: they are never planned, enabled or left
+# running.
+DAY_REASON = ('Deniz approval (verbatim: "nas shoul dnot have any of the keep everything (except the keep 20)"; '
+              '"yuea double check everything be 100% sure redundancy before deleting"): Keep Everything NAS raw outside the '
+              'pinned 20-day window, each name against its live raw R2 copy (same size, same sha256 where recorded, '
+              'R2 restore sample hash-matched); server and independent folder/window/hold check PASS; one owned plan.')
 R2PRUNE = Path.home() / 'stoarama-r2prune-lane' / 'r2prune'
+AWS = Path.home() / 'aws-cli' / 'aws'
+RESTORE_SAMPLE = 20
+RESTORE_TIMEOUT_SEC = 900
 FOLDERS = 'backend/internal/api/nas_cleanup_folder_streams.json'
 FOLDERS_SHA = '94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88bc33c4c90cae0e7ab8'
 DAY_MAX_UNITS = 1000
@@ -65,6 +77,17 @@ DAY_MAX_UNITS = 1000
 FILE_EXCLUSIONS, DAY_EXCLUSIONS = 'excluded_streams', 'day_excluded_streams'
 EXCLUSIONS = (FILE_EXCLUSIONS, DAY_EXCLUSIONS)
 DAY_TERMINAL = {'deleted', 'refused', 'client_refused', 'retired'}
+# SQL CTEs over u (dir, d, sid, names): n, one row per Keep Everything name; k, each name's catalogued clips of
+# that path and size, whether the clip's own raw R2 object is live (the preparer's r2_live_raw on alias rc), and
+# the catalogued and present NAS inventory sha256 (null when unrecorded).
+KE_NAME_COPIES = """n AS (SELECT u.dir,u.d,u.sid,x->>'name' name,(x->>'size_bytes')::bigint size
+            FROM u CROSS JOIN jsonb_array_elements(u.names) x),
+          k AS (SELECT n.dir,n.d,n.name,rc.object_key,rc.size_bytes,__RAW_LIVE__ live,
+              lower(nullif(rc.sha256,'')) cat_sha,lower(nullif(f.sha256,'')) nas_sha
+            FROM n JOIN recordings r ON r.account_id=47 AND r.stream_id=n.sid
+            JOIN recording_clips rc ON rc.recording_id=r.id AND rc.display_path=n.dir||'/'||n.name AND rc.size_bytes=n.size
+            LEFT JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=rc.id AND f.state='present'
+              AND f.relative_path=rc.display_path)"""
 _MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
            'August', 'September', 'October', 'November', 'December')
 _WEEKDAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
@@ -299,6 +322,7 @@ def day_verify(plan, windows, timezones, keep_everything, folders, catalog):
         require(u['state'] == 'pending' and u['attempt'] == 0 and u['receipts'] == [], 'day unit already started')
         sid, directory = u['stream_id'], u['relative_dir']
         require(sid in windows, 'day unit stream is unpinned')
+        require(sid in keep_everything, 'a non-Keep-Everything day unit has no proven second copy')
         names = u.get('names') or []
         require((sid in keep_everything) == bool(names), 'a Keep Everything unit names its media; any other unit names none')
         require(all(type(n['size_bytes']) is int and n['size_bytes'] > 0 for n in names)
@@ -315,7 +339,8 @@ def day_verify(plan, windows, timezones, keep_everything, folders, catalog):
         row = rows.get((directory, u['local_date']))
         require(row is not None and row['held'] == 0 and row['overlap'] == 0 and row['dir_held'] is False,
                 'directory-day has a held or in-window catalogued clip')
-        require(row['unlive'] == 0, 'a Keep Everything name lacks a live same-size R2 counterpart in the catalogue')
+        require(row['unlive'] == 0, 'a Keep Everything name lacks its live same-size raw R2 object in the catalogue')
+        require(row['mismatch'] == 0, 'a Keep Everything name differs in sha256 from its raw R2 object')
     require(len({u['stream_id'] for u in units}) == 1, 'day plan must be one stream')
     return plan['bytes']
 
@@ -1520,31 +1545,92 @@ class Runner:
                  'ws': self.windows[u['stream_id']][0].isoformat(), 'we': self.windows[u['stream_id']][1].isoformat(),
                  'names': u.get('names') or [], 'ke': u['stream_id'] in self.keep_everything} for u in plan['units']]
         encoded = base64.b64encode(json.dumps(rows).encode()).decode()
-        prepare = self.preparer()
-        # unlive: Keep Everything names whose catalogued clip of the stream is missing, has another size,
-        # or has no live R2 counterpart (the preparer's and server's rule).
+        # Per Keep Everything name, against the stream's catalogued clips of that path and size (the preparer's
+        # rule): unlive, none whose own raw R2 object is live (a stitched output is not the same content);
+        # mismatch, one whose catalogued and present NAS inventory sha256 differ; hashless, none with both.
         return self.query("""WITH u AS (SELECT x->>'dir' dir,(x->>'d')::date d,(x->>'sid')::bigint sid,x->>'tz' tz,
             (x->>'ws')::timestamptz ws,(x->>'we')::timestamptz we,x->'names' names,(x->>'ke')::boolean ke
           FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
           c AS (SELECT u.dir,u.d,c.id,(c.clip_start_at<u.we AND c.clip_end_at>u.ws) inside FROM u
             JOIN recordings r ON r.account_id=47 AND r.stream_id=u.sid JOIN recording_clips c ON c.recording_id=r.id
             WHERE c.clip_start_at>=u.d::timestamp AT TIME ZONE u.tz AND c.clip_start_at<(u.d+1)::timestamp AT TIME ZONE u.tz
-              AND left(c.display_path,length(u.dir)+1)=u.dir||'/' AND strpos(substr(c.display_path,length(u.dir)+2),'/')=0)
+              AND left(c.display_path,length(u.dir)+1)=u.dir||'/' AND strpos(substr(c.display_path,length(u.dir)+2),'/')=0),
+          """ + self.ke_name_copies() + """,
+          s AS (SELECT n.dir,n.d,n.name,coalesce(bool_or(k.live),false) live,coalesce(bool_or(k.cat_sha<>k.nas_sha),false) mismatch,
+              coalesce(bool_or(k.cat_sha IS NOT NULL AND k.nas_sha IS NOT NULL),false) hashed
+            FROM n LEFT JOIN k ON k.dir=n.dir AND k.d=n.d AND k.name=n.name GROUP BY n.dir,n.d,n.name)
           SELECT coalesce(json_agg(json_build_object('relative_dir',u.dir,'local_date',u.d::text,
             'held',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND nas_cleanup_day_clip_held(c.id,u.ke)),
             'overlap',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND c.inside),
             'dir_held',nas_cleanup_day_dir_held(u.dir,u.ke),
-            'unlive',(SELECT count(*) FROM jsonb_array_elements(u.names) n WHERE NOT EXISTS(SELECT 1 FROM recording_clips c
-              JOIN recordings r ON r.id=c.recording_id AND r.account_id=47 AND r.stream_id=u.sid
-              WHERE c.display_path=u.dir||'/'||(n->>'name') AND c.size_bytes=(n->>'size_bytes')::bigint AND (""" + prepare.r2_live_raw('c', prepare.R2_BUCKET) + """
-               OR EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.source_clip_ids @> ARRAY[c.id] AND """ + prepare.R2_LIVE_OUTPUT + """)))))),'[]') FROM u""", 'day catalog query')
+            'unlive',(SELECT count(*) FROM s WHERE s.dir=u.dir AND s.d=u.d AND NOT s.live),
+            'mismatch',(SELECT count(*) FROM s WHERE s.dir=u.dir AND s.d=u.d AND s.mismatch),
+            'hashless',(SELECT count(*) FROM s WHERE s.dir=u.dir AND s.d=u.d AND NOT s.hashed))),'[]') FROM u""", 'day catalog query')
+
+    def ke_name_copies(self):
+        prepare = self.preparer()
+        return KE_NAME_COPIES.replace('__RAW_LIVE__', prepare.r2_live_raw('rc', prepare.R2_BUCKET))
+
+    def day_sample(self, p):
+        """Restore sample of a Keep Everything plan: fetch RESTORE_SAMPLE random hashed names (every name of a
+        smaller plan) from their raw R2 object; each must have the catalogued size and every recorded sha256."""
+        names = sum(len(u.get('names') or ()) for u in p['units'])
+        rows = [{'dir': u['relative_dir'], 'd': u['local_date'], 'sid': u['stream_id'], 'names': u.get('names') or []}
+                for u in p['units']]
+        encoded = base64.b64encode(json.dumps(rows).encode()).decode()
+        sample = self.query("""WITH u AS (SELECT x->>'dir' dir,(x->>'d')::date d,(x->>'sid')::bigint sid,x->'names' names
+          FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
+          """ + self.ke_name_copies() + """
+          SELECT coalesce(json_agg(json_build_array(object_key,size_bytes,cat_sha,nas_sha)),'[]')
+          FROM (SELECT * FROM (SELECT DISTINCT ON (object_key) * FROM k WHERE live AND (cat_sha IS NOT NULL OR nas_sha IS NOT NULL)) h
+            ORDER BY random() LIMIT """ + str(RESTORE_SAMPLE) + ') s', 'restore sample query')
+        require(len(sample) == min(RESTORE_SAMPLE, names), 'too few hashed names for the R2 restore sample')
+        for key, size, cat_sha, nas_sha in sample:
+            got = self.r2_sha256(key)
+            require(got[0] == size and all(h is None or h == got[1] for h in (cat_sha, nas_sha)),
+                    'R2 restore sample differs from the catalogue or the NAS inventory')
+        with (self.root / 'runner.jsonl').open('a') as output:
+            output.write(json.dumps(dict(at=utcnow().isoformat(), phase='day_restore_sample', day_plan=p['id'],
+                                         plan_sha256=p['plan_sha256'], names=names, sampled=len(sample))) + '\n')
+            output.flush(); os.fsync(output.fileno())
+
+    def r2_sha256(self, key):
+        """Fetch one R2 object read-only: (bytes, sha256). R2 credentials reach the CLI only through its environment."""
+        env = dict(os.environ, AWS_ACCESS_KEY_ID=os.environ['R2_ACCESS_KEY_ID'],
+                   AWS_SECRET_ACCESS_KEY=os.environ['R2_SECRET_ACCESS_KEY'], AWS_DEFAULT_REGION='auto')
+        endpoint = 'https://%s.r2.cloudflarestorage.com' % os.environ['R2_ACCOUNT_ID']
+        digest, size = hashlib.sha256(), 0
+        deadline = time.monotonic() + RESTORE_TIMEOUT_SEC
+        with subprocess.Popen([str(AWS), 's3', 'cp', 's3://%s/%s' % (os.environ.get('R2_BUCKET', 'stoarama'), key), '-',
+                               '--endpoint-url', endpoint, '--only-show-errors'],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env) as proc:
+            for block in iter(lambda: proc.stdout.read(1 << 20), b''):
+                digest.update(block)
+                size += len(block)
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    raise Halt('R2 restore sample fetch timed out')
+            require(proc.wait() == 0, 'R2 restore sample fetch failed')
+        return size, digest.hexdigest()
+
+    def unproven(self, p):
+        """The plan has a unit no second copy is proven for: any non-Keep-Everything unit."""
+        return any(u['stream_id'] not in self.keep_everything for u in p['units'])
 
     def ke_plan_held(self, p):
         return self.ke_held() and any(u['stream_id'] in self.keep_everything for u in p['units'])
 
     def day_checked(self, p):
         """day_verify's bytes, or None after closing a never-started plan whose Keep Everything name
-        lost its live R2 counterpart, or that the Keep Everything hold covers; its directory-days are replanned."""
+        lost its live raw R2 copy, that the Keep Everything hold covers, or that proves no second copy (a
+        non-Keep-Everything unit); its directory-days are replanned. A plan that passes is also restore-sampled."""
+        if p['mode'] == 'dry_run' and self.unproven(p):
+            require(not self.dry_run, 'a plan without a proven second copy cannot be closed by a dry run')
+            closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
+                                      'reason': 'No second copy proven: non-Keep-Everything day cleanup is disabled.'}, 'retired')
+            require(closed['id'] == p['id'] and closed['mode'] == 'retired', 'day close was not confirmed')
+            self.save('day_replan', current_day_plan=None)
+            return None
         if p['mode'] == 'dry_run' and self.ke_plan_held(p):
             require(not self.dry_run, 'a held Keep Everything plan cannot be closed by a dry run')
             closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
@@ -1559,32 +1645,34 @@ class Runner:
             require(closed['id'] == p['id'] and closed['mode'] == 'retired', 'day close was not confirmed')
             self.save('day_replan', current_day_plan=None)
             return None
-        return day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
+        size = day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
+        self.day_sample(p)
+        self.save(self.status.get('phase', 'day_dry_run'), day_hashless_names=sum(c['hashless'] for c in catalog))
+        return size
 
     def ke_held(self):
         # Owner hold (2026-11-26): Keep Everything day cleanup waits until permits verify R2 live.
         return (self.root / 'KE_HOLD').exists()
 
     def day_pick(self):
-        held = self.ke_held() and self.keep_everything
-        skip_ke = (" AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id IN (%s))"
-                   % ','.join(str(int(sid)) for sid in sorted(self.keep_everything))) if held else ''
+        # Only Keep Everything plans prove a second copy; while KE_HOLD exists there is nothing to pick.
+        if self.ke_held() or not self.keep_everything:
+            return None
+        ke = ','.join(str(int(sid)) for sid in sorted(self.keep_everything))
         ids = self.query("SELECT coalesce(json_agg(p.id ORDER BY p.id),'[]') FROM nas_cleanup_day_plans p WHERE p.account_id=47 "
-                         "AND p.connection_id=13 AND p.mode='dry_run' AND p.policy_sha256='" + POLICY_SHA + "'" + skip_ke,
+                         "AND p.connection_id=13 AND p.mode='dry_run' AND p.policy_sha256='" + POLICY_SHA + "'"
+                         " AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id NOT IN (" + ke + "))",
                          'day plan query')
         if ids:
             return ids[0]
-        for sid in sorted(self.windows, key=lambda sid: (sid in self.keep_everything, sid)):
+        for sid in sorted(self.keep_everything & set(self.windows)):
             if self.stopped():
                 return None
-            if held and sid in self.keep_everything:
-                continue
             if not self.stream_ready(sid, DAY_EXCLUSIONS):
                 continue
             prefix = 'kday-' + utcnow().strftime('%Y%m%d-%H%M%S')
             out = self.root / 'day-plans' / (prefix + '-s' + str(sid))
-            lister = ['--r2prune', str(R2PRUNE)] if sid in self.keep_everything else []
-            if not self.prepare_stream(sid, ['--day-plans', '--max-plans', '1', '--label-prefix', prefix, *lister,
+            if not self.prepare_stream(sid, ['--day-plans', '--max-plans', '1', '--label-prefix', prefix, '--r2prune', str(R2PRUNE),
                                              '--out', str(out), '--api', API, '--submit', '--atomic-admission'],
                                      DAY_EXCLUSIONS):
                 continue
@@ -1600,7 +1688,7 @@ class Runner:
                     'live ownership failure requires shutdown')
             self.finish_health()
             p = self.day_plan(pid)
-            if day_state(p, utcnow()) != 'running' or self.ke_plan_held(p):
+            if day_state(p, utcnow()) != 'running' or self.ke_plan_held(p) or self.unproven(p):
                 self.day_finish(p)
                 return
             require(p['master_deletion_enabled'] is True, 'master switch mismatch during execution')

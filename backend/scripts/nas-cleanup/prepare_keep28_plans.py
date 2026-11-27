@@ -56,17 +56,29 @@ folder map names the stream, the path names the local day, the whole day lies
 outside the pinned window with a one-day guard band, and no catalogued clip of
 it is held. Its files and bytes are the present NAS inventory of that day; each
 plan carries those totals and the day digest, which the server recomputes
-before admitting it (dry run only). For a non-Keep-Everything stream no R2 copy
-is checked. Labels: <prefix>-s<stream>-day-<n>.
+before admitting it (dry run only). Labels: <prefix>-s<stream>-day-<n>.
+
+Redundancy (Deniz, 2026-11-27, verbatim: "yuea double check everything be 100%
+sure redundancy before deleting"): a NAS file is named only against another
+verified copy of the same content. Only Keep Everything streams have one, their
+raw R2 object, so day plans are prepared only for them; a non-Keep-Everything
+stream refuses.
 
 Keep Everything streams (Deniz, verbatim: "nas shoul dnot have any of the keep
 everything (except the keep 20)"; "if its the same size and same file name or
-whatever checks we have already?") come after the others. A KE unit names its
-exact media files, and a file is named only when its NAS size is the
-catalogued clip size and its R2 counterpart is live in the catalogue (the raw
-object, or a stitched output listing the clip, neither retired) AND a fresh
-read-only R2 listing (`r2prune list`, --r2prune) shows that key with that
-size. Every other file stays on the NAS and is counted as excluded.
+whatever checks we have already?"). A KE unit names its exact media files. A file
+is named only when all of these hold:
+- its NAS size is the catalogued clip size;
+- the clip's own raw R2 object is live in the catalogue (neither purged nor
+  retired);
+- a fresh read-only R2 listing (`r2prune list`, --r2prune) shows that key at that
+  size;
+- where the catalogue and the NAS inventory both record a sha256, the two are
+  equal.
+A stitched output is not the same content and never counts. Every other file
+stays on the NAS and is counted as excluded (`excluded_no_r2_*`, or
+`excluded_hash_mismatch_*`). Named files without both hashes are counted as
+`named_hashless_files`.
 
 Environment: DATABASE_URL (read-only use) and, for --submit, SERVICE_TOKEN.
 """
@@ -393,26 +405,18 @@ def r2_live_raw(clip, bucket):
             "WHERE x.kind='raw' AND x.source_id=%s.id))" % (clip, "'" + bucket.replace("'", "''") + "'", clip, clip, clip))
 
 
-# SQL: a stitched output is live in R2 (the server's cleanupDayR2LiveSQL stitched branch).
-R2_LIVE_OUTPUT = ("NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id) "
-                  "AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='collated' AND x.source_id=o.id)")
-
-
 def day_stream_rows(w, psql, bucket=R2_BUCKET):
     """Every catalogued clip of one stream: path, bounds, held flag, present NAS size (-1 if absent), id,
-    catalogued size, live raw R2 key (or null) and when the NAS last reported it; a Keep Everything stream
-    also lists its live stitched outputs."""
+    catalogued size, live raw R2 key (or null), when the NAS last reported it, the catalogued sha256 and
+    the present NAS inventory sha256 (each null when unrecorded)."""
     sid, ke = int(w['stream_id']), 'true' if w['keep_everything'] else 'false'
-    outputs = ("""(SELECT coalesce(json_agg(json_build_array(o.object_key,o.size_bytes,o.source_clip_ids)),'[]')
-  FROM recordings r JOIN recording_collation_hours h ON h.recording_id=r.id JOIN recording_collation_outputs o ON o.collation_hour_id=h.id
-  WHERE r.account_id=47 AND r.stream_id=""" + str(sid) + " AND " + R2_LIVE_OUTPUT + ")") if w['keep_everything'] else "'[]'::json"
     return query("""SELECT json_build_object('clips',(SELECT coalesce(json_agg(json_build_array(c.display_path,c.clip_start_at,c.clip_end_at,
-  nas_cleanup_day_clip_held(c.id,""" + ke + """),coalesce((SELECT f.size_bytes FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id
-   AND f.state='present' AND f.relative_path=c.display_path),-1),c.id,c.size_bytes,CASE WHEN """ + r2_live_raw('c', bucket) + """ THEN c.object_key END,
-  (SELECT f.client_updated_at FROM nas_inventory_files f WHERE f.connection_id=13 AND f.clip_id=c.id AND f.relative_path=c.display_path))),'[]')
+  nas_cleanup_day_clip_held(c.id,""" + ke + """),coalesce(f.size_bytes,-1),c.id,c.size_bytes,CASE WHEN """ + r2_live_raw('c', bucket) + """ THEN c.object_key END,
+  (SELECT x.client_updated_at FROM nas_inventory_files x WHERE x.connection_id=13 AND x.clip_id=c.id AND x.relative_path=c.display_path),
+  lower(nullif(c.sha256,'')),lower(nullif(f.sha256,'')))),'[]')
   FROM recordings r JOIN recording_clips c ON c.recording_id=r.id
+  LEFT JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id AND f.state='present' AND f.relative_path=c.display_path
   WHERE r.account_id=47 AND r.stream_id=""" + str(sid) + """ AND c.display_path<>''),
- 'outputs',""" + outputs + """,
  'claimed',(SELECT coalesce(json_agg(json_build_array(u.relative_dir,u.local_date::text,u.state,u.names,u.updated_at)),'[]') FROM nas_cleanup_day_units u
   WHERE u.stream_id=""" + str(sid) + """ AND u.state IN ('pending','permitted','deleted')),
  'held_dirs',(SELECT coalesce(json_agg(DISTINCT regexp_replace(h.relative_path,'/[^/]*$','')),'[]')
@@ -448,10 +452,11 @@ def r2_listing(r2prune, out):
 
 
 def day_units(w, folders, facts, listed=None):
-    """Admissible units of one stream, the server's rule applied to the same catalogue, and the
-    Keep Everything media excluded for lacking a listed R2 counterpart: (units, {files, bytes})."""
+    """Admissible units of one stream, the server's rule applied to the same catalogue, the Keep Everything
+    media excluded for lacking a listed raw R2 copy (files, bytes) or for a sha256 that differs from it
+    (hash_mismatch_*), and the named files without both hashes (hashless_files): (units, excluded)."""
     sid, ke = w['stream_id'], w['keep_everything']
-    excluded = {'files': 0, 'bytes': 0}
+    excluded = {'files': 0, 'bytes': 0, 'hash_mismatch_files': 0, 'hash_mismatch_bytes': 0, 'hashless_files': 0}
     if not facts['keep20_active']:
         return [], excluded
     zone = zoneinfo.ZoneInfo(w['tz'])
@@ -468,7 +473,7 @@ def day_units(w, folders, facts, listed=None):
                 deleted_names[d, n['name']] = max(pg_timestamp(at), deleted_names.get((d, n['name']), pg_timestamp(at)))
     held_dirs = set(facts['held_dirs'])
     groups, refused = defaultdict(list), set()
-    for path, a, b, held, size, cid, catalogued, raw_key, seen in facts['clips']:
+    for path, a, b, held, size, cid, catalogued, raw_key, seen, cat_sha, nas_sha in facts['clips']:
         directory, name = path.rsplit('/', 1) if '/' in path else ('', path)
         if not (DAY_PLAZA_DIR.fullmatch(directory) or DAY_FLAT_DIR.fullmatch(directory)) or folders.get(folder_key(directory)) != sid:
             continue
@@ -478,30 +483,25 @@ def day_units(w, folders, facts, listed=None):
             continue
         if seen is not None and (directory, name) in deleted_names and pg_timestamp(seen) <= deleted_names[directory, name]:
             size = -1  # Unlinked by a deleted unit; the inventory has not rescanned it since.
-        groups[directory, date].append((pg_timestamp(a), pg_timestamp(b), held, size, cid, name, catalogued, raw_key))
+        groups[directory, date].append((pg_timestamp(a), pg_timestamp(b), held, size, cid, name, catalogued, raw_key, cat_sha, nas_sha))
     eligible = [((directory, date), clips) for (directory, date), clips in sorted(groups.items(), key=lambda g: (g[0][1], g[0][0]))
                 if not (directory in refused or directory in held_dirs or (directory, date.isoformat()) in claimed
                         or not any(c[3] >= 0 for c in clips) or not day_outside(w, date)
                         or any(held or not (b > a) or (a < end and b > start) for a, b, held, *_ in clips))]
-    counterparts = defaultdict(list)  # clip id -> [(R2 key, size)]
     if ke:
-        for key, size, sources in facts['outputs']:
-            for cid in sources:
-                counterparts[cid].append((key, size))
-        for _, clips in eligible:
-            for c in clips:
-                if c[7]:
-                    counterparts[c[4]].append((c[7], c[6]))
-        sizes = listed({k for _, clips in eligible for c in clips if c[3] >= 0 for k, _ in counterparts[c[4]]})
+        sizes = listed({c[7] for _, clips in eligible for c in clips if c[3] >= 0 and c[7]})
     units = []
     for (directory, date), clips in eligible:
         present = [c for c in clips if c[3] >= 0]
         names = present
         if ke:
-            names = sorted((c for c in present if c[3] == c[6] and any(sizes.get(k) == z for k, z in counterparts[c[4]])),
-                           key=lambda c: c[5])
-            excluded['files'] += len(present) - len(names)
-            excluded['bytes'] += sum(c[3] for c in present) - sum(c[3] for c in names)
+            copied = [c for c in present if c[3] == c[6] and c[7] and sizes.get(c[7]) == c[6]]
+            names = sorted((c for c in copied if not (c[8] and c[9] and c[8] != c[9])), key=lambda c: c[5])
+            excluded['hash_mismatch_files'] += len(copied) - len(names)
+            excluded['hash_mismatch_bytes'] += sum(c[3] for c in copied) - sum(c[3] for c in names)
+            excluded['files'] += len(present) - len(copied)
+            excluded['bytes'] += sum(c[3] for c in present) - sum(c[3] for c in copied)
+            excluded['hashless_files'] += sum(not (c[8] and c[9]) for c in names)
         if not names:
             continue
         unit = {'relative_dir': directory, 'local_date': date.isoformat(), 'stream_id': sid,
@@ -510,6 +510,14 @@ def day_units(w, folders, facts, listed=None):
             unit['names'] = [{'name': c[5], 'size_bytes': c[3]} for c in names]
         units.append(unit)
     return units, excluded
+
+
+def redundancy_counts(excluded):
+    """The day_units exclusion counts under their summary names (all zero for no stream)."""
+    get = lambda k: excluded.get(k, 0)
+    return {'excluded_no_r2_files': get('files'), 'excluded_no_r2_bytes': get('bytes'),
+            'excluded_hash_mismatch_files': get('hash_mismatch_files'), 'excluded_hash_mismatch_bytes': get('hash_mismatch_bytes'),
+            'named_hashless_files': get('hashless_files')}
 
 
 def day_plans(units, prefix, max_units):
@@ -587,30 +595,30 @@ def day_main(a, policy):
     folders = load_folders()
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    units, excluded = [], {'files': 0, 'bytes': 0}
-    # Keep Everything streams after the others.
-    streams = sorted(a.stream or policy, key=lambda sid: (policy[sid]['keep_everything'], sid))
+    units, excluded = [], {}
+    if any(not policy[sid]['keep_everything'] for sid in a.stream):
+        raise SystemExit('non-Keep-Everything day plans are disabled: no second copy of their files is proven')
+    streams = sorted(a.stream or (sid for sid in policy if policy[sid]['keep_everything']))
+    if not a.r2prune:
+        raise SystemExit('Keep Everything day plans need --r2prune for the read-only R2 listing')
     for sid in streams:
-        ke = policy[sid]['keep_everything']
-        if ke and not a.r2prune:
-            raise SystemExit('Keep Everything day plans need --r2prune for the read-only R2 listing')
-        listed = r2_listing(a.r2prune, out / ('r2-listing-s%d.tsv' % sid)) if ke else None
+        listed = r2_listing(a.r2prune, out / ('r2-listing-s%d.tsv' % sid))
         part, missing = day_units(policy[sid], folders, day_stream_rows(policy[sid], a.psql, a.bucket), listed)
         units += part
-        excluded = {k: excluded[k] + missing[k] for k in excluded}
-        print(json.dumps({'phase': 'listed_stream_days', 'stream_id': sid, 'keep_everything': ke, 'units': len(part),
+        excluded = {k: excluded.get(k, 0) + missing[k] for k in missing}
+        print(json.dumps({'phase': 'listed_stream_days', 'stream_id': sid, 'keep_everything': True, 'units': len(part),
                           'files': sum(u['files'] for u in part), 'bytes': sum(u['bytes'] for u in part),
-                          'excluded_no_r2_files': missing['files'], 'excluded_no_r2_bytes': missing['bytes']}), file=sys.stderr, flush=True)
+                          **redundancy_counts(missing)}), file=sys.stderr, flush=True)
     plans = []
     for sid in streams:
         plans += day_plans([u for u in units if u['stream_id'] == sid], a.label_prefix, a.max_units)
     plans = [] if a.summary_only else plans[:a.max_plans or None]
     for plan in plans:
         (out / (plan['label'] + '.json')).write_text(json.dumps(plan))
-    summary = {'policy_sha256': POLICY_SHA, 'mode': 'day_plans', 'streams': sorted(a.stream or policy), 'observed_at_epoch': time.time(),
+    summary = {'policy_sha256': POLICY_SHA, 'mode': 'day_plans', 'streams': streams, 'observed_at_epoch': time.time(),
                'candidate_units': len(units), 'candidate_files': sum(u['files'] for u in units),
                'candidate_bytes': sum(u['bytes'] for u in units),
-               'excluded_no_r2_files': excluded['files'], 'excluded_no_r2_bytes': excluded['bytes'],
+               **redundancy_counts(excluded),
                'plans': [{k: p[k] for k in ('label', 'plan_sha256', 'files', 'bytes')} | {'units': len(p['units']), 'stream_id': p['units'][0]['stream_id']}
                          for p in plans], 'receipts': [], 'deletion_enabled': False}
     for plan in plans if a.submit else ():
@@ -634,8 +642,7 @@ def day_main(a, policy):
     temp.replace(out / 'summary.json')
     print(json.dumps({'phase': 'DAY_PLANS_SUBMITTED' if a.submit else 'DAY_PLANS_PREVIEW', 'candidate_units': summary['candidate_units'],
                       'candidate_files': summary['candidate_files'], 'candidate_bytes': summary['candidate_bytes'],
-                      'excluded_no_r2_files': excluded['files'], 'excluded_no_r2_bytes': excluded['bytes'],
-                      'plans': len(plans), 'admitted': len(summary['receipts']), 'out': str(out), 'deletion_enabled': False}), flush=True)
+                      **redundancy_counts(excluded), 'plans': len(plans), 'admitted': len(summary['receipts']), 'out': str(out), 'deletion_enabled': False}), flush=True)
     return 0
 
 
