@@ -215,7 +215,8 @@ time, then install D. A v4 observation packet is not late-budget eligible.
    overlap. Verify the next automatic timestamp. The independent Rolly dead-man
    check reads the output age and `stop_reason`; CLI status is replaced atomically.
    Also install/bootstrap `com.stoarama.finish-recovery.plist` from its separate
-   template: it runs every six hours (not at load, so it never races the
+   template: it runs every three hours, well inside the runner's 7 h recovery
+   freshness limit even right after a reload (not at load, so it never races the
    runner's boot-time state), with a separate lock and timeout. A held runner
    kickstarts it once per unlatched hold. It performs only canonical recovery HEAD verification, never cleanup
    or master control. Verify `recovery.json` has its own fresh checked_at.
