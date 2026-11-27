@@ -523,6 +523,52 @@ class LedgerBuildTests(unittest.TestCase):
         w.hours[(rid, DAYS[2], 2)] = dataclasses.replace(w.hours[(rid, DAYS[2], 2)], in_r2=False)
         self.assertEqual(b.choose_windows(w.hour_list(), live_world.hour_list(), live, isa)[rid], b.Window.ORIGINAL)
 
+    def test_stream_published_empty_gains_its_hours(self):
+        # Stream 420: published in its best-14 window before any hour was registered (every
+        # hour unregistered, captured 0), then every hour stitched and registered.
+        rid = RIDS[10]
+        w = LedgerWorld(self.fx)
+        for k in [k for k in self.fx.parent['files'] if self.fx.parent['files'][k]['recording_id'] == rid]:
+            del self.fx.parent['files'][k]
+        load = self.store.load
+        stream = load(f'/public/streams/{rid}.json')
+        for d in stream['days']:
+            d.update(captured_scheduled_seconds=0, captured_scheduled_coverage_pct=0.0)
+            d['hours'] = [['unregistered', 0, 0, 0.0, 0, 0, 0, h[7], h[8], [], [], h[11]] for h in d['hours']]
+        stream['current_download_paths'] = {}
+        man = dict(load(f'/public/manifests/{rid}.json'), outputs=[], original_count=0, replaced_original_count=0, replacement_count=0)
+        md, rd = load('/public/metadata.json'), load('/public/readiness.json')
+        s = next(s for s in md['streams'] if s['id'] == rid)
+        s.update(captured_scheduled_seconds=0, registered_hours=0, missing_registration_hours=2 * len(DAYS))
+        s['state_counts'].update(registered=0, parts=0, multi=0, collated=0)
+        rd['by_recording_id'][str(rid)].update(captured_scheduled_seconds=0, manifest_present_slots=0, delivery_state='awaiting_verified_outputs')
+        self.store = b.OverlayStore(self.store, {
+            f'/public/streams/{rid}.json': stream, f'/public/manifests/{rid}.json': man,
+            f'/api/coverage-delivery/manifest?stream={rid}&scope=available': man,
+            f'/public/ranges/{rid}.json': dict(load(f'/public/ranges/{rid}.json'), by_output_id={}),
+            '/public/metadata.json': md, '/public/readiness.json': rd})
+        for d, date in enumerate(DAYS):
+            for dh in (1, 2):
+                w.new_part(rid, date, dh, 9_300_000 + d * 2 + dh)
+        out, reg, summary, lost = self.build_ledger(w, 'empty')
+        self.assertEqual(lost, {})
+        span = 1700.0  # each new part's span
+        md = {s['id']: s for s in self.object(out, reg, '/public/metadata.json')['streams']}
+        R = self.object(out, reg, '/public/readiness.json')['by_recording_id'][str(rid)]
+        days = self.object(out, reg, f'/public/streams/{rid}.json')['days']
+        self.assertEqual([(d['captured_scheduled_seconds'], d['captured_scheduled_coverage_pct']) for d in days],
+                         [(2 * span, 100 * 2 * span / b.DAY_SCHEDULED_SECONDS)] * len(DAYS))
+        self.assertEqual((md[rid]['captured_scheduled_seconds'], R['captured_scheduled_seconds']), (2 * span * len(DAYS),) * 2)
+        self.assertEqual((md[rid]['registered_hours'], md[rid]['availability'], md[rid]['best14_days_ready']), (2 * len(DAYS), 'available', 14))
+        self.assertEqual(R['delivery_state'], 'all_scheduled_manifests_present')
+        U = R['represented_scheduled_union_seconds']
+        self.assertGreater(U, 0)
+        self.assertEqual(R['represented_pct_of_captured_timeline'], 100 * U / R['captured_scheduled_seconds'])
+        self.assertEqual(R['length_thresholds']['15']['pct_of_captured_timeline'], 100 * U / R['captured_scheduled_seconds'])
+        # A parent day with source accounting keeps it.
+        self.assertEqual(self.object(out, reg, f'/public/streams/{RIDS[0]}.json')['days'][0]['captured_scheduled_seconds'], 7000.0)
+        go_validate(self, os.path.join(out, 'registry.json.gz'))
+
     def test_cli_fails_closed_and_dry_runs(self):
         r = subprocess.run([sys.executable, '-I', os.path.join(BACKEND, 'scripts', 'gss', 'build_generation.py'), '--ledger',
                             '--parent', 'x', '--assets', 'a', '--base-holds', 'h', '--best14', 'b', '--note', 'n', '--dry-run'],
