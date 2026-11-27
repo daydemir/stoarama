@@ -210,15 +210,21 @@ type deliveryKeepQuerier interface {
 // (2026-11-26).
 const boundedSetChunk = 5000
 
-// RequireDeliveryKeep checks every exact identity in bounded set-based
-// statements. Missing schema/rows, or any identity drift in any chunk, revoke
-// every retirement class. It is also the publication gate: links cannot be
-// served before their holds exist. Chunking cannot pass a torn view: no code
-// path deletes holds or changes a held etag/size, so a later chunk can only
-// see more holds, and each chunk alone fails closed.
+// RequireDeliveryKeep checks every exact identity. Missing schema/rows, or any
+// identity drift, revoke every retirement class. It is also the publication
+// gate: links cannot be served before their holds exist. Object holds are
+// checked in bounded chunks, which cannot pass a torn view: no code path
+// deletes holds or changes a held etag/size, so a later chunk can only see
+// more holds. Assembly dependencies follow mutable output/hour rows, so they
+// are checked in one statement (one snapshot); their sets are small.
 func RequireDeliveryKeep(ctx context.Context, q deliveryKeepQuerier, s DeliveryKeepSnapshot) error {
 	if len(s.Objects) == 0 {
 		return errors.New("delivery keep snapshot missing")
+	}
+	for key, o := range s.Objects {
+		if key != o.Key {
+			return errors.New("delivery keep snapshot key differs from its identity")
+		}
 	}
 	keys := slices.Sorted(maps.Keys(s.Objects))
 	for chunk := range slices.Chunk(keys, boundedSetChunk) {
@@ -236,19 +242,20 @@ func RequireDeliveryKeep(ctx context.Context, q deliveryKeepQuerier, s DeliveryK
 			return errors.New("live delivery and durable keep holds disagree; retirement/publication refused")
 		}
 	}
+	if len(s.OutputDependencies) == 0 {
+		return nil
+	}
 	ids := slices.Sorted(maps.Keys(s.OutputDependencies))
-	for chunk := range slices.Chunk(ids, boundedSetChunk) {
-		recordings := make([]int64, len(chunk))
-		for i, id := range chunk {
-			recordings[i] = s.OutputDependencies[id]
-		}
-		var matches bool
-		if err := q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM unnest($1::bigint[],$2::bigint[]) x(id,recording)
+	recordings := make([]int64, len(ids))
+	for i, id := range ids {
+		recordings[i] = s.OutputDependencies[id]
+	}
+	var matches bool
+	if err := q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM unnest($1::bigint[],$2::bigint[]) x(id,recording)
  LEFT JOIN delivery_keep_output_dependencies d ON d.output_id=x.id AND d.recording_id=x.recording
  LEFT JOIN recording_collation_outputs o ON o.id=d.output_id LEFT JOIN recording_collation_hours h ON h.id=o.collation_hour_id
- WHERE d.output_id IS NULL OR h.recording_id IS DISTINCT FROM x.recording)`, chunk, recordings).Scan(&matches); err != nil || !matches {
-			return errors.New("delivery assembly dependency holds disagree/unavailable")
-		}
+ WHERE d.output_id IS NULL OR h.recording_id IS DISTINCT FROM x.recording)`, ids, recordings).Scan(&matches); err != nil || !matches {
+		return errors.New("delivery assembly dependency holds disagree/unavailable")
 	}
 	return nil
 }
