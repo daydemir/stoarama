@@ -54,11 +54,12 @@ every ledger file in R2: complete hours whole, other hours with what R2 holds.
 - Fails closed, before writing, when any stream-day of the live generation
   would serve fewer complete hours or fewer assemblies (days outside the new
   window serve none). A live assembly on best14_ledger's veto list
-  (assembly-veto.tsv) does not count: its parts serve in its place.
+  (assembly-veto.tsv) does not count: its parts serve in its place. --dry-run
+  builds everything in memory, writes nothing and prints the counts, including
+  those regressions.
+- Every served day's grade is best14-grades.tsv's; a day it lacks fails.
 
 Every mode (--files, --days, --ledger) fails if a vetoed assembly would be published.
-- Every served day's grade is best14-grades.tsv's; a day it lacks fails. --dry-run builds everything in memory, writes nothing and
-  prints the counts, including those regressions.
 """
 import argparse
 import collections
