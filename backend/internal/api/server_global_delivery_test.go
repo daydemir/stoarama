@@ -7,11 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -211,34 +213,34 @@ func TestGlobalDeliveryApprovedCohortExpansion(t *testing.T) {
 
 func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
 	reg := globalDeliveryTestRegistry()
-	reg.PublicDelivery = true
-	reg.SelectionScope = "available"
+	reg.Generation, reg.PublicDelivery, reg.SelectionScope = strings.Repeat("a", 32), true, "available"
 	reg.Assets["/public/catalog.json"] = reg.Assets["/fixture.txt"]
 	delete(reg.Assets, "/fixture.txt")
 	m := &globalDeliveryTestStore{body: []byte("hello")}
-	s := &Server{globalDeliveryStore: m, publicDeliveryRegistries: []*globalDeliveryRegistry{reg}, publicDeliveryCurrentAt: time.Now()}
+	s := publicDeliveryTestServer(t, m, reg)
+	gen := "&generation=" + reg.Generation
 	w := httptest.NewRecorder()
-	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/public/catalog.json", "", nil))
+	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/public/catalog.json"+gen, "", nil))
 	if w.Code != 200 {
 		t.Fatal(w.Code)
 	}
 	w = httptest.NewRecorder()
-	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/private/audit.json", "", nil))
+	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/private/audit.json"+gen, "", nil))
 	if w.Code != 404 {
 		t.Fatal("private asset exposed", w.Code)
 	}
 	w = httptest.NewRecorder()
-	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/2?sha256="+reg.Files["1"].SHA256, "2", nil))
+	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/2?sha256="+reg.Files["1"].SHA256+gen, "2", nil))
 	if w.Code != 404 {
 		t.Fatal("unselected output exposed", w.Code)
 	}
 	w = httptest.NewRecorder()
-	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/1?sha256="+reg.Files["1"].SHA256+"&path=other.mp4", "1", nil))
+	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/1?sha256="+reg.Files["1"].SHA256+"&path=other.mp4"+gen, "1", nil))
 	if w.Code != 409 || m.presigned != 0 {
 		t.Fatal("arbitrary presentation accepted", w.Code)
 	}
 	w = httptest.NewRecorder()
-	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/1?sha256="+reg.Files["1"].SHA256, "1", nil))
+	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/1?sha256="+reg.Files["1"].SHA256+gen, "1", nil))
 	if w.Code != 200 {
 		t.Fatal(w.Code)
 	}
@@ -256,13 +258,12 @@ func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
 
 func TestPublicGlobalDeliveryEncodedFileIDThroughRouter(t *testing.T) {
 	reg := globalDeliveryTestRegistry()
-	reg.PublicDelivery = true
-	reg.SelectionScope = "available"
+	reg.Generation, reg.PublicDelivery, reg.SelectionScope = strings.Repeat("a", 32), true, "available"
 	file := reg.Files["1"]
 	delete(reg.Files, "1")
 	reg.Files["sha256:"+file.SHA256] = file
 	store := &globalDeliveryTestStore{body: []byte("hello")}
-	s := &Server{globalDeliveryStore: store, publicDeliveryRegistries: []*globalDeliveryRegistry{reg}, publicDeliveryCurrentAt: time.Now()}
+	s := publicDeliveryTestServer(t, store, reg)
 	router := chi.NewRouter()
 	router.Get(publicGlobalDeliveryAPI+"/ticket/{fileID}", s.handleGlobalDeliveryTicket)
 	for _, tc := range []struct {
@@ -276,7 +277,7 @@ func TestPublicGlobalDeliveryEncodedFileIDThroughRouter(t *testing.T) {
 	} {
 		t.Run(tc.id, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/ticket/"+tc.id+"?sha256="+file.SHA256, nil))
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/ticket/"+tc.id+"?sha256="+file.SHA256+"&generation="+reg.Generation, nil))
 			if w.Code != tc.status {
 				t.Fatalf("ticket status = %d, want %d", w.Code, tc.status)
 			}
@@ -294,13 +295,10 @@ func TestPublicGlobalDeliveryRevalidatesAssetRepresentations(t *testing.T) {
 		"/download-script.py": {SHA256: strings.Repeat("c", 64)},
 	}}
 	store := &globalDeliveryTestStore{body: body}
-	s := &Server{
-		globalDeliveryStore: store, publicDeliveryRegistries: []*globalDeliveryRegistry{reg},
-		publicDeliveryCurrent: generation, publicDeliveryCurrentAt: time.Now(),
-	}
-	target := publicGlobalDeliveryAPI + "/metadata?path=" + url.QueryEscape(assetPath)
+	s := publicDeliveryTestServer(t, store, reg)
+	target := publicGlobalDeliveryAPI + "/metadata?path=" + url.QueryEscape(assetPath) + "&generation="
 	request := func(encoding, etag string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest(http.MethodGet, target, nil)
+		r := httptest.NewRequest(http.MethodGet, target+reg.Generation, nil)
 		r.Header.Set("Accept-Encoding", encoding)
 		r.Header.Set("If-None-Match", etag)
 		w := httptest.NewRecorder()
@@ -336,122 +334,158 @@ func TestPublicGlobalDeliveryRevalidatesAssetRepresentations(t *testing.T) {
 	}
 	// An unchanged R2 asset must be stamped again after publication moves.
 	reg.Generation = strings.Repeat("b", 32)
-	s.publicDeliveryCurrent = reg.Generation
+	if _, err := s.pool.Exec(context.Background(), `UPDATE gss_public_generation_pin SET generation=$1`, reg.Generation); err != nil {
+		t.Fatal(err)
+	}
 	w = request("identity", etag)
 	if w.Code != http.StatusOK || etag == w.Header().Get("ETag") || store.opened != 3 {
 		t.Fatalf("new generation reused old manifest: status=%d opens=%d", w.Code, store.opened)
 	}
 }
 
-type deliveryCurrentTestStore struct {
-	globalDeliveryMapStore
-	registryOpens int
+// publicDeliveryTestServer serves reg as the pinned public generation, its
+// holds taken as confirmed for the rest of the test.
+func publicDeliveryTestServer(t *testing.T, store globalDeliveryObjectStore, reg *globalDeliveryRegistry) *Server {
+	t.Helper()
+	pool := cleanupTestPool(t)
+	if _, err := pool.Exec(context.Background(), `UPDATE gss_public_generation_pin SET generation=$1`, reg.Generation); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{globalDeliveryStore: store, pool: pool}
+	s.publicDelivery.Store(&publicDeliveryEntry{registry: reg, admittedAt: time.Now().Add(time.Hour)})
+	return s
 }
 
-func (s *deliveryCurrentTestStore) Head(ctx context.Context, key string) (r2.ObjectHead, error) {
+// deliveryRegistryTestStore counts registry reads and HEADs, and can hold a
+// HEAD of one key until released, like a stalled R2 request.
+type deliveryRegistryTestStore struct {
+	globalDeliveryMapStore
+	mu                   sync.Mutex
+	registryOpens, heads int
+	stallKey             string
+	stalled              chan struct{}
+	release              chan struct{}
+}
+
+func (s *deliveryRegistryTestStore) Head(ctx context.Context, key string) (r2.ObjectHead, error) {
+	s.mu.Lock()
+	s.heads++
+	s.mu.Unlock()
+	if key == s.stallKey {
+		close(s.stalled)
+		<-s.release
+	}
 	head, err := s.globalDeliveryMapStore.Head(ctx, key)
 	sum := sha256.Sum256(s.globalDeliveryMapStore[key])
 	head.ETag = hex.EncodeToString(sum[:])
 	return head, err
 }
 
-func (s *deliveryCurrentTestStore) OpenExact(ctx context.Context, key, etag, version string) (io.ReadCloser, error) {
+func (s *deliveryRegistryTestStore) OpenExact(ctx context.Context, key, etag, version string) (io.ReadCloser, error) {
+	s.mu.Lock()
 	s.registryOpens++
+	s.mu.Unlock()
 	return s.globalDeliveryMapStore.OpenExact(ctx, key, etag, version)
+}
+
+func (s *deliveryRegistryTestStore) counts() (opens, heads int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.registryOpens, s.heads
+}
+
+// publicDeliveryPoolFixture publishes a held public generation, pinned, in
+// generations/ and returns a server on a maxConns pool of db.
+func publicDeliveryPoolFixture(t *testing.T, ctx context.Context, db *pgxpool.Pool, maxConns int32) (*Server, *deliveryRegistryTestStore, *globalDeliveryRegistry, []byte) {
+	t.Helper()
+	cfg := db.Config()
+	cfg.MaxConns = maxConns
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reg := globalDeliveryTestRegistry()
+	reg.Generation, reg.PublicDelivery, reg.SelectionScope = strings.Repeat("a", 32), true, "available"
+	asset := reg.Assets["/fixture.txt"]
+	reg.Assets = map[string]globalDeliveryObject{"/public/catalog.json": asset}
+	for _, object := range []globalDeliveryObject{asset, reg.Files["1"]} {
+		if _, err := db.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,$2,$3,'live_file')`, object.Key, object.ETag, object.SizeBytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := json.Marshal(reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE gss_public_generation_pin SET generation=$1`, reg.Generation); err != nil {
+		t.Fatal(err)
+	}
+	store := &deliveryRegistryTestStore{globalDeliveryMapStore: globalDeliveryMapStore{publicDeliveryGenerationKey(reg.Generation): raw}}
+	return &Server{globalDeliveryStore: store, pool: pool}, store, reg, raw
+}
+
+func publicDeliveryGenerationKey(generation string) string {
+	return globalDeliveryPrefix + "public/generations/" + generation + ".json"
 }
 
 func TestPublicGlobalDeliveryColdRegistryUsesFenceConnection(t *testing.T) {
 	db := cleanupTestPool(t)
-	cfg := db.Config()
-	cfg.MaxConns = 1
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-
-	reg := globalDeliveryTestRegistry()
-	reg.Generation, reg.PublicDelivery, reg.SelectionScope = strings.Repeat("a", 32), true, "available"
-	asset := reg.Assets["/fixture.txt"]
-	reg.Assets = map[string]globalDeliveryObject{"/public/catalog.json": asset}
-	for _, object := range []globalDeliveryObject{asset, reg.Files["1"]} {
-		if _, err := db.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,$2,$3,'live_file')`, object.Key, object.ETag, object.SizeBytes); err != nil {
-			t.Fatal(err)
-		}
-	}
-	raw, err := json.Marshal(reg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := globalDeliveryPrefix + "public/current.json"
-	store := &deliveryCurrentTestStore{globalDeliveryMapStore: globalDeliveryMapStore{key: raw}}
-	s := &Server{globalDeliveryStore: store, pool: pool}
+	s, store, reg, raw := publicDeliveryPoolFixture(t, ctx, db, 1)
 	first, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
 	if err != nil {
 		t.Fatalf("cold load must complete with a single database connection: %v", err)
 	}
-
-	s.publicDeliveryCurrentAt = time.Time{}
-	next, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
-	if err != nil || next != first || store.registryOpens != 1 {
-		t.Fatalf("unchanged current should reuse parsed registry: opens=%d err=%v", store.registryOpens, err)
+	next, err := s.loadGlobalDeliveryRegistryScope(ctx, true, reg.Generation)
+	if opens, heads := store.counts(); err != nil || next != first || opens != 1 || heads != 1 {
+		t.Fatalf("unchanged pin must reuse the parsed registry without R2: opens=%d heads=%d err=%v", opens, heads, err)
 	}
 
-	if _, err := db.Exec(ctx, `ALTER TABLE delivery_keep_holds RENAME TO fixture_holds`); err != nil {
+	// A moved pin whose holds are unavailable is refused and evicts the entry.
+	newGeneration := strings.Repeat("b", 32)
+	store.globalDeliveryMapStore[publicDeliveryGenerationKey(newGeneration)] = bytes.Replace(raw, []byte(reg.Generation), []byte(newGeneration), 1)
+	if _, err := db.Exec(ctx, `UPDATE gss_public_generation_pin SET generation='`+newGeneration+`';ALTER TABLE delivery_keep_holds RENAME TO fixture_holds`); err != nil {
 		t.Fatal(err)
 	}
-	s.publicDeliveryCurrentAt = time.Time{}
-	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err == nil || store.registryOpens != 1 {
-		t.Fatalf("unchanged current skipped the unavailable hold check: opens=%d err=%v", store.registryOpens, err)
+	// The former pin is still the cached entry; naming it is outdated.
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, reg.Generation); !errors.Is(err, errGlobalDeliveryOutdatedGeneration) {
+		t.Fatalf("cached former pin must answer 410: %v", err)
 	}
-
-	// A same-size publication with a different ETag still reloads.
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err == nil || s.publicDelivery.Load() != nil {
+		t.Fatalf("moved pin skipped the unavailable hold check: %v", err)
+	}
 	if _, err := db.Exec(ctx, `ALTER TABLE fixture_holds RENAME TO delivery_keep_holds`); err != nil {
 		t.Fatal(err)
 	}
-	newGeneration := strings.Repeat("b", 32)
-	store.globalDeliveryMapStore[key] = bytes.Replace(raw, []byte(reg.Generation), []byte(newGeneration), 1)
 	next, err = s.loadGlobalDeliveryRegistryScope(ctx, true, "")
-	if err != nil || next.Generation != newGeneration || store.registryOpens != 2 {
-		t.Fatalf("changed current must reload: opens=%d err=%v", store.registryOpens, err)
+	if err != nil || next.Generation != newGeneration {
+		t.Fatalf("moved pin must reload: %v", err)
+	}
+	// Evicted former pin: still 410, and nothing is read from R2.
+	opens, _ := store.counts()
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, reg.Generation); !errors.Is(err, errGlobalDeliveryOutdatedGeneration) {
+		t.Fatalf("evicted former pin must answer 410: %v", err)
+	}
+	if after, _ := store.counts(); after != opens {
+		t.Fatal("outdated generation was loaded from R2")
 	}
 }
 
+// Cold loads must not hold a connection while they queue for the registry
+// mutex or wait on R2: with one of two connections held elsewhere, 64
+// concurrent first requests all complete.
 func TestPublicGlobalDeliveryColdRegistryConcurrentSmallPool(t *testing.T) {
 	db := cleanupTestPool(t)
-	cfg := db.Config()
-	cfg.MaxConns = 2
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	held, err := pool.Acquire(ctx)
+	s, store, _, _ := publicDeliveryPoolFixture(t, ctx, db, 2)
+	held, err := s.pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer held.Release()
-
-	reg := globalDeliveryTestRegistry()
-	reg.Generation, reg.PublicDelivery, reg.SelectionScope = strings.Repeat("a", 32), true, "available"
-	asset := reg.Assets["/fixture.txt"]
-	reg.Assets = map[string]globalDeliveryObject{"/public/catalog.json": asset}
-	for _, object := range []globalDeliveryObject{asset, reg.Files["1"]} {
-		if _, err := db.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama',$1,$2,$3,'live_file')`, object.Key, object.ETag, object.SizeBytes); err != nil {
-			t.Fatal(err)
-		}
-	}
-	raw, err := json.Marshal(reg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store := &deliveryCurrentTestStore{globalDeliveryMapStore: globalDeliveryMapStore{globalDeliveryPrefix + "public/current.json": raw}}
-	s := &Server{globalDeliveryStore: store, pool: pool}
-
 	const readers = 64
 	start := make(chan struct{})
 	errs := make(chan error, readers)
@@ -469,7 +503,178 @@ func TestPublicGlobalDeliveryColdRegistryConcurrentSmallPool(t *testing.T) {
 			t.Fatalf("cold public registry load starved with one of two connections held after %s: %v", time.Since(began), err)
 		}
 	}
+	if opens, _ := store.counts(); opens != 1 {
+		t.Fatalf("%d concurrent cold requests read the registry %d times", readers, opens)
+	}
 	if elapsed := time.Since(began); elapsed > 5*time.Second {
 		t.Fatalf("%d cold public registry loads took %s", readers, elapsed)
+	}
+}
+
+// Cache hits take neither the registry mutex nor R2: while the account
+// registry load holds the mutex, stalled on R2, 64 concurrent hits on a
+// two-connection pool (one held elsewhere) finish in about one hit's time.
+func TestPublicGlobalDeliveryCacheHitsRunConcurrently(t *testing.T) {
+	db := cleanupTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, store, reg, raw := publicDeliveryPoolFixture(t, ctx, db, 2)
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	held, err := s.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+	hit := func() time.Duration {
+		began := time.Now()
+		got, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+		if err != nil || got.Generation != reg.Generation {
+			t.Errorf("hit: %v", err)
+		}
+		return time.Since(began)
+	}
+	single := hit()
+
+	latest := globalDeliveryPrefix + "latest.json"
+	store.globalDeliveryMapStore[latest] = raw
+	store.stallKey, store.stalled, store.release = latest, make(chan struct{}), make(chan struct{})
+	loaded := make(chan error, 1)
+	go func() {
+		_, err := s.loadGlobalDeliveryRegistryScope(ctx, false, "")
+		loaded <- err
+	}()
+	<-store.stalled
+	released := false
+	defer func() {
+		if !released {
+			close(store.release)
+		}
+	}()
+	_, headsBefore := store.counts()
+
+	const readers = 64
+	start := make(chan struct{})
+	done := make(chan time.Duration, readers)
+	for range readers {
+		go func() {
+			<-start
+			done <- hit()
+		}()
+	}
+	began := time.Now()
+	close(start)
+	for range readers {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("cache hits waited behind the stalled load")
+		}
+	}
+	wall := time.Since(began)
+	_, headsAfter := store.counts()
+	released = true
+	close(store.release)
+	if err := <-loaded; err != nil {
+		t.Fatalf("stalled load: %v", err)
+	}
+	t.Logf("one hit %s; %d concurrent hits %s", single, readers, wall)
+	if headsAfter != headsBefore {
+		t.Fatalf("cache hits sent %d R2 HEADs", headsAfter-headsBefore)
+	}
+	if limit := 16*single + 250*time.Millisecond; wall > limit {
+		t.Fatalf("%d concurrent hits took %s (one hit %s): serialized", readers, wall, single)
+	}
+}
+
+// A load that read pin A must not admit A when the pin moves to B while it
+// waits on R2.
+func TestPublicGlobalDeliveryPinMoveDuringLoadAdmitsNothing(t *testing.T) {
+	db := cleanupTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, store, reg, _ := publicDeliveryPoolFixture(t, ctx, db, 2)
+	store.stallKey, store.stalled, store.release = publicDeliveryGenerationKey(reg.Generation), make(chan struct{}), make(chan struct{})
+	type result struct {
+		reg *globalDeliveryRegistry
+		err error
+	}
+	loaded := make(chan result, 1)
+	go func() {
+		got, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+		loaded <- result{got, err}
+	}()
+	<-store.stalled
+	if _, err := db.Exec(ctx, `UPDATE gss_public_generation_pin SET generation=$1`, strings.Repeat("b", 32)); err != nil {
+		t.Fatal(err)
+	}
+	close(store.release)
+	got := <-loaded
+	if got.err == nil || got.reg != nil || s.publicDelivery.Load() != nil {
+		t.Fatalf("former pin was served or admitted after the pin moved: %v", got.err)
+	}
+}
+
+// A request that read pin A and then queued on the mutex re-reads the pin and
+// never returns A once the pin has moved.
+func TestPublicGlobalDeliveryQueuedRequestRereadsPin(t *testing.T) {
+	db := cleanupTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, store, reg, raw := publicDeliveryPoolFixture(t, ctx, db, 2)
+	a, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Due for its hold recheck, so the request queues on the mutex.
+	s.publicDelivery.Store(&publicDeliveryEntry{registry: a, admittedAt: time.Now().Add(-publicDeliveryHoldRecheck)})
+	b := strings.Repeat("b", 32)
+	store.globalDeliveryMapStore[publicDeliveryGenerationKey(b)] = bytes.Replace(raw, []byte(reg.Generation), []byte(b), 1)
+	s.globalDeliveryMu.Lock()
+	acquired := s.pool.Stat().AcquireCount()
+	got := make(chan *globalDeliveryRegistry, 1)
+	go func() {
+		r, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+		if err != nil {
+			t.Error(err)
+		}
+		got <- r
+	}()
+	// Wait until the request has read pin A and released its connection.
+	for s.pool.Stat().AcquireCount() == acquired || s.pool.Stat().AcquiredConns() != 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := db.Exec(ctx, `UPDATE gss_public_generation_pin SET generation=$1`, b); err != nil {
+		t.Fatal(err)
+	}
+	s.globalDeliveryMu.Unlock()
+	if r := <-got; r == nil || r.Generation != b {
+		t.Fatalf("queued request served the former pin")
+	}
+}
+
+// Holds are confirmed again once an entry is publicDeliveryHoldRecheck old: a
+// failed hold check then fails closed and evicts the entry.
+func TestPublicGlobalDeliveryHoldRecheckFailsClosed(t *testing.T) {
+	db := cleanupTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, _, _, _ := publicDeliveryPoolFixture(t, ctx, db, 2)
+	first, err := s.loadGlobalDeliveryRegistryScope(ctx, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Holds cannot be deleted outside a reviewed release; an unavailable hold
+	// table fails the check the same way.
+	if _, err := db.Exec(ctx, `ALTER TABLE delivery_keep_holds RENAME TO fixture_holds`); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err != nil || got != first {
+		t.Fatalf("entry inside its recheck window: %v", err)
+	}
+	s.publicDelivery.Store(&publicDeliveryEntry{registry: first, admittedAt: time.Now().Add(-publicDeliveryHoldRecheck - time.Second)})
+	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, ""); err == nil || s.publicDelivery.Load() != nil {
+		t.Fatalf("failed hold check kept serving past the recheck: %v", err)
 	}
 }

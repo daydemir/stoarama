@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -41,19 +42,16 @@ import (
 )
 
 type Server struct {
-	nasCleanupMu              sync.Mutex
-	nasCleanupReportCache     *nasCleanupReport
-	nasCleanupInventoryIndex  *cleanupFrozenIndex
-	nasCleanupRankingCache    map[int64]nasCleanupRankingsSnapshot
-	nasCleanupRankingFlights  map[int64]*nasCleanupRankingsFlight
-	globalDeliveryStore       globalDeliveryObjectStore
-	globalDeliveryMu          sync.Mutex
-	globalDeliveryRegistry    *globalDeliveryRegistry
-	globalDeliveryRegistryAt  time.Time
-	publicDeliveryRegistries  []*globalDeliveryRegistry // most recently used first; see cachePublicDeliveryRegistry
-	publicDeliveryCurrent     string
-	publicDeliveryCurrentHead r2.ObjectHead
-	publicDeliveryCurrentAt   time.Time
+	nasCleanupMu             sync.Mutex
+	nasCleanupReportCache    *nasCleanupReport
+	nasCleanupInventoryIndex *cleanupFrozenIndex
+	nasCleanupRankingCache   map[int64]nasCleanupRankingsSnapshot
+	nasCleanupRankingFlights map[int64]*nasCleanupRankingsFlight
+	globalDeliveryStore      globalDeliveryObjectStore
+	globalDeliveryMu         sync.Mutex
+	globalDeliveryRegistry   *globalDeliveryRegistry
+	globalDeliveryRegistryAt time.Time
+	publicDelivery           atomic.Pointer[publicDeliveryEntry]
 
 	cfg                      config.Config
 	pool                     *pgxpool.Pool
