@@ -20,9 +20,9 @@ A seam collation split as frame_jump or packet_replay therefore joins only with 
 clock proof; every other seam stays split. A recording without a CLOCK_CROPS profile
 never joins. There is no class rule: an independent check found 10 of 199 within-lease
 0 s seams with matching media whose clock jumps -8.7 to +19.9 s
-(seam-audit-20261126/independent-verify/zero-gap-exceptions.tsv); that and the scaled audit's
-105 near-seam discontinuities are the test fixture testdata/clock_discontinuities.json, and the rule
-refuses all 115. The audit behind it:
+(seam-audit-20261126/independent-verify/zero-gap-exceptions.tsv). Those 10 and the final scaled
+census's 112 flagged zero-gap seams (51 real by eye) are testdata/clock_discontinuities.json; the
+rule refuses every real one. The audit behind it:
 records/finish-plan-20261117/gss-delivery/seam-audit-20261126/README.md.
 
 Subcommands (all local files; `evidence` and `build` read R2 through presigned GETs
