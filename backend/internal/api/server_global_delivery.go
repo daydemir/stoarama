@@ -23,14 +23,15 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 	webassets "github.com/daydemir/stoarama/backend/web"
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 )
 
 const globalDeliveryPrefix = "datasets/global-street-scores-delivery/47/"
 const publicGlobalDeliveryAPI = "/api/v1/global-street-scores-delivery"
 const globalDeliveryAPI = "/api/v1/account/global-street-scores-delivery"
 
-// errGlobalDeliveryOutdatedGeneration refuses a copied command whose generation
-// the NAS cleanup fence does not serve. Pasted commands print only the HTTP
+// errGlobalDeliveryOutdatedGeneration refuses a page or copied command naming a
+// generation other than the pinned one. Pasted commands print only the HTTP
 // status, so it answers 410 Gone rather than a retryable 503.
 var errGlobalDeliveryOutdatedGeneration = errors.New("This download link is outdated; copy a fresh command from the page.")
 
@@ -117,55 +118,12 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 	return s.loadGlobalDeliveryRegistryScope(ctx, false, "")
 }
 func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool, generation string) (*globalDeliveryRegistry, error) {
-	// Queue registry readers before checking out a database connection. Only
-	// the reader holding the mutex needs a fence transaction.
+	if public {
+		return s.loadPublicDeliveryRegistry(ctx, generation)
+	}
 	s.globalDeliveryMu.Lock()
 	defer s.globalDeliveryMu.Unlock()
-	var keepQuerier deliveryKeepQuerier
-	// While cleanup permits can be outstanding, serve only the operator-pinned
-	// public generation (gss_public_generation_pin, 0268). A direct registry
-	// publication cannot introduce a new protected source midway through a
-	// separately approved deletion batch; a missing pin fails closed.
-	if public && s.pool != nil {
-		fence, err := s.pool.Begin(ctx)
-		if err != nil {
-			return nil, errors.New("public cleanup fence unavailable")
-		}
-		defer fence.Rollback(ctx)
-		keepQuerier = fence
-		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
-			return nil, errors.New("public cleanup fence unavailable")
-		}
-		var fenced bool
-		var pinned *string
-		err = fence.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.mode='enabled' AND p.approved_until>now()) OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.delete_ever_issued AND i.updated_at>now()-interval '2 minutes'),(SELECT generation FROM gss_public_generation_pin)`).Scan(&fenced, &pinned)
-		if err != nil {
-			return nil, errors.New("public cleanup fence unavailable")
-		}
-		if fenced {
-			if pinned == nil {
-				return nil, errors.New("public generation pin missing during NAS cleanup")
-			}
-			if generation != "" && generation != *pinned {
-				return nil, errGlobalDeliveryOutdatedGeneration
-			}
-			generation = *pinned
-		}
-	}
-	if public {
-		fresh := generation == "" && time.Since(s.publicDeliveryCurrentAt) < 15*time.Second
-		want := generation
-		if fresh {
-			want = s.publicDeliveryCurrent
-		}
-		for i, cached := range s.publicDeliveryRegistries {
-			if (generation != "" || fresh) && cached.Generation == want {
-				s.publicDeliveryRegistries[0], s.publicDeliveryRegistries[i] = cached, s.publicDeliveryRegistries[0]
-				return cached, nil
-			}
-		}
-	}
-	if !public && s.globalDeliveryRegistry != nil && time.Since(s.globalDeliveryRegistryAt) < 15*time.Second {
+	if s.globalDeliveryRegistry != nil && time.Since(s.globalDeliveryRegistryAt) < 15*time.Second {
 		return s.globalDeliveryRegistry, nil
 	}
 	store := s.globalDeliveryObjectStore()
@@ -173,70 +131,190 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 		return nil, errors.New("dataset storage unavailable")
 	}
 	key := globalDeliveryPrefix + "latest.json"
-	if public {
-		key = globalDeliveryPrefix + "public/current.json"
-		if generation != "" {
-			decoded, e := hex.DecodeString(generation)
-			if e != nil || len(decoded) != 16 {
-				return nil, errors.New("invalid published generation")
-			}
-			key = globalDeliveryPrefix + "public/generations/" + generation + ".json"
-		}
-	}
 	head, err := store.Head(ctx, key)
 	if err != nil || head.SizeBytes <= 0 || head.SizeBytes > 64<<20 {
 		return nil, errors.New("dataset registry unavailable")
 	}
-	var result *globalDeliveryRegistry
-	if public && generation == "" && head.ETag != "" && head == s.publicDeliveryCurrentHead {
-		for _, cached := range s.publicDeliveryRegistries {
-			if cached.Generation == s.publicDeliveryCurrent {
-				result = cached
-				break
-			}
-		}
+	result, err := readGlobalDeliveryRegistry(ctx, store, key, head)
+	if err != nil {
+		return nil, err
 	}
-	if result == nil {
-		result, err = readGlobalDeliveryRegistry(ctx, store, key, head)
-		if err != nil {
+	s.globalDeliveryRegistry, s.globalDeliveryRegistryAt = result, time.Now()
+	return result, nil
+}
+
+// publicDeliveryHoldRecheck bounds how long a loaded public generation is
+// served before its files and assets are checked against delivery_keep_holds
+// again.
+const publicDeliveryHoldRecheck = 15 * time.Second
+
+// publicDeliveryEntry is the served public generation and when its holds were
+// last confirmed. It is immutable and replaced whole under globalDeliveryMu.
+// A 55k-file registry retains ~22 MB once parsed and allocates ~84 MB while
+// loading.
+type publicDeliveryEntry struct {
+	registry   *globalDeliveryRegistry
+	admittedAt time.Time
+}
+
+func (e *publicDeliveryEntry) serves(pin string) bool {
+	return e != nil && e.registry.Generation == pin && time.Since(e.admittedAt) < publicDeliveryHoldRecheck
+}
+
+// loadPublicDeliveryRegistry serves the pinned public generation
+// (gss_public_generation_pin). A request naming any other generation gets 410,
+// fenced by NAS cleanup or not: only the pin's files and assets are sure to be
+// kept, so an older registry could point at files the prune lane removes.
+//
+// The pin alone decides, so a request needs no R2 HEAD of public/current.json.
+// The one publisher, gss_gen.py swap (Jelly ~/stoarama-gss-freeze; also its
+// rollback), copies public/generations/<id>.json byte for byte to current.json,
+// verifies the readback, then moves the pin and verifies it; the republish
+// cycle's post-swap gates read the live API and swap back on failure. Serving
+// generations/<pin>.json is the same registry, switching at the pin write.
+//
+// A hit reads the pin in a short fence transaction on its own connection,
+// releases it, and reads the immutable entry without a lock. Only a miss, a
+// moved pin or an entry due for its hold recheck takes globalDeliveryMu, then
+// re-reads the pin (it may have moved while the request queued). It loads from
+// R2 holding no connection, then re-reads the pin and runs RequireDeliveryKeep
+// in one fence transaction; any failure evicts the entry and fails closed. No
+// request holds a connection while it waits on the mutex or R2. A missing pin
+// or database fails closed.
+func (s *Server) loadPublicDeliveryRegistry(ctx context.Context, generation string) (*globalDeliveryRegistry, error) {
+	if s.pool == nil {
+		return nil, errors.New("public cleanup fence unavailable")
+	}
+	if decoded, err := hex.DecodeString(generation); generation != "" && (err != nil || len(decoded) != 16) {
+		return nil, errors.New("invalid published generation")
+	}
+	pin, err := s.publicDeliveryPin(ctx, generation)
+	if err != nil {
+		return nil, err
+	}
+	if entry := s.publicDelivery.Load(); entry.serves(pin) {
+		return entry.registry, nil
+	}
+	s.globalDeliveryMu.Lock()
+	defer s.globalDeliveryMu.Unlock()
+	if pin, err = s.publicDeliveryPin(ctx, generation); err != nil {
+		return nil, err
+	}
+	entry := s.publicDelivery.Load()
+	if entry.serves(pin) {
+		return entry.registry, nil
+	}
+	registry, err := s.admitPublicDeliveryRegistry(ctx, entry, pin, generation)
+	if err != nil {
+		s.publicDelivery.Store(nil)
+		return nil, err
+	}
+	return registry, nil
+}
+
+// admitPublicDeliveryRegistry reuses entry's registry when it is the pin, or
+// loads the pin from R2, then confirms the pin and its holds and stores it.
+func (s *Server) admitPublicDeliveryRegistry(ctx context.Context, entry *publicDeliveryEntry, pin, generation string) (*globalDeliveryRegistry, error) {
+	var registry *globalDeliveryRegistry
+	if entry != nil && entry.registry.Generation == pin {
+		registry = entry.registry
+	} else {
+		var err error
+		if registry, err = s.readPublicDeliveryRegistry(ctx, pin); err != nil {
 			return nil, err
 		}
 	}
-	if public {
-		if !result.PublicDelivery || result.SelectionScope != "available" || (generation != "" && result.Generation != generation) {
-			return nil, errors.New("dataset is not published")
+	keep := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{}}
+	for _, o := range registry.Assets {
+		if err := keep.add(o, "asset"); err != nil {
+			return nil, err
 		}
-		for name := range result.Assets {
-			if !publicGlobalDeliveryAsset(name, result.RecordingIDs) {
-				return nil, errors.New("private asset in public dataset")
-			}
-		}
-		keep := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{}}
-		for _, o := range result.Assets {
-			if err := keep.add(o, "asset"); err != nil {
-				return nil, err
-			}
-		}
-		for _, o := range result.Files {
-			if err := keep.add(o, "live_file"); err != nil {
-				return nil, err
-			}
-		}
-		if keepQuerier != nil {
-			if err := RequireDeliveryKeep(ctx, keepQuerier, keep); err != nil {
-				return nil, err
-			}
-		}
-		if generation == "" {
-			s.publicDeliveryCurrent, s.publicDeliveryCurrentAt = result.Generation, time.Now()
-			s.publicDeliveryCurrentHead = head
-		}
-		s.cachePublicDeliveryRegistry(result)
-	} else {
-		s.globalDeliveryRegistry = result
-		s.globalDeliveryRegistryAt = time.Now()
 	}
-	return result, nil
+	for _, o := range registry.Files {
+		if err := keep.add(o, "live_file"); err != nil {
+			return nil, err
+		}
+	}
+	checked := time.Now()
+	if err := s.publicDeliveryFence(ctx, func(tx pgx.Tx) error {
+		again, err := readPublicDeliveryPin(ctx, tx, generation)
+		if err != nil {
+			return err
+		}
+		if again != pin {
+			return errors.New("public generation moved while loading")
+		}
+		return RequireDeliveryKeep(ctx, tx, keep)
+	}); err != nil {
+		return nil, err
+	}
+	s.publicDelivery.Store(&publicDeliveryEntry{registry: registry, admittedAt: checked})
+	return registry, nil
+}
+
+func (s *Server) readPublicDeliveryRegistry(ctx context.Context, generation string) (*globalDeliveryRegistry, error) {
+	store := s.globalDeliveryObjectStore()
+	if store == nil {
+		return nil, errors.New("dataset storage unavailable")
+	}
+	key := globalDeliveryPrefix + "public/generations/" + generation + ".json"
+	head, err := store.Head(ctx, key)
+	if err != nil || head.SizeBytes <= 0 || head.SizeBytes > 64<<20 {
+		return nil, errors.New("dataset registry unavailable")
+	}
+	registry, err := readGlobalDeliveryRegistry(ctx, store, key, head)
+	if err != nil {
+		return nil, err
+	}
+	if !registry.PublicDelivery || registry.SelectionScope != "available" || registry.Generation != generation {
+		return nil, errors.New("dataset is not published")
+	}
+	for name := range registry.Assets {
+		if !publicGlobalDeliveryAsset(name, registry.RecordingIDs) {
+			return nil, errors.New("private asset in public dataset")
+		}
+	}
+	return registry, nil
+}
+
+// publicDeliveryPin reads the pin on a connection released before it returns.
+func (s *Server) publicDeliveryPin(ctx context.Context, generation string) (pin string, err error) {
+	err = s.publicDeliveryFence(ctx, func(tx pgx.Tx) error {
+		pin, err = readPublicDeliveryPin(ctx, tx, generation)
+		return err
+	})
+	return pin, err
+}
+
+// publicDeliveryFence runs fn in a transaction on its own connection,
+// released before it returns.
+func (s *Server) publicDeliveryFence(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return errors.New("public cleanup fence unavailable")
+	}
+	defer tx.Rollback(ctx)
+	return fn(tx)
+}
+
+// readPublicDeliveryPin takes the shared NAS cleanup fence lock, so it orders
+// after any cleanup step that holds it exclusively, then reads the pin. A
+// request naming another generation (non-empty) gets 410.
+func readPublicDeliveryPin(ctx context.Context, tx pgx.Tx, generation string) (string, error) {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
+		return "", errors.New("public cleanup fence unavailable")
+	}
+	var pinned *string
+	if err := tx.QueryRow(ctx, `SELECT (SELECT generation FROM gss_public_generation_pin)`).Scan(&pinned); err != nil {
+		return "", errors.New("public cleanup fence unavailable")
+	}
+	if pinned == nil {
+		return "", errors.New("public generation pin missing")
+	}
+	if generation != "" && generation != *pinned {
+		return "", errGlobalDeliveryOutdatedGeneration
+	}
+	return *pinned, nil
 }
 
 func readGlobalDeliveryRegistry(ctx context.Context, store globalDeliveryObjectStore, key string, head r2.ObjectHead) (*globalDeliveryRegistry, error) {
@@ -267,24 +345,6 @@ func readGlobalDeliveryRegistry(ctx context.Context, store globalDeliveryObjectS
 // verified whole before it is sent, so a burst of large manifest or growth.json
 // requests cannot add up past the instance's memory.
 var globalDeliveryAssetSlots = make(chan struct{}, 4)
-
-// publicDeliveryRegistryCacheSize bounds parsed public generations held in
-// memory: the served one plus one other (the cleanup pin, or the generation an
-// older tab or a running download command still names). A 55k-file registry
-// retains ~22 MB once parsed and allocates ~84 MB while loading.
-const publicDeliveryRegistryCacheSize = 2
-
-// cachePublicDeliveryRegistry puts reg first, replacing a same-generation entry
-// and evicting the least recently used one past the bound.
-func (s *Server) cachePublicDeliveryRegistry(reg *globalDeliveryRegistry) {
-	kept := []*globalDeliveryRegistry{reg}
-	for _, cached := range s.publicDeliveryRegistries {
-		if cached.Generation != reg.Generation && len(kept) < publicDeliveryRegistryCacheSize {
-			kept = append(kept, cached)
-		}
-	}
-	s.publicDeliveryRegistries = kept
-}
 
 // readGlobalDeliveryExact reads exactly size bytes into one allocation and fails
 // unless the body then ends cleanly (for gzip, that read also checks the CRC).

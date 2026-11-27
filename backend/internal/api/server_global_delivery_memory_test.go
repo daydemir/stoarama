@@ -137,18 +137,20 @@ func totalAlloc() uint64 {
 func TestGlobalDeliveryMemoryBudget(t *testing.T) {
 	gen := "549402679c9d5f158cece1c4f77bad16"
 	store, manifest := memoryTestDelivery(t, gen)
-	s := &Server{globalDeliveryStore: store}
+	loader := &Server{globalDeliveryStore: store}
 	ctx := context.Background()
 
 	alloc := totalAlloc()
-	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, gen); err != nil {
+	reg, err := loader.readPublicDeliveryRegistry(ctx, gen)
+	if err != nil {
 		t.Fatal(err)
 	}
 	loadAlloc := totalAlloc() - alloc
 	held := heapAfterGC()
-	s.publicDeliveryRegistries = nil
+	runtime.KeepAlive(reg)
+	reg = nil
 	retained := held - heapAfterGC()
-	if _, err := s.loadGlobalDeliveryRegistryScope(ctx, true, gen); err != nil {
+	if reg, err = loader.readPublicDeliveryRegistry(ctx, gen); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("registry load: %.1f MB allocated, %.1f MB retained per cached generation", float64(loadAlloc)/1e6, float64(retained)/1e6)
@@ -156,6 +158,7 @@ func TestGlobalDeliveryMemoryBudget(t *testing.T) {
 		t.Fatalf("55k-file registry load allocates %d B, retains %d B", loadAlloc, retained)
 	}
 
+	s := publicDeliveryTestServer(t, store, reg)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/metadata?generation="+gen+"&path="+url.QueryEscape(memoryTestManifestPath), nil)
 	req.Header.Set("Accept-Encoding", "gzip")
@@ -206,33 +209,6 @@ func TestGlobalDeliveryManifestRewriteEdgeShapes(t *testing.T) {
 	writeGlobalDeliveryManifest(w, httptest.NewRequest(http.MethodGet, "/", nil), []byte(`{"outputs":[`), "g", "", "application/json", "")
 	if w.Code != http.StatusConflict {
 		t.Fatal("invalid manifest served", w.Code)
-	}
-}
-
-// Parsed generations stay bounded however many distinct ?generation= ids
-// arrive: the most recently used two, current first while it is in use.
-func TestPublicDeliveryRegistryCacheIsBoundedLRU(t *testing.T) {
-	gens := []string{strings.Repeat("a", 32), strings.Repeat("b", 32), strings.Repeat("c", 32)}
-	held := func(s *Server) (out string) {
-		for _, r := range s.publicDeliveryRegistries {
-			out += r.Generation[:1]
-		}
-		return out
-	}
-	s := &Server{}
-	for _, g := range gens {
-		s.cachePublicDeliveryRegistry(&globalDeliveryRegistry{Generation: g})
-	}
-	if held(s) != "cb" {
-		t.Fatalf("cache %q", held(s))
-	}
-	s.publicDeliveryCurrent, s.publicDeliveryCurrentAt = gens[1], time.Now()
-	if reg, err := s.loadGlobalDeliveryRegistryScope(context.Background(), true, ""); err != nil || reg.Generation != gens[1] || held(s) != "bc" {
-		t.Fatalf("current not served from cache: %v %q", err, held(s))
-	}
-	s.cachePublicDeliveryRegistry(&globalDeliveryRegistry{Generation: gens[1]})
-	if held(s) != "bc" {
-		t.Fatalf("reload of a cached generation duplicated it: %q", held(s))
 	}
 }
 
