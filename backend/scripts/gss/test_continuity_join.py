@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import shutil
@@ -112,6 +113,14 @@ class RuleTests(unittest.TestCase):
             C.read_clock_profiles(f.name)
         os.remove(f.name)
 
+    def test_head_verification(self):
+        sha, md5 = 'ab' * 32, 'cd' * 16
+        head = {'ContentLength': 10, 'ChecksumSHA256': base64.b64encode(bytes.fromhex(sha)).decode(), 'Metadata': {'sha256': sha}, 'ETag': f'"{md5}"'}
+        self.assertEqual(C.head_problems(head, 10, sha, md5), [])
+        self.assertEqual(len(C.head_problems(dict(head, ContentLength=11), 10, sha, md5)), 1)  # another size
+        self.assertEqual(len(C.head_problems(dict(head, ETag='"' + 'ef' * 16 + '"'), 10, sha, md5)), 1)  # same size, other bytes
+        self.assertEqual(len(C.head_problems({'ContentLength': 10, 'ETag': f'"{md5}"'}, 10, sha, md5)), 2)  # no server checksum
+
     def test_runs(self):
         self.assertEqual(C.runs('abcde', [True, False, True, True]), [['a', 'b'], ['c', 'd', 'e']])
         self.assertEqual(C.runs('ab', [False]), [['a'], ['b']])
@@ -140,8 +149,9 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(m.audio[0], 'aac')
             self.assertEqual(C.sha256_file(obj), proof['output']['sha256'])
             self.assertEqual([i['output_id'] for i in proof['inputs']], [100, 101, 102])
-            listing = {proof['output']['key']: (proof['output']['size_bytes'], '0' * 32)}
-            [a] = L.read_proofs(out, listing)
+            md5 = C.file_md5(obj)
+            listing = {proof['output']['key']: (proof['output']['size_bytes'], md5)}
+            [a] = L.read_proofs(out, listing, {proof['output']['key']: (proof['output']['size_bytes'], md5, proof['output']['sha256'])})
             self.assertEqual((a.source, a.input_ids, a.path), (L.Source.CLOCK_ASSEMBLY, (100, 101, 102), None))
             with self.assertRaisesRegex(SystemExit, 'create-only'):
                 C.build_run(run, [], 'clock-prestitch-20261126', out, os.path.join(d, 'work2'), lambda fid: [int(fid)], fetch)
