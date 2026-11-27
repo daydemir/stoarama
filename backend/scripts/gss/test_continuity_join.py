@@ -72,18 +72,19 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(C.verdict(ev)[:2], (False, K.EVIDENCE_FAILED))
 
     def test_known_clock_discontinuities_never_join(self):
-        """Every known 0 s seam whose clock jumps (115 cases from the scaled audit and the independent
-        review), through the rule with offset = clock minus seam-relative time."""
+        """Every 0 s seam the final scaled census flagged and the independent review's 10, through the
+        rule with offset = clock minus seam-relative time: no confirmed (by eye) discontinuity joins."""
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'testdata', 'clock_discontinuities.json')) as f:
             cases = json.load(f)['cases']
-        self.assertEqual(len(cases), 115)
+        self.assertEqual((len(cases), sum(x['visual'] == 'real' for x in cases)), (122, 61))
         for x in cases:
             before = tuple(None if c is None else c - (t - x['prev_duration_s']) for t, c in x['prev_reads'])
             after = tuple(None if c is None else c - t for t, c in x['next_reads'])
             join, why, _ = C.decide(seam('frame_jump', before=before, after=after, ratio=0.5, span=x['prev_duration_s'],
                                          prev=C.Media(VIDEO, AUDIO, 0.0, x['prev_duration_s'], 0.04)))
-            self.assertFalse(join, (x['source'], x['stream'], x['seam']))
-            self.assertIn(why, (K.CLOCK_DISAGREES, K.CLOCK_INCONSISTENT, K.CLOCK_UNREADABLE))
+            if x['visual'] == 'real':
+                self.assertFalse(join, (x['source'], x['stream'], x['seam']))
+                self.assertIn(why, (K.CLOCK_DISAGREES, K.CLOCK_INCONSISTENT, K.CLOCK_UNREADABLE))
 
     def test_seam_timing(self):
         f = 1 / 30
