@@ -30,8 +30,11 @@ def r2env():
 E = B = EP = None
 
 
-def s3(*args, check=True):
-    p = subprocess.run([AWS, 's3api', '--endpoint-url', EP, '--output', 'json', *args], env=E, capture_output=True, text=True)
+def s3(*args, check=True, single_attempt=False):
+    # A successful retry could hide an earlier still-in-flight conditional
+    # write. A pointer write must have only one wire attempt.
+    environment = dict(E, AWS_MAX_ATTEMPTS='1') if single_attempt else E
+    p = subprocess.run([AWS, 's3api', '--endpoint-url', EP, '--output', 'json', *args], env=environment, capture_output=True, text=True)
     if check and p.returncode:
         raise SystemExit('s3api failed: ' + p.stderr[-300:])
     return p
@@ -102,11 +105,12 @@ def snapshot(allowed):
 
 
 def verify(gen):
+    require_no_pending_write()
     snapshot({gen: staged(gen)})
     print('verified both pointers', gen)
 
 
-def put_current(old, etag, new_body):
+def put_current(old, etag, new_body, owner):
     arch = P + '/archive/current-%s.json' % old
     if not head(arch):
         s3('copy-object', '--bucket', B, '--key', arch, '--copy-source', B + '/' + CURRENT,
@@ -114,30 +118,32 @@ def put_current(old, etag, new_body):
     with tempfile.TemporaryDirectory() as directory:
         path = directory + '/registry.json.gz'
         Path(path).write_bytes(new_body)
-        s3('put-object', '--bucket', B, '--key', CURRENT, '--body', path,
-           '--content-type', 'application/gzip', '--if-match', etag)
+        guarded_pointer_write(owner, 'current', lambda: s3(
+            'put-object', '--bucket', B, '--key', CURRENT, '--body', path,
+            '--content-type', 'application/gzip', '--if-match', etag, single_attempt=True))
 
 
-def move_pin(old, new):
+def move_pin(old, new, owner):
     # Both IDs have been validated. The singleton and expected generation are
     # part of the UPDATE predicate; a competing pin must never be overwritten.
-    got = pg("UPDATE gss_public_generation_pin SET generation='%s', pinned_at=clock_timestamp() "
-             "WHERE singleton AND generation='%s' RETURNING generation" % (new, old), write=True).strip()
+    got = guarded_pointer_write(owner, 'pin', lambda: pg(
+        "UPDATE gss_public_generation_pin SET generation='%s', pinned_at=clock_timestamp() "
+        "WHERE singleton AND generation='%s' RETURNING generation" % (new, old), write=True)).strip()
     if got != new:
         raise RuntimeError('pin compare-and-set failed')
 
 
-def move(source, target, bodies, initial):
+def move(source, target, bodies, initial, owner):
     current, etag, pin = initial
     if current != target:
-        put_current(source, etag, bodies[target])
+        put_current(source, etag, bodies[target], owner)
     # Check the object readback before touching the pin, and refuse unrelated
     # state even on a retry after an ambiguous command outcome.
     current, _, pin = snapshot(bodies)
     if current != target:
         raise RuntimeError('current.json readback differs')
     if pin != target:
-        move_pin(source, target)
+        move_pin(source, target, owner)
     snapshot({target: bodies[target]})
     print('verified both pointers', target)
 
@@ -200,17 +206,55 @@ def record_attempt(attempt, parent, candidate, *, cancel):
     return True
 
 
+def transition_state():
+    path = Path(H) / 'generation-transition.json'
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text())
+    if (not isinstance(value, dict) or set(value) != {'attempt', 'parent', 'candidate', 'pending'}
+            or value['pending'] not in (None, 'current', 'pin')):
+        raise RuntimeError('invalid publication transition state')
+    for key in ('attempt', 'parent', 'candidate'):
+        generation_id(value[key])
+    return value
+
+
+def require_no_pending_write():
+    state = transition_state()
+    if state is not None and state['pending'] is not None:
+        raise RuntimeError('UNRESOLVED DIVERGENCE: outstanding %s write for attempt %s' %
+                           (state['pending'], state['attempt']))
+
+
 def claim_transition(attempt, parent, candidate):
     # Only called after the exact-parent precondition, under generation.lock.
     # The last forward attempt owns recovery until another validated attempt
     # takes ownership. A stale rollback cannot undo a successor's publication.
-    write_durable_json(Path(H) / 'generation-transition.json',
-                       attempt_identity(attempt, parent, candidate))
+    require_no_pending_write()
+    owner = attempt_identity(attempt, parent, candidate)
+    write_durable_json(Path(H) / 'generation-transition.json', dict(owner, pending=None))
+    return owner
 
 
 def owns_transition(attempt, parent, candidate):
+    return transition_state() == dict(attempt_identity(attempt, parent, candidate), pending=None)
+
+
+def guarded_pointer_write(owner, kind, write):
+    """Persist possible in-flight mutation before it crosses either store boundary.
+
+    A lost response may precede an actual write. Even a matching readback
+    cannot prove that request has drained; fail closed across restarts and
+    do not restore the old ETag or issue a successor write in that state.
+    Only a definite command response may clear this marker.
+    """
     path = Path(H) / 'generation-transition.json'
-    return path.exists() and json.loads(path.read_text()) == attempt_identity(attempt, parent, candidate)
+    if transition_state() != dict(owner, pending=None):
+        raise RuntimeError('publication does not own an idle transition')
+    write_durable_json(path, dict(owner, pending=kind))
+    result = write()
+    write_durable_json(path, dict(owner, pending=None))
+    return result
 
 
 def rollback(attempt, candidate, parent):
@@ -220,6 +264,7 @@ def rollback(attempt, candidate, parent):
         print('UNRESOLVED DIVERGENCE: attempt cancellation not durable:', error, file=sys.stderr)
         return 8
     try:
+        require_no_pending_write()
         bodies = {candidate: staged(candidate), parent: staged(parent)}
         if registry(bodies[candidate]).get('parent_generation') != parent:
             raise RuntimeError('candidate was not built from expected parent')
@@ -230,7 +275,7 @@ def rollback(attempt, candidate, parent):
             snapshot({parent: bodies[parent]})
             print('verified both parent pointers without transition ownership', parent)
             return 0
-        move(candidate, parent, bodies, snapshot(bodies))
+        move(candidate, parent, bodies, snapshot(bodies), attempt_identity(attempt, parent, candidate))
     except FAILURES as error:
         # An error response does not prove the last write failed. Only a fresh
         # readback of both exact parent pointers can establish a safe outcome.
@@ -252,16 +297,23 @@ def swap(attempt, parent, candidate):
         print('UNRESOLVED DIVERGENCE: attempt reservation failed:', error, file=sys.stderr)
         return 8
     try:
+        require_no_pending_write()
         bodies = {parent: staged(parent), candidate: staged(candidate)}
         if registry(bodies[candidate]).get('parent_generation') != parent:
             raise RuntimeError('candidate was not built from expected parent')
         initial = snapshot({parent: bodies[parent]})
     except FAILURES as error:
         print('REFUSED: swap precondition failed:', error, file=sys.stderr)
+        # An unresolved earlier write is a state that needs reconciliation,
+        # not a clean refusal. Do not tell the caller it is safe to proceed.
+        try:
+            require_no_pending_write()
+        except FAILURES:
+            return 8
         return 3
     try:
-        claim_transition(attempt, parent, candidate)
-        move(parent, candidate, bodies, initial)
+        owner = claim_transition(attempt, parent, candidate)
+        move(parent, candidate, bodies, initial, owner)
     except FAILURES as error:
         print('swap failed:', error, file=sys.stderr)
         return 8 if rollback(attempt, candidate, parent) else 4

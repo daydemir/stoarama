@@ -19,6 +19,7 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('gss_gen', HERE / 'gss_gen.py')
 gss = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gss)
+REAL_S3 = gss.s3
 PARENT, CANDIDATE, OTHER, ATTEMPT = ('a' * 32, 'b' * 32, 'c' * 32, 'd' * 32)
 
 
@@ -36,6 +37,10 @@ class MockStore:
         self.after_put = lambda: None
         self.before_pin = lambda: None
         self.after_pin = lambda: None
+        self.delay_put = False
+        self.outstanding = None
+        self.delay_pin = False
+        self.outstanding_pin = None
 
     def state(self):
         return gss.registry(self.objects[gss.CURRENT])['generation'], self.pin
@@ -43,7 +48,7 @@ class MockStore:
     def etag(self, key):
         return '"' + hashlib.sha256(self.objects[key]).hexdigest() + '"'
 
-    def s3(self, command, *args, check=True):
+    def s3(self, command, *args, check=True, single_attempt=False):
         def arg(flag):
             return args[args.index(flag) + 1]
         key = arg('--key')
@@ -57,14 +62,25 @@ class MockStore:
             assert arg('--if-none-match') == '*' and key not in self.objects
             self.objects[key] = self.objects[gss.CURRENT]
         elif command == 'put-object':
+            assert single_attempt, 'a live pointer PUT must not be retried'
             self.before_put()
             if arg('--if-match') != self.etag(key):
                 raise SystemExit('conditional PUT failed')
-            self.objects[key] = Path(arg('--body')).read_bytes()
+            payload = Path(arg('--body')).read_bytes()
+            if self.delay_put:
+                self.outstanding = (key, arg('--if-match'), payload)
+                raise SystemExit('response lost before conditional write finished')
+            self.objects[key] = payload
             self.after_put()
         else:
             raise AssertionError(command)
         return subprocess.CompletedProcess([], 0, json.dumps({'ETag': self.etag(key)}), '')
+
+    def finish_outstanding_put(self):
+        key, etag, payload = self.outstanding
+        self.outstanding = None
+        assert self.etag(key) == etag, 'the outstanding request should still match the parent'
+        self.objects[key] = payload
 
     def pg(self, sql, write=False):
         if not write:
@@ -76,6 +92,9 @@ class MockStore:
         self.before_pin()
         if self.pin != old:
             return ''
+        if self.delay_pin:
+            self.outstanding_pin = (old, new)
+            raise SystemExit('SQL response lost before conditional update finished')
         self.pin = new
         self.after_pin()
         return new
@@ -125,30 +144,36 @@ class PointerTests(unittest.TestCase):
 
     def test_partial_swap(self):
         self.store.before_pin = fail
-        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 4)
-        self.assertEqual(self.store.state(), (PARENT, PARENT))
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
+        self.assertEqual(self.store.state(), (CANDIDATE, PARENT))
+        self.assertEqual(gss.transition_state()['pending'], 'pin')
 
     def test_ambiguous_put(self):
         def once():
             self.store.after_put = lambda: None
             fail()
         self.store.after_put = once
-        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 4)
-        self.assertEqual(self.store.state(), (PARENT, PARENT))
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
+        self.assertEqual(self.store.state(), (CANDIDATE, PARENT))
+        self.assertEqual(gss.transition_state()['pending'], 'current')
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
 
     def test_ambiguous_pin(self):
         def once():
             self.store.after_pin = lambda: None
             fail()
         self.store.after_pin = once
-        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 4)
-        self.assertEqual(self.store.state(), (PARENT, PARENT))
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
+        self.assertEqual(self.store.state(), (CANDIDATE, CANDIDATE))
+        self.assertEqual(gss.transition_state()['pending'], 'pin')
+        with self.assertRaisesRegex(RuntimeError, 'outstanding pin write'):
+            gss.verify(CANDIDATE)
 
     def test_failed_rollback(self):
-        self.store.before_pin = fail
-        self.store.after_put = lambda: setattr(self.store, 'before_put', fail)
-        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
-        self.assertEqual(self.store.state(), (CANDIDATE, PARENT))
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 0)
+        self.store.before_put = fail
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        self.assertEqual(self.store.state(), (CANDIDATE, CANDIDATE))
         self.assertIn('UNRESOLVED DIVERGENCE', self.output.getvalue())
 
     def test_pin_only_partial_rollback(self):
@@ -163,8 +188,56 @@ class PointerTests(unittest.TestCase):
         gss.claim_transition(ATTEMPT, PARENT, CANDIDATE)
         self.store.pin = CANDIDATE
         self.store.after_pin = fail
-        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+
+    def test_outstanding_conditional_put_cannot_be_reported_as_rollback(self):
+        # The transport accepted the conditional write, lost its response,
+        # and hasn't actually applied it when recovery observes both parents.
+        self.store.delay_put = True
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
+        self.assertEqual(gss.transition_state()['pending'], 'current')
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        with self.assertRaisesRegex(RuntimeError, 'outstanding current write'):
+            gss.verify(PARENT)
+        self.assertEqual(gss.swap('e' * 32, PARENT, CANDIDATE), 8)
+        self.store.finish_outstanding_put()
+        self.assertEqual(self.store.state(), (CANDIDATE, PARENT))
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        self.assertEqual(gss.transition_state()['pending'], 'current')
+
+    def test_outstanding_pin_update_cannot_be_reported_as_rollback(self):
+        self.store.delay_pin = True
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
+        self.assertEqual(self.store.state(), (CANDIDATE, PARENT))
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        old, new = self.store.outstanding_pin
+        self.assertEqual(self.store.pin, old)
+        self.store.pin = new
+        self.assertEqual(self.store.state(), (CANDIDATE, CANDIDATE))
+        with self.assertRaisesRegex(RuntimeError, 'outstanding pin write'):
+            gss.verify(CANDIDATE)
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+
+    def test_outstanding_rollback_put_is_not_verified_even_after_it_arrives(self):
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 0)
+        self.store.delay_put = True
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        self.assertEqual(self.store.state(), (CANDIDATE, CANDIDATE))
+        self.store.finish_outstanding_put()
+        self.assertEqual(self.store.state(), (PARENT, CANDIDATE))
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        self.assertEqual(gss.transition_state()['pending'], 'current')
+
+    def test_pointer_put_cli_disables_retry(self):
+        with patch.object(gss, 'E', {'FAKE': 'mock'}), patch.object(gss, 'EP', 'mock://endpoint'), \
+             patch.object(gss.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '{}', '')) as run:
+            # Use the real CLI wrapper, not the fixture's fake s3 method.
+            REAL_S3('put-object', single_attempt=True)
+            self.assertEqual(run.call_args.kwargs['env']['AWS_MAX_ATTEMPTS'], '1')
+            self.assertNotIn('AWS_MAX_ATTEMPTS', gss.E)
 
     def test_current_body_must_match_staged(self):
         self.store.objects[gss.CURRENT] = body(PARENT, OTHER)

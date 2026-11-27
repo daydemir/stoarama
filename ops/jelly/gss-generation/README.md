@@ -28,8 +28,9 @@ allows either pointer to already name the parent, but refuses any generation
 outside the exact candidate/parent pair. Object writes use the ETag returned
 with the object bytes as `If-Match`; database writes use a generation-qualified
 UPDATE. Both exact pointers are read back before reporting success. On a
-failed forward write or uncertain response, the stager attempts conditional
-rollback while holding the same Jelly-local lock.
+failed forward operation, the stager attempts conditional recovery while
+holding the same Jelly-local lock. It never claims success for an unresolved
+write.
 
 The controller supplies a fresh UUID (32 lowercase hex characters) for each
 attempt. Under `generation.lock`, Jelly durably records the exact parent and
@@ -48,6 +49,17 @@ that owner; a non-owner can verify an already-restored parent but cannot undo
 a newer attempt, even if it used the same candidate. Both the attempt records
 and the transition-owner file must be retained.
 
+Before crossing either pointer-write boundary, the transition file durably
+records which store may have a write in flight. The R2 pointer PUT disables
+AWS CLI automatic retries (one total attempt). Only a definite command
+response clears the pending marker. If a response is lost or the process
+dies, matching reads of either pointer do **not** prove that an accepted
+request has drained. Verification, rollback and subsequent publication
+remain blocked while the pending marker exists. A delayed write could still
+arrive and change a pointer; recovery must account for that uncertainty at
+the destination, not restore the old ETag or report success based on a
+point-in-time read.
+
 The cycle also holds a Mooney-local lock across the build, swaps, gates, and
 ledger publication. It arms rollback before invoking the remote swap, so a
 lost SSH response is treated as an uncertain write. It checks the preview,
@@ -64,10 +76,14 @@ before replacement and restored if publication fails.
 | Other nonzero | Pre-swap failure, e.g. build, stage, lock or offline check. |
 
 An exit 8 is not a successful rollback. Stop publication attempts until the
-actual pointer identities and ledger status are accounted for. Do not use an
-unconditional pointer write to repair a conflict. If the state is still within
-the original candidate/parent pair, the same conditional rollback can be
-retried; otherwise a new recovery decision is needed. An interrupted cycle
+actual pointer identities, any outstanding request, and ledger status are
+accounted for. Do not use an unconditional pointer write to repair a conflict.
+Only if no pending write remains and the state is still within the original
+candidate/parent pair can the same owner-bound conditional rollback be
+retried. A pending write requires a separately reviewed recovery that proves
+the request drained or is fenced at its destination; do not erase the marker
+on the strength of a readback, timeout or elapsed wall time. An unrelated
+generation requires a separate recovery decision. An interrupted cycle
 may leave `$HOME/.stoarama-gss-cycle.lock` in place; only remove that directory
 after confirming the cycle is no longer running and reconciling its pointers
 and ledger. The Jelly `generation.lock` file uses an OS lock and should not be
