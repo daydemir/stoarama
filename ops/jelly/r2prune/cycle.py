@@ -40,6 +40,8 @@ SET LOCAL statement_timeout='115s';
 -- joins or parallel workers. The planner probes NAS rows by clip index; measured
 -- 34 s, every hash under 2 MB (the forced plan hashed 71k wide clip rows and
 -- seq-scanned all NAS rows, and hit this timeout in cycle 20261127T001522Z).
+-- Live window clips come from migration 0273's partial index: the clip-start index
+-- alone fetched every purged clip before each window end (1.0M heap rows for 350k).
 SET LOCAL work_mem='32MB';
 SET LOCAL max_parallel_workers_per_gather=0;
 COPY (
