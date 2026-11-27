@@ -203,9 +203,12 @@ class SyntheticBuildTests(unittest.TestCase):
         cat = {s['id']: s for s in self.object(out, reg, '/public/catalog.json')['streams']}
         self.assertEqual((cat[empty]['available_parts'], cat[empty]['weekly_exports']['available']['weeks'][0]['sample_path']), (0, None))
 
-        # Untouched assets keep their objects.
-        for p in ('/download-script.py', '/public/images.json', f'/public/images/{RIDS[0]}.jpg'):
+        # Untouched assets keep their objects; the download script is this repository's.
+        for p in ('/public/images.json', f'/public/images/{RIDS[0]}.jpg'):
             self.assertEqual(reg['assets'][p], self.fx.parent['assets'][p])
+        script = b.DOWNLOAD_SCRIPT.read_bytes()
+        self.assertEqual((reg['assets']['/download-script.py']['sha256'], reg['assets']['/download-script.py']['content_type']),
+                         (hashlib.sha256(script).hexdigest(), 'text/x-python'))
         self.check_objects(out, reg)
 
         # Rebuilt from the same base as a child of that generation: every key is already published.

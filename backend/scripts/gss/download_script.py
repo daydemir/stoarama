@@ -5,8 +5,11 @@ Requires Python 3.9 or newer; no additional packages.
 Save this script, then run the command in Terminal.
 python3 reviewed_downloader.py --destination ./stitched
 Rerun the same command to resume. Existing files are never overwritten.
+If the server retires the dataset generation mid-run (HTTP 410), the download
+continues on the current generation when it lists the same files (names, sizes,
+checksums); otherwise it stops and says what changed.
 """
-import argparse,hashlib,json,os,re,sys,time,urllib.request,urllib.error,urllib.parse,unicodedata
+import argparse,collections,hashlib,json,os,re,sys,time,urllib.request,urllib.error,urllib.parse,unicodedata
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from pathlib import Path,PurePosixPath
 DEFAULT='https://stoarama.com'
@@ -56,11 +59,19 @@ def save_receipt(receipt,manifest):
  with os.fdopen(fd,'wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
  return target
 
+FRESH='Copy a fresh command from the page to continue.'
+RETIRED=object()
 DATASET_API=None
 API_TOKEN=None
 DELIVERY_GENERATION=None
 
-def access_request(base,path):
+class GenerationRetired(Exception):
+ """The access server answered 410: the generation this download uses is retired."""
+
+class GenerationChanged(Exception):
+ """The current generation delivers different files than the retired one."""
+
+def access_request(base,path,generation=None):
  if DATASET_API:
   match=re.fullmatch(r'/api/(coverage-downloads|confident-repairs|reviewed-repairs)/ticket/([^/?]+)\?sha256=([0-9a-f]{64})(?:&path=([^&]+))?(?:&generation=([a-f0-9]{32}))?',path)
   if path.startswith(DATASET_API+'/ticket/'):
@@ -68,7 +79,7 @@ def access_request(base,path):
   elif match:
    identity=match[2] if match[1]=='coverage-downloads' else 'sha256:'+match[2]
    path=DATASET_API+'/ticket/'+urllib.parse.quote(identity,safe='')+'?sha256='+match[3]+('&path='+match[4]if match[4]else'')+('&generation='+match[5]if match[5]else'')
-  else:path=DATASET_API+'/asset?path='+urllib.parse.quote(path,safe='')+('&generation='+DELIVERY_GENERATION if DELIVERY_GENERATION else'')
+  else:path=DATASET_API+'/asset?path='+urllib.parse.quote(path,safe='')+('&generation='+generation if generation else'')
  headers={'User-Agent':USER_AGENT}
  if API_TOKEN:headers['Authorization']='Bearer '+API_TOKEN
  return urllib.request.Request(base+path,headers=headers)
@@ -77,16 +88,18 @@ class NoMediaRedirects(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,request,fp,code,msg,headers,newurl):
   raise ValueError('Unexpected download redirect refused')
 
-def direct_request(base,o,start):
+def ticket(base,o):
+ """The access server's verified R2 capability for one output of DELIVERY_GENERATION."""
  route=o.get('file_url','/api/coverage-downloads/file/'+str(o['id']))
  ticket_path=route.replace('/file/','/ticket/')+'?sha256='+o['sha256']
  if o.get('ticket_presentation_path'):ticket_path+='&path='+urllib.parse.quote(o['path'],safe='')
- generation=o.get('delivery_generation',DELIVERY_GENERATION)
- if generation:
-  if not isinstance(generation,str)or not re.fullmatch('[a-f0-9]{32}',generation)or DELIVERY_GENERATION and generation!=DELIVERY_GENERATION:raise ValueError('Invalid delivery generation')
-  ticket_path+='&generation='+generation
+ if DELIVERY_GENERATION:ticket_path+='&generation='+DELIVERY_GENERATION
  opener=urllib.request.build_opener(NoMediaRedirects())
- with opener.open(access_request(base,ticket_path),timeout=90) as response:
+ try:response=opener.open(access_request(base,ticket_path),timeout=90)
+ except urllib.error.HTTPError as e:
+  if e.code==410 and DELIVERY_GENERATION:e.close();raise GenerationRetired(DELIVERY_GENERATION) from None
+  raise
+ with response:
   if response.status!=200:raise ValueError('Download ticket unavailable')
   raw=response.read(16385)
   if len(raw)>16384:raise ValueError('Invalid download ticket')
@@ -100,6 +113,11 @@ def direct_request(base,o,start):
  if type(t.get('expires_at')) not in (float,int) or not time.time()+5<t['expires_at']<=time.time()+610:raise ValueError('Expired download ticket; retry')
  etag=t.get('etag')
  if not isinstance(etag,str) or not re.fullmatch(r'"[0-9a-f]{32}(?:-[0-9]+)?"',etag) or t.get('required_headers')!={'If-Match':etag}:raise ValueError('Download condition differs')
+ return t
+
+def storage(t,o,start):
+ """Open the ticket's R2 object from byte start, checked against the output's identity."""
+ etag=t['etag'];opener=urllib.request.build_opener(NoMediaRedirects())
  request=urllib.request.Request(t['url'],headers={'Range':'bytes=%d-'%start,'If-Match':etag,'User-Agent':USER_AGENT})
  try:response=opener.open(request,timeout=90)
  except urllib.error.HTTPError as e:
@@ -112,6 +130,8 @@ def direct_request(base,o,start):
  if response.headers.get('Content-Length')!=str(o['size_bytes']-start):
   response.close();raise ValueError('R2 range size differs')
  return response
+
+def direct_request(base,o,start):return storage(ticket(base,o),o,start)
 
 def fetch(base,o,root):
  final=destination(root,o['path']);partial=final.with_name('.output_'+o['sha256']+'.partial')
@@ -202,6 +222,38 @@ def week_outputs(m,week):
   if first<=local<first+timedelta(days=7):selected.append(o)
  return selected
 
+def file_identity(o):
+ """What one output delivers: its access identity, relative name, size, checksum and availability."""
+ return (o['id'],o['file_url'],bool(o.get('ticket_presentation_path')),o['path'],o['size_bytes'],o['sha256'],o['available'])
+
+def load_manifest(base,path,stream,week,generation):
+ """A verified manifest (of generation, or the current one), its outputs limited to week; returns (stream, manifest)."""
+ with urllib.request.urlopen(access_request(base,path,generation),timeout=90) as r:m=json.load(r)
+ recording=validate_manifest(m,stream);published=m.get('generation')
+ if published is not None and (not isinstance(published,str) or not re.fullmatch('[a-f0-9]{32}',published) or generation and published!=generation or any(o.get('delivery_generation',published)!=published for o in m['outputs'])):raise ValueError('Invalid published dataset generation')
+ if week:m=dict(m,outputs=week_outputs(m,week),selected_week=week)
+ return recording,m
+
+def follow(base,path,stream,week,outputs):
+ """After a 410: the current generation's manifest when it delivers exactly the same files, else GenerationChanged."""
+ retired=DELIVERY_GENERATION
+ for attempt in range(4):
+  try:m=load_manifest(base,path,stream,week,None)[1];break
+  except (urllib.error.URLError,TimeoutError,ConnectionError):
+   if attempt==3:raise
+   time.sleep(2**attempt)
+ current=m.get('generation')
+ if current is None or current==retired:raise ValueError('generation '+retired+' was refused as retired but is still served')
+ before={o['path']:file_identity(o) for o in outputs};after={o['path']:file_identity(o) for o in m['outputs']}
+ if before!=after:
+  added=sorted(after.keys()-before.keys());removed=sorted(before.keys()-after.keys());changed=sorted(p for p in before.keys()&after.keys() if before[p]!=after[p])
+  lines=['Stopped: dataset generation %s was retired, and the current generation %s changes this download: %d files added, %d removed, %d changed.'%(retired,current,len(added),len(removed),len(changed))]
+  for kind,paths in (('added',added),('removed',removed),('changed',changed)):
+   lines+=['  %s: %s'%(kind,p) for p in paths[:5]]+(['  ...and %d more %s'%(len(paths)-5,kind)] if len(paths)>5 else [])
+  lines.append('Every file in this folder is from %s and verified; nothing from %s was downloaded. %s The fresh command keeps unchanged files and refuses any that differ.'%(retired,current,FRESH))
+  raise GenerationChanged('\n'.join(lines))
+ return m
+
 def main():
  global DATASET_API,API_TOKEN,DELIVERY_GENERATION
  p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -233,42 +285,56 @@ def main():
  if target.is_symlink():p.error('Destination cannot be a symlink')
  target.mkdir(parents=True,exist_ok=True);root=target.resolve()
  urllib.request.install_opener(urllib.request.build_opener(NoRedirects()))
- with urllib.request.urlopen(access_request(base,a.manifest),timeout=90) as r:m=json.load(r)
- scope=str(validate_manifest(m,a.stream));ids={o['id'] for o in m['outputs']}
+ try:scope,m=load_manifest(base,a.manifest,a.stream,a.week,DELIVERY_GENERATION)
+ except urllib.error.HTTPError as e:
+  if e.code==410 and DELIVERY_GENERATION:e.close();raise SystemExit('Dataset generation '+DELIVERY_GENERATION+' is retired. '+FRESH) from None
+  raise
  generation=m.get('generation')
  if generation:
-  if not isinstance(generation,str)or not re.fullmatch('[a-f0-9]{32}',generation):raise ValueError('Invalid published dataset generation')
   print('Dataset generation '+generation+'. To resume this exact export, add --generation '+generation,flush=True)
- if a.week:
-  m=dict(m,outputs=week_outputs(m,a.week),selected_week=a.week)
-  ids={o['id'] for o in m['outputs']}
+  DELIVERY_GENERATION=generation  # only public manifests carry one
  # Small receipt manifest enables later audit; media is never archived/duplicated.
- receipt=root/('stitching-'+scope+'-reviewed'+('-week'+str(a.week) if a.week else '')+'.manifest.json')
+ receipt=root/('stitching-'+str(scope)+'-reviewed'+('-week'+str(a.week) if a.week else '')+'.manifest.json')
  save_receipt(receipt,m)
- failures=[]
+ outputs=m['outputs'];total=len(outputs);failures=[]
  def transfer(n,o):
   if not o['available']:
-   print('[%d/%d] Unavailable output %s'%(n,len(ids),o['id']));return o['id']
+   print('[%d/%d] Unavailable output %s'%(n,total,o['id']));return o['id']
   for attempt in range(4):
    try:
-    status=fetch(base,o,root);print('[%d/%d] %s: %s'%(n,len(ids),status,o['path']));return None
+    status=fetch(base,o,root);print('[%d/%d] %s: %s'%(n,total,status,o['path']));return None
+   except GenerationRetired:return RETIRED
    except (urllib.error.URLError,TimeoutError,ConnectionError):
     if attempt<3:time.sleep(2**attempt);continue
     print('Transfer failed for output '+str(o['id'])+'; rerun to resume',file=sys.stderr);return o['id']
    except (ValueError,OSError) as e:
     print(str(e),file=sys.stderr);return o['id']
+ # Bound pending work as well as active sockets for the 70k-file export. After a
+ # 410, finish what is in flight, then switch generations once or stop.
+ work=collections.deque(enumerate(outputs,1));pending={};retired=[];stopped=None
  with ThreadPoolExecutor(max_workers=a.jobs) as pool:
-  # Bound pending work as well as active sockets for the 70k-file export.
-  pending={};items=iter(enumerate(m['outputs'],1))
-  for _ in range(a.jobs):
-   item=next(items,None)
-   if item:pending[pool.submit(transfer,*item)]=item[1]['id']
-  while pending:
-   done=next(as_completed(pending));result=done.result();del pending[done]
-   if result is not None:failures.append(result)
-   item=next(items,None)
-   if item:pending[pool.submit(transfer,*item)]=item[1]['id']
- print('%d outputs complete; %d unavailable or failed. Rerun to resume.'%(len(ids)-len(failures),len(failures)))
+  while not stopped:
+   while work and not retired and len(pending)<a.jobs:
+    item=work.popleft();pending[pool.submit(transfer,*item)]=item
+   if pending:
+    done=next(as_completed(pending));item=pending.pop(done);result=done.result()
+    if result is RETIRED:retired.append(item)
+    elif result is not None:failures.append(result)
+    continue
+   if not retired:break
+   old=DELIVERY_GENERATION
+   try:m=follow(base,a.manifest,a.stream,a.week,outputs)
+   except GenerationChanged as e:stopped=str(e)
+   except (urllib.error.URLError,TimeoutError,ConnectionError,ValueError) as e:stopped='Stopped: dataset generation '+old+' was retired and the current generation could not be checked ('+str(e)+'). '+FRESH
+   else:
+    DELIVERY_GENERATION=m['generation'];save_receipt(receipt,m)
+    print('Dataset generation %s was retired; generation %s lists the same %d files, so this download continues on it. Files already downloaded are kept.'%(old,DELIVERY_GENERATION,total),flush=True)
+    work.extendleft(reversed(retired));retired.clear()
+ if stopped:
+  print(stopped,file=sys.stderr)
+  print('%d outputs complete; %d unavailable or failed; %d not started.'%(total-len(failures)-len(work)-len(retired),len(failures),len(work)+len(retired)))
+  return True
+ print('%d outputs complete; %d unavailable or failed. Rerun to resume.'%(total-len(failures),len(failures)))
  return bool(failures)
 if __name__=='__main__':
  try:sys.exit(main())
