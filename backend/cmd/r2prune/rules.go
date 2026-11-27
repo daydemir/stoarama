@@ -134,7 +134,7 @@ type rules struct {
 type ruleFiles struct {
 	identities, dbProtect, closure, controller, picks string
 	derived, nasEvidence, release, recentFrom         string
-	keCoverage, best14Coverage                        string
+	keCoverage, best14Coverage, served                string
 }
 
 func (f *ruleFiles) register(fs *flag.FlagSet) {
@@ -148,6 +148,7 @@ func (f *ruleFiles) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.nasEvidence, "nas-evidence", "", "live NAS custody TSV for window keys; required with --release nas_keep_20")
 	fs.StringVar(&f.release, "release", "", "comma-separated controller protections to lift: "+strings.Join(sortedKeys(releasable), ","))
 	fs.StringVar(&f.keCoverage, "ke-coverage", "", "optional TSV: raw_key,raw_size,output_key,output_size for KE raw already inside a stitched R2 output")
+	fs.StringVar(&f.served, "served", "", "optional: one key per line the live GSS generation serves; each is protect_live_site everywhere, never window-only")
 	fs.StringVar(&f.best14Coverage, "best14-coverage", "", "optional TSV, same columns: non-KE best-14 raw inside a served, keep-held stitched R2 output")
 }
 
@@ -165,7 +166,7 @@ func (f ruleFiles) digests() (map[string]string, error) {
 	out := map[string]string{}
 	for name, p := range map[string]string{"identities": f.identities, "db_protect": f.dbProtect, "closure": f.closure,
 		"controller_protect": f.controller, "picks": f.picks, "derived_identities": f.derived, "nas_evidence": f.nasEvidence, "ke_coverage": f.keCoverage,
-		"best14_coverage": f.best14Coverage} {
+		"best14_coverage": f.best14Coverage, "served": f.served} {
 		if p == "" {
 			continue
 		}
@@ -216,6 +217,17 @@ func (f ruleFiles) load() (*rules, error) {
 	}
 	if err := r.loadDBProtect(f.dbProtect); err != nil {
 		return nil, err
+	}
+	if f.served != "" {
+		if err := eachLine(f.served, func(key string) error {
+			if strings.TrimSpace(key) != key || strings.Contains(key, "\t") {
+				return fmt.Errorf("bad served key %q", key)
+			}
+			r.addKey(key, keyRule{protectLiveSite, "served:gss_generation", false})
+			return nil
+		}); err != nil {
+			return nil, err
+		}
 	}
 	if err := eachTSV(f.closure, 2, func(c []string) error { r.Closure[c[1]] = true; return nil }); err != nil {
 		return nil, err

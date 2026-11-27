@@ -887,6 +887,8 @@ def main(argv):
     b.add_argument('--ledger', required=True)
     b.add_argument('--defer-blocked', action='store_true',
                    help='apply every receipt the dry run admits; record held keys in deferred-blocked.tsv and keep the intent open')
+    k = sub.add_parser('served-keys', help='write the pinned generation\'s served keys, one per line (r2prune --served)')
+    k.add_argument('out')
     sub.add_parser('protect-served', help='union the pinned generation\'s served keys into gss-protect.tsv (after a publish)')
     g = sub.add_parser('gate', help='the served-generation gate on a plan, read-only; exits non-zero on failure')
     g.add_argument('plan', help='r2prune plan --out directory (delete-manifest.jsonl, classified.tsv)')
@@ -896,6 +898,11 @@ def main(argv):
     cfg = p.parse_args(argv)
     if cfg.cmd == 'status':
         return status(cfg.roots)
+    if cfg.cmd == 'served-keys':
+        gen, served = served_keys(cfg, r2_store(cfg.r2_env))
+        durable_write(cfg.out, ''.join(k + '\n' for k in sorted(served)))
+        print(json.dumps({'generation': gen, 'served_keys': len(served), 'sha256': sha(cfg.out)}))
+        return
     if cfg.cmd == 'protect-served':
         return protect_served(cfg)
     if cfg.cmd == 'gate':

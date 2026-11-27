@@ -714,6 +714,12 @@ class Gate(Best14ChunkVerify):
             cycle.write_text('if rows.count("\\n") < 99:\n')
             self.run_cli(*args)
 
+    def test_served_keys_writes_the_pinned_generation(self):
+        out = self.d / 'served.txt'
+        got = self.run_cli('served-keys', str(out))
+        self.assertEqual((got[0]['generation'], got[0]['served_keys']), (GEN, 2))
+        self.assertEqual(out.read_text(), f'{ASSET}\n{SERVED}\n')
+
     def test_gate_command_on_a_plan(self):
         (self.plan / 'delete-manifest.jsonl').write_text(self.manifest.read_text())
         out = self.run_cli('gate', str(self.plan), '--db-protect', str(self.protect))

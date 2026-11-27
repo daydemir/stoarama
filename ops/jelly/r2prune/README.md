@@ -158,6 +158,12 @@ serves (files and assets) is in the keys about to be deleted, every one has a
 per chunk catches a generation swap mid-run. `manual_apply.py gate PLAN_DIR
 --db-protect FILE` runs the same check on a plan.
 
+`manual_apply.py served-keys OUT` writes the same served keys, one per line, for
+`r2prune --served`: each is `protect_live_site` everywhere, where a `page_link` row
+holds only inside a window or on Keep Everything. A plan meant for a manual delete
+passes it, so the gate's classification check holds for every served key the
+plan lists.
+
 `manual_apply.py protect-served` unions the pinned generation's served keys into
 `~/stoarama-gss-freeze/gss-protect.tsv` under `cycle.lock`. It never removes a row,
 backs up `gss-protect.tsv` and the lane's `cycle.py`, and raises `cycle.py`'s

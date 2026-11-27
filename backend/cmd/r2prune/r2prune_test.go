@@ -851,3 +851,40 @@ func TestBest14CoveragePlanThenDeleteRechecksOutput(t *testing.T) {
 		t.Fatalf("output gone from the fresh listing must skip: %s", body)
 	}
 }
+
+// A key the live GSS generation serves is protect_live_site even outside its
+// window, where a page_link row alone does not hold.
+func TestServedKeysHoldEverywhere(t *testing.T) {
+	const old = "managed/acct-47/a_folder/oldpage.mp4"
+	files, _ := fixture(t)
+	out := w0 - 30*day
+	f, _ := os.OpenFile(files.identities, os.O_APPEND|os.O_WRONLY, 0)
+	fmt.Fprintf(f, "raw\t%s\t10\t%d\t%d\t130\tf\t0\ta_folder\t1\n", old, out, out+60)
+	f.Close()
+	p, _ := os.OpenFile(files.dbProtect, os.O_APPEND|os.O_WRONLY, 0)
+	p.WriteString("page_link\t" + old + "\n")
+	p.Close()
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.decide(object{Key: old, Size: 130, MTime: w0}); got != deleteRawOutsideWindow {
+		t.Fatalf("page_link alone outside the window: got %s", got)
+	}
+	files.served = writeFile(t, t.TempDir(), "served.txt", old+"\njoined/nightly-collation-v2/objects/old.mp4\n")
+	if r, err = files.load(); err != nil {
+		t.Fatal(err)
+	}
+	for key, size := range map[string]int64{old: 130, "joined/nightly-collation-v2/objects/old.mp4": 200} {
+		if got, reason := r.decide(object{Key: key, Size: size, MTime: w0}); got != protectLiveSite || reason != "served:gss_generation" {
+			t.Errorf("%s served: got %s (%s)", key, got, reason)
+		}
+	}
+	if d, _ := files.digests(); d["served"] == "" {
+		t.Error("the served list must be a pinned rule input")
+	}
+	files.served = writeFile(t, t.TempDir(), "bad.txt", " lead\n")
+	if _, err := files.load(); err == nil {
+		t.Error("a padded served key must refuse")
+	}
+}
