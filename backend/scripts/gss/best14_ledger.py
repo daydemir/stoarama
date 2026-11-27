@@ -21,7 +21,9 @@ Inputs:
                aws s3api list-objects-v2 --bucket B --prefix P
                  --query 'Contents[].[Key,Size,ETag]' --output text
   --clock-proofs  optional directory of clock-join proof JSONs, copied read-only
-               from joined/clock-prestitch-*/proofs/.
+               from joined/clock-prestitch-*/proofs/, with
+  --clock-uploads  the server-checked upload log that binds each listed video to
+               its proof's sha256 (size, ETag and SHA-256 from the upload's HEAD).
 
 An assembly serves in place of the consecutive parts it was built from (across
 an hour boundary, from the end of one hour into the start of the next): a live
@@ -405,17 +407,54 @@ def registry_assemblies(registry, store, listing, holds):
     return live, unheld
 
 
-def read_proofs(directory, listing):
-    """Every clock-join proof (joined/<batch>/proofs/<sha256>.json) whose video is in the listing."""
+def read_uploads(path):
+    """{key: (size, etag, sha256)} of the server-checked uploads (continuity_join's upload log: one JSON
+    object per line whose 'object' holds the key, size_bytes, etag and sha256 a HEAD with SHA-256
+    checksum mode returned for the create-only upload)."""
+    out = {}
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                o = json.loads(line)['object']
+                out[o['key']] = (int(o['size_bytes']), o['etag'].strip('"'), o['sha256'])
+    return out
+
+
+def read_proofs(directory, listing, uploads):
+    """Every clock-join proof (joined/<batch>/proofs/<sha256>.json) whose video is in the listing.
+    A listed video serves only when a server-checked upload binds it: the listing's size and ETag
+    must be the upload's, and the upload's SHA-256 the proof's."""
     out = []
     for p in sorted(Path(directory).rglob('*.json')):
         proof = json.loads(p.read_text(encoding='utf-8'))
         o = proof['output']
         if not o['key'].startswith(CLOCK_PREFIX):
             raise LedgerError(f'{p}: assembly key {o["key"]} is not under {CLOCK_PREFIX}*')
-        if in_r2(listing, o['key'], int(o['size_bytes'])):
-            out.append(Assembly('sha256:' + o['sha256'], o['key'], int(o['size_bytes']), listing[o['key']][1], o['sha256'],
-                                tuple(int(i['output_id']) for i in proof['inputs']), Source.CLOCK_ASSEMBLY, None))
+        if not in_r2(listing, o['key'], int(o['size_bytes'])):
+            continue
+        size, etag = listing[o['key']]
+        if uploads.get(o['key']) != (size, etag, o['sha256']):
+            raise LedgerError(f'{o["key"]}: no server-checked upload binds the listed object {(size, etag)} to the proof sha256 {o["sha256"]}')
+        out.append(Assembly('sha256:' + o['sha256'], o['key'], size, etag, o['sha256'],
+                            tuple(int(i['output_id']) for i in proof['inputs']), Source.CLOCK_ASSEMBLY, None))
+    return out
+
+
+def with_proofs(live, proofs, registry):
+    """The live assemblies plus the clock-join proofs. A proof for a file the live generation
+    lists must match its live assembly (key, ETag, inputs), which must be loaded (in R2 with a
+    matching keep hold): an unheld live file cannot come back through a proof."""
+    by_id = {a.file_id: a for a in live}
+    out = list(live)
+    for a in proofs:
+        if a.file_id in registry['files']:
+            b = by_id.get(a.file_id)
+            if b is None:
+                raise LedgerError(f'clock-join proof {a.file_id}: the live generation lists it but it is not in R2 with a matching keep hold')
+            if (b.key, b.etag, b.input_ids) != (a.key, a.etag, a.input_ids):
+                raise LedgerError(f'clock-join proof {a.file_id} differs from its live assembly')
+            continue
+        out.append(a)
     return out
 
 
@@ -427,7 +466,9 @@ def load(a):
     holds = read_holds(a.holds)
     live, unheld = registry_assemblies(registry, store, listing, holds)
     if a.clock_proofs:
-        live += read_proofs(a.clock_proofs, listing)
+        if not a.clock_uploads:
+            raise LedgerError('--clock-proofs needs --clock-uploads (the server-checked upload log)')
+        live = with_proofs(live, read_proofs(a.clock_proofs, listing, read_uploads(a.clock_uploads)), registry)
     return Inputs(read_best14(a.best14), read_extract(a.extract), live, listing, registry, holds, unheld,
                   delivery_naming.catalog_names(store.load('/public/catalog.json'))), store
 
@@ -485,18 +526,31 @@ def serving_set(record, slot, by_input, listing, holds, names):
                  for k, x in enumerate(served, 1)), tuple(carried)
 
 
+REPLACEABLE = frozenset({Source.V79_ASSEMBLY, Source.V85_ASSEMBLY})
+
+
 def live_after_clock_joins(assemblies):
-    """The assemblies that serve: a clock-join assembly (from a proof, path None) replaces
-    every live generation assembly wholly inside its inputs, which then stays in R2, held
-    and unreferenced. A live assembly it only partly covers fails."""
-    claimed = {i: a.file_id for a in assemblies if a.path is None for i in a.input_ids}
-    out = []
+    """The assemblies that serve. Vetoed ones never do (their parts serve), and are dropped
+    first. One file id has one definition. A new clock-join assembly (from a proof, path None)
+    replaces every live V79/V85 assembly wholly inside its inputs, which stays in R2, held and
+    unreferenced; partly covering one, or covering any other kind, fails."""
+    defs = collections.defaultdict(set)
     for a in assemblies:
+        defs[a.file_id].add(a.input_ids)
+    bad = sorted(f for f, d in defs.items() if len(d) > 1)
+    if bad:
+        raise LedgerError(f'assemblies with conflicting input lists: {bad[:3]}')
+    kept = [a for a in dict((a.file_id, a) for a in assemblies if a.file_id not in VETOED).values()]
+    claimed = {i: a.file_id for a in kept if a.path is None for i in a.input_ids}
+    out = []
+    for a in kept:
         over = {claimed.get(i) for i in a.input_ids}
         if a.path is None or over == {None}:
             out.append(a)
         elif len(over) > 1:
             raise LedgerError(f'assembly {a.file_id} is only partly inside clock-join assemblies {sorted(over - {None})}')
+        elif a.source not in REPLACEABLE:
+            raise LedgerError(f'clock-join assembly {over.pop()} would replace {a.source.value} {a.file_id}; only V79/V85 can be replaced')
     return out
 
 
@@ -777,6 +831,7 @@ def add_input_args(ap):
     ap.add_argument('--holds', required=True, help='holds-sql output')
     ap.add_argument('--listing', required=True, nargs='+', help='key/size/ETag listings of joined/ and experimental/')
     ap.add_argument('--clock-proofs', help='directory of clock-join proof JSONs')
+    ap.add_argument('--clock-uploads', help="continuity_join's server-checked upload log for --clock-proofs")
 
 
 def main(argv=None):

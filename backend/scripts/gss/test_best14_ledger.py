@@ -308,8 +308,46 @@ class AssemblyTests(unittest.TestCase):
             with open(os.path.join(proofs, a.sha256 + '.json'), 'w') as f:
                 json.dump({'hour_id': self.rec.hour_id, 'inputs': [{'output_id': i} for i in a.input_ids],
                            'output': {'key': a.key, 'sha256': a.sha256, 'size_bytes': a.size_bytes}}, f)
-            self.assertEqual(L.read_proofs(d, {}), [])
-            self.assertEqual(L.read_proofs(d, {a.key: (a.size_bytes, ETAG)}), [a])
+            listing = {a.key: (a.size_bytes, ETAG)}
+            uploads = {a.key: (a.size_bytes, ETAG, a.sha256)}
+            self.assertEqual(L.read_proofs(d, {}, uploads), [])
+            self.assertEqual(L.read_proofs(d, listing, uploads), [a])
+            # A listed object no server-checked upload binds to the proof does not serve: same size, other bytes.
+            for bad in ({}, {a.key: (a.size_bytes, ETAG, 'f' * 64)}, {a.key: (a.size_bytes, '1' * 32, a.sha256)}):
+                with self.assertRaisesRegex(L.LedgerError, 'no server-checked upload binds'):
+                    L.read_proofs(d, listing, bad)
+
+    def test_an_unheld_live_assembly_cannot_return_through_a_proof(self):
+        a = self.w.assembly(self.rec, [2, 3], live=False)
+        registry = {'files': {a.file_id: {'key': a.key}}}
+        with self.assertRaisesRegex(L.LedgerError, 'not in R2 with a matching keep hold'):
+            L.with_proofs([], [a], registry)
+        held = dataclasses.replace(a, path='p.mp4', source=L.Source.CLOCK_ASSEMBLY)
+        self.assertEqual(L.with_proofs([held], [a], registry), [held])  # the live entry serves
+        with self.assertRaisesRegex(L.LedgerError, 'differs from its live assembly'):
+            L.with_proofs([held], [dataclasses.replace(a, etag='1' * 32)], registry)
+        with self.assertRaisesRegex(L.LedgerError, 'differs from its live assembly'):
+            L.with_proofs([held], [dataclasses.replace(a, input_ids=a.input_ids[:1])], registry)
+
+    def test_conflicting_input_lists_for_one_file_fail(self):
+        self.w.assembly(self.rec, [1, 2], 'aa', L.Source.V79_ASSEMBLY, path='v79.mp4')
+        self.w.assembly(self.rec, [1, 2, 3], 'aa')  # the same sha256 with other inputs
+        with self.assertRaisesRegex(L.LedgerError, 'conflicting input lists'):
+            self.w.select()
+
+    def test_clock_join_replaces_only_v79_and_v85(self):
+        self.w.assembly(self.rec, [1, 2], 'aa', L.Source.STRICT_ASSEMBLY, path='strict.mp4')
+        self.w.assembly(self.rec, [1, 2, 3], 'cc')
+        with self.assertRaisesRegex(L.LedgerError, 'only V79/V85 can be replaced'):
+            self.w.select()
+
+    def test_a_vetoed_clock_proof_leaves_the_live_assembly_serving(self):
+        v79 = self.w.assembly(self.rec, [1, 2], 'aa', L.Source.V79_ASSEMBLY, path='v79.mp4')
+        a = self.w.assembly(self.rec, [1, 2, 3], 'cc')
+        with mock.patch.object(L, 'VETOED', frozenset({a.file_id})):
+            h = self.w.hour(self.w.select(), DAYS[3], 5)
+        self.assertEqual([s.file_id for s in h.served][:1], [v79.file_id])
+        self.assertNotIn(a.file_id, [s.file_id for s in h.served])
 
 
 class RuleTests(unittest.TestCase):
