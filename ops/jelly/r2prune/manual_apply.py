@@ -606,7 +606,7 @@ COPY (
  UNION ALL
  SELECT 'pair', p.raw, p.output, EXISTS(SELECT FROM recording_collation_outputs x JOIN recording_clips c ON c.id=p.clip
    WHERE x.object_key=p.output AND p.clip=ANY(x.source_clip_ids)
-    AND c.clip_start_at>=x.start_at AND c.clip_end_at<=x.end_at)::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+    AND c.clip_start_at>=x.start_at AND c.clip_start_at<c.clip_end_at AND c.clip_end_at<=x.end_at)::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL
  FROM p
 ) TO STDOUT WITH (FORMAT csv, DELIMITER E'\\t');
 ROLLBACK;
@@ -644,17 +644,16 @@ def verify_chunk(cfg, store, batch, manifest, sources, cover, attempted, held):
         if got is None or got[2:5] != [str(manifest[k]['size']), 'true', 'false']:
             raise SystemExit(f'verify: recording_clips row for {k} [size, purged_at NULL, owner keep] is {got and got[2:5]}, '
                              f'want size {manifest[k]["size"]}, purged_at NULL and no owner keep')
-    # A covering output's keep (an owner keep such as collation_v2_recovery_held, or the GSS page's
-    # delivery keep hold at its live size and ETag) is the protection a sole copy must have, so it is
-    # required; a raw's owner keep refuses above.
+    # A covering output's owner keep (such as collation_v2_recovery_held) is the protection a sole copy
+    # must have, so it is required: a delivery keep hold alone blocks no retirement since 0244. A raw's
+    # owner keep refuses above.
     for o in outputs:
         got = db[('output', o)]
-        size, etag = heads[o][0], heads[o][1]
-        held = got[9] == 'true' or got[8] == f'{size}:{etag}'
-        if got[2:8] != ['1', str(size), 'false', 'false', 'false', 'true'] or not held or got[10] == 'unverified':
+        size = heads[o][0]
+        if got[2:8] != ['1', str(size), 'false', 'false', 'false', 'true'] or got[9] != 'true' or got[10] == 'unverified':
             raise SystemExit(f'verify: covering output {o} catalog [rows, size, receipt, reservation, nonraw intent, collated, '
                              f'delivery hold, owner keep, NAS restore] is {got[2:11]}, want one collated row at size {size}, '
-                             f'none of the others, keep-held, and no unverified restore')
+                             f'none of the others, an owner keep, and no unverified restore')
     for k in batch:
         for o, _ in cover[k]:
             if db[('pair', k, o)][3] != 'true':
@@ -723,7 +722,7 @@ def delete(cfg, W, args, lock_fd):
 
     def call(keys, listing):
         """Served-generation gate, preflight, bind the intent, one r2prune call, then its receipts."""
-        gate(cfg, store, keys, protect_path, classified_path)
+        gen = gate(cfg, store, keys, protect_path, classified_path)[0]
         preflight(cfg, W, keys, manifest, sources, expected)
         if not intent_path.exists():
             durable_write(intent_path, json.dumps(intent) + '\n')
@@ -733,6 +732,9 @@ def delete(cfg, W, args, lock_fd):
         st = finish_receipts(cfg, W, only=ledger)
         if rc:
             raise SystemExit(f'r2prune delete exited {rc}; receipts for its acknowledged deletes are written')
+        now = served_keys(cfg, store)[0]
+        if now != gen:  # a publish during the call: its keys were not gated; stop loudly
+            raise SystemExit(f'the pinned generation moved from {gen} to {now} during this chunk; receipts are written, rerun to gate')
         return st
 
     if mode is Mode.LISTING:
@@ -747,6 +749,10 @@ def delete(cfg, W, args, lock_fd):
     for other, path in open_intents({Path(W).parent, Path(cfg.lane_cycles)}):
         if other != Path(W):
             held |= read_manifest(path).keys()
+    if (cfg.chunk or CHUNK) > CHUNK:
+        raise SystemExit(f'--chunk is at most {CHUNK}: one live verify covers one chunk')
+    if cfg.chunks is None and not State(W, intent, manifest).final:
+        raise SystemExit('run the canary first: --chunks 1, then check it, then rerun without --chunks')
     for n in range(cfg.chunks or sys.maxsize):
         st = State(W, intent, manifest)
         batch = (sorted(st.unresolved & st.attempted) + [k for k in manifest if k not in st.attempted])[:cfg.chunk or CHUNK]
@@ -847,7 +853,8 @@ def protect_served(cfg):
             backup = f'{path}.pre-served-{gen[:8]}-{stamp}'
             Path(backup).write_bytes(Path(path).read_bytes())
             os.chmod(backup, os.stat(path).st_mode & 0o777)
-        for path, body in ((cfg.gss_protect, new), (cfg.cycle, src.replace(f'< {found[0]}:', f'< {n}:'))):
+        threshold = re.sub(r'(if rows\.count\("\\n"\) < )\d+:', lambda m: f'{m[1]}{n}:', src)
+        for path, body in ((cfg.gss_protect, new), (cfg.cycle, threshold)):
             mode = os.stat(path).st_mode & 0o777
             durable_write(path, body)
             os.chmod(path, mode)

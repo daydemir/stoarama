@@ -266,8 +266,8 @@ class ListingMode(Base):
         self.assertEqual(self.calls(), ['stdin', 'dry-run.sql', 'r2prune', 'receipt-apply.sql'])
         calls = [json.loads(l) for l in (self.d / 'calls.jsonl').read_text().splitlines()]
         self.assertEqual([(c['psql'], c['ro']) for c in calls if 'psql' in c],
-                         [('stdin', True), ('pin', True), ('dry-run.sql', True), ('receipt-apply.sql', False)])
-        apply = calls[-1]
+                         [('stdin', True), ('pin', True), ('dry-run.sql', True), ('receipt-apply.sql', False), ('pin', True)])
+        apply = [c for c in calls if c.get('psql') == 'receipt-apply.sql'][-1]
         self.assertEqual((apply['cwd'], apply['args'][apply['args'].index('total=2') - 1]), (str(self.W), '-v'))
         self.assertNotIn('secretpw', json.dumps(calls))
         self.assertTrue(self.result()['complete'])
@@ -521,7 +521,7 @@ class ChunkVerify(Base):
         self.r2({**{k: [100, 'e1', 1] for k in KE}, OUT1: [500, 'o1', 5], OUT2: [600, 'o2', 6]})
         # [rows, size, receipt, reservation, nonraw intent, collated, delivery hold size:etag, owner keep, NAS restore]
         self.db({'clips': {k: ['100', 'true'] for k in KE},
-                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false', 'true', '500:o1', 'false', 'none'],
+                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false', 'true', '500:o1', 'true', 'none'],
                              OUT2: ['1', '600', 'false', 'false', 'false', 'true', '', 'true', 'verified']},
                  'contains': {OUT1: KE[:2], OUT2: KE[2:]}})
 
@@ -531,7 +531,10 @@ class ChunkVerify(Base):
     def db(self, db):
         (self.d / 'db.json').write_text(json.dumps(db))
 
-    def delete(self, *wrapper, extra=()):
+    def delete(self, *wrapper, extra=(), full=False):
+        # A bounded run unless full: an unbounded one needs a canary first (test_an_unbounded_run_needs_a_canary).
+        if not full and '--chunks' not in wrapper:
+            wrapper += ('--chunks', '99')
         return self.run_cli('delete', *wrapper, str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
                             *self.rule_args(), self.FLAG, str(self.coverage), *extra)
 
@@ -608,8 +611,7 @@ class ChunkVerify(Base):
             'output two catalog rows': (lambda: out2(0, '2'), OUT2),
             'output hour not collated': (lambda: out2(5, 'false'), OUT2),
             'output unheld': (lambda: out2(7, 'false'), OUT2),
-            'output held at another size': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: db['outputs'][OUT2][:6] + ['601:o2', 'false', 'none']}}), OUT2),
-            'output held at another etag': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: db['outputs'][OUT2][:6] + ['600:x', 'false', 'none']}}), OUT2),
+            'output with only a delivery keep hold': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: db['outputs'][OUT2][:6] + ['600:o2', 'false', 'none']}}), OUT2),
             'output restore unverified': (lambda: out2(8, 'unverified'), OUT2),
             'clip left the output or its span': (lambda: self.db({**db, 'contains': {OUT1: KE[:2], OUT2: []}}), 'source_clip_ids of ' + OUT2),
             'output in another open intent': (other_intent, "another open intent's manifest"),
@@ -642,6 +644,28 @@ class ChunkVerify(Base):
                 self.delete()
         self.assertEqual(self.calls(), [])
 
+    def test_an_unbounded_run_needs_a_canary_and_chunks_are_capped(self):
+        with self.assertRaisesRegex(SystemExit, 'run the canary first'):
+            self.delete('--chunk', '2', full=True)
+        with self.assertRaisesRegex(SystemExit, '--chunk is at most'):
+            self.delete('--chunk', str(ma.CHUNK + 1), '--chunks', '1')
+        self.assertNotIn('r2prune', self.calls())
+        self.delete('--chunk', '2', '--chunks', '1')
+        self.delete('--chunk', '2', full=True)
+        self.assertTrue(self.result()['complete'])
+
+    def test_a_pin_move_during_a_chunk_stops_after_its_receipts(self):
+        real = ma.run_r2prune
+
+        def publish_during(*a, **k):
+            out = real(*a, **k)
+            self.serve('c' * 32, [SERVED])
+            return out
+        with unittest.mock.patch.object(ma, 'run_r2prune', publish_during):
+            with self.assertRaisesRegex(SystemExit, 'pinned generation moved'):
+                self.delete('--chunk', '2')
+        self.assertEqual(set(self.applied()), set(KE[:2]))
+
     def test_the_coverage_flag_must_be_the_classs_own(self):
         other = '--best14-coverage' if self.FLAG == '--ke-coverage' else '--ke-coverage'
         with self.assertRaisesRegex(SystemExit, 'pass ' + self.FLAG + ' exactly once'):
@@ -658,10 +682,9 @@ class Best14ChunkVerify(ChunkVerify):
 class Gate(Best14ChunkVerify):
     """The served-generation gate: before every chunk, from the generation pinned now."""
 
-    def test_the_pin_is_read_before_every_chunk(self):
+    def test_the_pin_is_read_before_and_after_every_chunk(self):
         self.delete('--chunk', '2')
-        kinds = [c['psql'] for c in self.calls('pin')] + [c.get('psql', 'r2prune') for c in self.calls('r2prune')]
-        self.assertEqual(kinds.count('pin'), 2)
+        self.assertEqual(len(self.calls('pin')), 4)
         self.assertTrue(self.result()['complete'])
 
     def test_a_generation_swap_mid_run_is_caught_before_the_next_chunk(self):

@@ -124,8 +124,8 @@ def build(a):
             return 'output_retirement_named'
         if h['restore'] == 'unverified':
             return 'output_restore_unverified'
-        if not (h['owner'] or h['hold'] == f"{o['size']}:{listed[o['key']][1]}"):
-            return 'output_not_keep_held'
+        if not h['owner']:
+            return 'output_not_keep_held'  # an owner keep: delivery_keep_holds alone blocks no retirement (0244)
         if o['key'] in sole:
             return 'output_ke_sole_copy'
         return None
@@ -154,11 +154,19 @@ def build(a):
             else:
                 why = cover_problem(row, covers[0])
         if why:
-            excluded.setdefault(key, (cid, int(row[5]), why))
+            excluded.setdefault(key, []).append((cid, int(row[5]), why))
         else:
             coverage[(key, covers[0]['key'])] = (int(row[5]), covers[0]['size'])
-    for key in {k for k, _ in coverage} & excluded.keys():
-        del excluded[key]  # covered by its serving hour; an excluded row elsewhere (a non-serving record) is moot
+    # An exclusion wins over coverage from another row of the same raw; only a non-serving record's
+    # row is moot once a serving hour covers the raw.
+    covered = {k for k, _ in coverage}
+    for key in list(excluded):
+        binding = [e for e in excluded[key] if e[2] != 'hour_not_serving' or key not in covered]
+        if binding:
+            excluded[key] = binding[0]
+        else:
+            del excluded[key]
+    coverage = {(k, o): v for (k, o), v in coverage.items() if k not in excluded}
     raws = {k for k, _ in coverage}
     return coverage, excluded, raws, seen
 

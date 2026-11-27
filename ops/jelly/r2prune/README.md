@@ -92,15 +92,17 @@ first, then up to `--chunk` (default 5000) raws not yet sent. For each, read-onl
   the coverage size; exactly one `recording_collation_outputs` row at that size, in
   a `collated` hour; the raw's clip is still in its `source_clip_ids` and its
   catalog `clip_start_at`..`clip_end_at` lies inside the output's
-  `start_at`..`end_at`; the output is keep-held: an owner keep (such as
-  `collation_v2_recovery_held`) or an unexempted `delivery_keep_holds` row at the
-  HEAD's size and ETag, the protection a sole copy must have; no
+  `start_at`..`end_at`; the output has an owner keep (such as
+  `collation_v2_recovery_held`), the protection a sole copy must have (a
+  `delivery_keep_holds` row alone blocks no retirement since 0244); no
   `r2_object_retirements`, `r2_retirement_reservations` or `r2_nonraw_intents` row
   for the output key; no NAS output restore left unverified; and the output is in
   no other open intent's manifest (manual workdirs beside `WORKDIR` and lane
   cycles).
 
-**The first mismatch stops the run before that chunk's `r2prune` call.** The
+**The first mismatch stops the run before that chunk's `r2prune` call.** `--chunk`
+is at most 5,000, and a run without `--chunks` is refused until a canary chunk
+(`--chunks 1`) has settled in the workdir. The
 wrapper then writes `listing-<stamp>.tsv` holding only the chunk's verified raws
 (at their planned identity) and their covering outputs (as HEAD reported them),
 and passes it as `--fresh-listing`. r2prune logs every key outside the chunk as
@@ -127,11 +129,12 @@ best-14 ledger serves in the named generation, and that part:
   the manifest (`payload_chain_matches`, `video_timing_matches`, `edge_decode_ok`);
 - holds the clip's exact catalog bytes (key, size, sha256, ETag) in its
   `source_clip_ids`, with the clip's catalog time span inside its own;
-- is live in R2 at its catalog size and keep-held (as above), named by no
+- is live in R2 at its catalog size with an owner keep (as above), named by no
   receipt, reservation or nonraw intent, with no unverified NAS restore, and not a
   Keep Everything sole copy.
 
-It also stays when the hour is served by a clock assembly or follows one, sits at
+It also stays (an exclusion wins over coverage from any other row of the same raw)
+when the hour is served by a clock assembly or follows one, sits at
 a seam the audit flagged (both hours, any verdict) or holds a reviewer-exception
 clip, or is named by `--exclude-hour`. `--within KEYS` limits coverage to raws the
 owner approved by count. `r2prune` decides `delete_best14_raw_stitched` for a
@@ -155,7 +158,8 @@ generation `gss_public_generation_pin` names now, GETs its registry
 serves (files and assets) is in the keys about to be deleted, every one has a
 `page_link` row in the plan's `--db-protect` file, and every one the plan's
 `classified.tsv` (beside `--summary`) lists is `protect_live_site`. Re-deriving it
-per chunk catches a generation swap mid-run. `manual_apply.py gate PLAN_DIR
+per chunk catches a generation swap between chunks; the pin is read again after
+each chunk, and a move during one stops the run once its receipts are written. `manual_apply.py gate PLAN_DIR
 --db-protect FILE` runs the same check on a plan.
 
 `manual_apply.py served-keys OUT` writes the same served keys, one per line, for

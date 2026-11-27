@@ -43,7 +43,7 @@ class Coverage(unittest.TestCase):
             key = f'joined/b/objects/o{h}.mp4'
             outputs.append([self.hours[h], 'collated', 7, '2026-08-01', h, 100 + h, key, 1000 + h, 1, t, t + 120,
                             f'{10 * h + 1},{10 * h + 2}', 'true', 'true', 'true'])
-            holds.append([key, f'{1000 + h}:oe{h}', 'false', 'false', 'false', 'false', 'none'])
+            holds.append([key, f'{1000 + h}:oe{h}', 'true', 'false', 'false', 'false', 'none'])
             listing.append([key, 1000 + h, f'"oe{h}"', 1])
             for i in (1, 2):
                 cid, raw = 10 * h + i, f'managed/acct-47/f/{h}-{i}.mp4'
@@ -95,7 +95,7 @@ class Coverage(unittest.TestCase):
             'output_not_live_at_catalog_size': lambda: self.listing[0].__setitem__(1, 999),
             'output_retirement_named': lambda: self.holds[0].__setitem__(3, 'true'),
             'output_restore_unverified': lambda: self.holds[0].__setitem__(6, 'unverified'),
-            'output_not_keep_held': lambda: self.holds[0].__setitem__(1, '1001:other'),
+            'output_not_keep_held': lambda: self.holds[0].__setitem__(2, 'false'),  # a delivery hold alone is not enough
             'output_ke_sole_copy': lambda: (self.d / 'sole.tsv').write_text('id\tobject_key\tsize_bytes\tsha256\n1\tjoined/b/objects/o1.mp4\t1\tx\n'),
             'disposition_quarantined': lambda: self.clips[0].__setitem__(3, 'quarantined'),
             '2_outputs_for_part': lambda: self.outputs.append(list(self.outputs[0][:6]) + ['joined/b/objects/dup.mp4'] + self.outputs[0][7:]),
@@ -107,6 +107,19 @@ class Coverage(unittest.TestCase):
                 break_it()
                 _, excluded = self.build()
                 self.assertEqual(excluded.get('managed/acct-47/f/1-1.mp4'), why)
+
+    def test_an_exclusion_wins_over_another_hours_coverage(self):
+        # clip 31 (clock-assembly hour 3) and clip 71 (seam-flagged hour 7) are also in hour 1's manifest and output
+        for cid, raw in ((31, 'managed/acct-47/f/3-1.mp4'), (71, 'managed/acct-47/f/7-1.mp4')):
+            self.clips.append([self.hours[1], cid, 1, 'included', raw, 50 + cid, 's' * 64, f'e{cid}', T0 + 3600, T0 + 3660, '60.0'])
+            self.outputs[0][11] += f',{cid}'
+        for c in self.catalog:
+            if c[0] in (31, 71):
+                c[7:9] = [T0 + 3600, T0 + 3660]
+        covered, excluded = self.build()
+        self.assertNotIn('managed/acct-47/f/3-1.mp4', [c[0] for c in covered])
+        self.assertEqual(excluded['managed/acct-47/f/3-1.mp4'], 'clock_assembly_hour')
+        self.assertEqual(excluded['managed/acct-47/f/7-1.mp4'], 'seam_flagged')
 
     def test_owner_keep_holds_without_a_delivery_hold(self):
         self.holds[0][1:3] = ['', 'true']
