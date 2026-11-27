@@ -59,6 +59,13 @@ class Script(Lane):
         self.assertEqual([(k, int(s)) for ck, cs in zip(kinds, ids) for k, s in zip(ck, cs)], candidates)
         self.assertLess(max(map(len, lines)), 100_000)
 
+    def test_receipts_read_is_memory_capped(self):
+        sets = [l for l in cycle.RECEIPTS.splitlines() if l.startswith('SET ')]
+        self.assertIn("SET LOCAL work_mem='32MB';", sets)
+        self.assertIn('SET LOCAL max_parallel_workers_per_gather=0;', sets)
+        for forced in ('enable_', 'parallel_setup_cost', 'parallel_tuple_cost'):
+            self.assertFalse([l for l in sets if forced in l], forced)
+
     def test_refuses_unknown_candidates(self):
         for bad in [('page', 1), ('raw', '1'), ('raw', True), ("raw}'", 1)]:
             with self.assertRaises(ValueError):

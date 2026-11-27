@@ -36,13 +36,12 @@ ROWS_PER_STATEMENT = 5000
 RECEIPTS = r"""BEGIN READ ONLY;
 SET LOCAL lock_timeout='2s';
 SET LOCAL statement_timeout='115s';
-SET LOCAL work_mem='96MB';
--- Production estimates undercount the path-and-size join. Hash the scoped
--- clips and issued IDs instead of probing NAS rows one at a time.
-SET LOCAL enable_nestloop=off;
-SET LOCAL enable_mergejoin=off;
-SET LOCAL parallel_setup_cost=0;
-SET LOCAL parallel_tuple_cost=0.01;
+-- Memory-safe on the 2 GB production DB (OOM-killed 2026-11-26): no forced hash
+-- joins or parallel workers. The planner probes NAS rows by clip index; measured
+-- 34 s, every hash under 2 MB (the forced plan hashed 71k wide clip rows and
+-- seq-scanned all NAS rows, and hit this timeout in cycle 20261127T001522Z).
+SET LOCAL work_mem='32MB';
+SET LOCAL max_parallel_workers_per_gather=0;
 COPY (
  WITH issued AS MATERIALIZED (
    SELECT plan_id, ordinal, item FROM nas_cleanup_items WHERE delete_ever_issued
