@@ -318,8 +318,10 @@ freeze migrations 0180/0181. Joined lifecycle fixtures apply them in order.
 
 ## Durham R2 handoff
 
-Durham works only on reviewed whole-hour plans backed by R2 and exact raw
-custody on NAS connection 13. The read-only planner emits a private manifest
+Durham groups whole clips by the UTC hour of their start. A clip that ends
+in a later hour stays entirely in its starting hour. Each nominal hour and
+every clip in it must fit inside the approved scope. Plans require R2 and
+exact raw custody on NAS connection 13. The read-only planner emits a private manifest
 and prints its SHA-256. Review that manifest before import. Import with the
 queue paused; imports serialize with each other, not with R2 retirement. Each
 input holds its own key lock until commit, so one import takes at most 1,000
