@@ -38,9 +38,16 @@ from R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY):
             written create-only under --out laid out by R2 key:
               joined/<batch>/objects/<sha256>.mp4
               joined/<batch>/proofs/<sha256>.json   (best14_ledger.py --clock-proofs)
-Uploading is separate and create-only; the inputs stay in R2, held and unreferenced.
+            With --upload-log each run is uploaded right after it is built: create-only
+            (If-None-Match: *) with a SHA-256 the server checks, verified by HEAD (size,
+            checksum, sha256 metadata, ETag = MD5), logged (best14_ledger.py
+            --clock-uploads binds each proof to its listed object with it), and the local
+            video is deleted, so scratch holds one run at a time. A run whose joined file
+            fails its checks stays split (refused.jsonl).
+The inputs stay in R2, held and unreferenced.
 """
 import argparse
+import base64
 import collections
 import concurrent.futures
 import csv
@@ -54,6 +61,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -387,6 +395,14 @@ def plan(ledger, seams, served_files, recording_id):
 
 # ---- build -------------------------------------------------------------------
 
+def file_md5(path):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
 def sha256_file(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -456,6 +472,10 @@ def download(key, path):
     os.rename(path + '.tmp', path)
 
 
+class BuildRefused(Exception):
+    """A joined file failed its checks: the run stays split."""
+
+
 def build_run(run, verdicts, batch, out_dir, work, catalog_parts, fetch=download):
     """Join one run of served files; returns the proof (also written under out_dir)."""
     os.makedirs(work, exist_ok=True)
@@ -477,7 +497,7 @@ def build_run(run, verdicts, batch, out_dir, work, catalog_parts, fetch=download
     frame_s = media_of(inputs[0]['media']).frame_s
     problems = check_output(tmp_out, inputs, frame_s)
     if problems:
-        raise SystemExit(f'{run[0]["file_id"]}..: joined file fails its checks: {problems}')
+        raise BuildRefused(problems)
     sha = sha256_file(tmp_out)
     key = f'joined/{batch}/objects/{sha}.mp4'
     proof = {
@@ -504,6 +524,43 @@ def build_run(run, verdicts, batch, out_dir, work, catalog_parts, fetch=download
         json.dump(proof, f, indent=1)
         f.write('\n')
     return proof
+
+
+# ---- create-only upload ------------------------------------------------------
+
+def head_problems(head, size, sha256, md5):
+    """Problems with an object's HEAD (ContentLength, ChecksumSHA256, Metadata.sha256, ETag) against the
+    uploaded file's size, sha256 (hex) and MD5 (hex, R2's single-part ETag)."""
+    want = (size, base64.b64encode(bytes.fromhex(sha256)).decode(), sha256, md5)
+    got = (head.get('ContentLength'), head.get('ChecksumSHA256'), (head.get('Metadata') or {}).get('sha256'), (head.get('ETag') or '').strip('"'))
+    return [f'{n} {g!r} != {w!r}' for n, g, w in zip(('size', 'checksum_sha256', 'meta_sha256', 'etag'), got, want) if g != w]
+
+
+def aws(*args):
+    env = dict(os.environ, AWS_ACCESS_KEY_ID=os.environ['R2_ACCESS_KEY_ID'], AWS_SECRET_ACCESS_KEY=os.environ['R2_SECRET_ACCESS_KEY'],
+               AWS_DEFAULT_REGION='auto')
+    return subprocess.run(['aws', '--endpoint-url', f'https://{os.environ["R2_ACCOUNT_ID"]}.r2.cloudflarestorage.com', 's3api', *args,
+                           '--bucket', os.environ['R2_BUCKET']], capture_output=True, text=True, env=env, timeout=7200)
+
+
+def upload_create_only(key, path, content_type):
+    """Upload path to key only if the key does not exist (If-None-Match: *), with a SHA-256 the
+    server checks, then verify by HEAD. A key that already exists is never overwritten; it passes
+    only if its HEAD matches this file. Returns the verified {key, size_bytes, sha256, etag}."""
+    sha, size = sha256_file(path), os.path.getsize(path)
+    md5 = file_md5(path)
+    put = aws('put-object', '--key', key, '--body', path, '--content-type', content_type, '--if-none-match', '*',
+              '--checksum-algorithm', 'SHA256', '--checksum-sha256', base64.b64encode(bytes.fromhex(sha)).decode(),
+              '--metadata', f'sha256={sha}')
+    if put.returncode and 'PreconditionFailed' not in put.stderr:
+        raise SystemExit(f'upload of {key} failed: {put.stderr.strip()[:300]}')
+    head = aws('head-object', '--key', key, '--checksum-mode', 'ENABLED')
+    if head.returncode:
+        raise SystemExit(f'HEAD of {key} failed: {head.stderr.strip()[:300]}')
+    problems = head_problems(json.loads(head.stdout), size, sha, md5)
+    if problems:
+        raise SystemExit(f'{key}: HEAD differs from the uploaded file: {problems}')
+    return {'key': key, 'size_bytes': size, 'sha256': sha, 'etag': md5}
 
 
 # ---- CLI ---------------------------------------------------------------------
@@ -535,6 +592,10 @@ def main(argv=None):
     b.add_argument('--batch', required=True, help=f'{BATCH_PREFIX}YYYYMMDD')
     b.add_argument('--out', required=True)
     b.add_argument('--work', required=True)
+    b.add_argument('--upload-log', help='upload each run create-only right after it is built (R2_* env), append the verified '
+                                        'object and proof here (best14_ledger.py --clock-uploads), and delete the local video; '
+                                        'a run already in the log is skipped')
+    b.add_argument('--shard', default='0/1', help='K/N: build only the runs whose index modulo N is K')
     a = ap.parse_args(argv)
 
     if a.cmd == 'plan':
@@ -572,7 +633,9 @@ def main(argv=None):
         by_hour = collections.defaultdict(list)
         for v in read_jsonl(a.verdicts):
             by_hour[v['hour_id']].append(v)
-        proofs = []
+        shard, shards = map(int, a.shard.split('/'))
+        done = {tuple(json.loads(l)['served_inputs']) for l in open(a.upload_log)} if a.upload_log and os.path.exists(a.upload_log) else set()
+        proofs, refused, idx = [], 0, 0
         for hour_id, vs in sorted(by_hour.items()):
             vs.sort(key=lambda v: v['seam'])
             if not any(v['join'] for v in vs):
@@ -588,12 +651,36 @@ def main(argv=None):
                 k += len(run)
                 if len(run) < 2:
                     continue
-                proof = build_run(run, [{key: v[key] for key in ('seam', 'collation_reason', 'db_gap_s', 'clock_before', 'clock_after',
-                                                                  'clock_delta_s', 'frame_ratio')} for v in seam_vs],
-                                  a.batch, a.out, os.path.join(a.work, hour_id), lambda fid: parts[fid])
-                proofs.append(proof['output']['key'])
-                print(json.dumps({'hour_id': hour_id, 'served_inputs': len(run), 'key': proof['output']['key']}), flush=True)
-        print(json.dumps({'assemblies': len(proofs)}))
+                idx += 1
+                ids = tuple(x['file_id'] for x in run)
+                if idx % shards != shard or ids in done:
+                    continue
+                work = os.path.join(a.work, hour_id)
+                try:
+                    proof = build_run(run, [{key: v[key] for key in ('seam', 'collation_reason', 'db_gap_s', 'clock_before', 'clock_after',
+                                                                      'clock_delta_s', 'frame_ratio')} for v in seam_vs],
+                                      a.batch, a.out, work, lambda fid: parts[fid])
+                except BuildRefused as e:
+                    refused += 1
+                    with open(os.path.join(a.out, 'refused.jsonl'), 'a', encoding='utf-8') as f:
+                        f.write(json.dumps({'hour_id': hour_id, 'served_inputs': list(ids), 'problems': e.args[0]}) + '\n')
+                    print(json.dumps({'hour_id': hour_id, 'refused': e.args[0][:3]}), flush=True)
+                    shutil.rmtree(work, ignore_errors=True)
+                    continue
+                o = proof['output']
+                if a.upload_log:
+                    obj = os.path.join(a.out, o['key'])
+                    prf_key = f'joined/{a.batch}/proofs/{o["sha256"]}.json'
+                    up = {'hour_id': hour_id, 'served_inputs': list(ids), 'duration_s': o['duration_s'],
+                          'object': upload_create_only(o['key'], obj, 'video/mp4'),
+                          'proof': upload_create_only(prf_key, os.path.join(a.out, prf_key), 'application/json')}
+                    with open(a.upload_log, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(up) + '\n')
+                    os.remove(obj)
+                    shutil.rmtree(work, ignore_errors=True)
+                proofs.append(o['key'])
+                print(json.dumps({'hour_id': hour_id, 'served_inputs': len(run), 'key': o['key']}), flush=True)
+        print(json.dumps({'assemblies': len(proofs), 'refused': refused}))
 
 
 if __name__ == '__main__':
