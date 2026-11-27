@@ -5,7 +5,6 @@ import hashlib
 import importlib.util
 import io
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -90,8 +89,10 @@ class PointerTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.multiple(gss, s3=self.store.s3, pg=self.store.pg, B='fake-bucket').start()
         self.output = io.StringIO()
-        self.enterContext(contextlib.redirect_stdout(self.output))
-        self.enterContext(contextlib.redirect_stderr(self.output))
+        for redirect in (contextlib.redirect_stdout, contextlib.redirect_stderr):
+            context = redirect(self.output)
+            context.__enter__()
+            self.addCleanup(context.__exit__, None, None, None)
 
     def test_success_and_rollback(self):
         self.assertEqual(gss.swap(PARENT, CANDIDATE), 0)
@@ -165,8 +166,9 @@ class PointerTests(unittest.TestCase):
 
 class CycleTests(unittest.TestCase):
     def setUp(self):
-        temp = self.enterContext(tempfile.TemporaryDirectory())
-        self.home = Path(temp)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name)
         self.records = self.home / 'Build/stoarama/records/finish-plan-20261117/gss-delivery'
         self.records.mkdir(parents=True)
         (self.records / 'cadence').mkdir()
@@ -227,7 +229,7 @@ esac
         p.chmod(0o755)
 
     def run_cycle(self, scenario):
-        env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + ':/usr/bin:/bin',
+        env = dict(HOME=str(self.home), PATH=str(self.bin) + ':/usr/bin:/bin',
                    STATE=str(self.state), CALLS=str(self.calls), SCENARIO=scenario)
         return subprocess.run(['sh', str(HERE / 'republish-cycle.sh'), str(self.home), str(self.out)],
                               env=env, capture_output=True, text=True)
