@@ -40,6 +40,9 @@ DEFAULTS = {
 BUCKET = 'stoarama'
 COLLATED = ('joined/goodplus-', 'joined/nightly-collation-v2/', 'joined/best14-20261021/')
 KE_CLASS = 'delete_ke_raw_stitched'  # class (a): Keep Everything raw inside a stitched R2 output
+BEST14_CLASS = 'delete_best14_raw_stitched'  # class (b): best-14 raw inside a stitched output the GSS page serves
+# Covered classes and the r2prune flag naming each one's coverage rows; each runs in verify mode.
+COVERAGE = {KE_CLASS: 'ke-coverage', BEST14_CLASS: 'best14-coverage'}
 OUTCOMES = {'deleted', 'failed', 'skipped_protected', 'skipped_changed'}
 FINAL = OUTCOMES - {'failed'}  # a failed DELETE may still have removed the object
 ABSENT = 'absent_from_fresh_listing'
@@ -52,7 +55,7 @@ ROWS_PER_STATEMENT = 5000
 
 class Mode(enum.Enum):
     LISTING = 'listing'    # the operator's --fresh-listing, pinned for the life of the intent
-    VERIFY = 'verify'      # class (a): the wrapper writes one live-verified listing per chunk
+    VERIFY = 'verify'      # covered classes: the wrapper writes one live-verified listing per chunk
     BACKFILL = 'backfill'  # receipts for a run made without the wrapper; never deletes
 
 
@@ -452,7 +455,7 @@ def open_intents(roots):
                 yield path.parent, Path(intent.get('manifest') or path.parent / 'plan/delete-manifest.jsonl')
 
 
-# ---- class (a): live re-verify of each chunk before its r2prune call ----
+# ---- covered classes (a) and (b): live re-verify of each chunk before its r2prune call ----
 
 def r2_store(path):
     e = env_file(path)
@@ -494,8 +497,8 @@ def r2_head(store, key):
 
 
 def load_coverage(path, manifest):
-    """{raw key: [(output key, output size)]}: the --ke-coverage rows r2prune would match for
-    each manifest raw (raw_size equal to the planned size)."""
+    """{raw key: [(output key, output size)]}: the coverage rows r2prune would match for each
+    manifest raw (raw_size equal to the planned size)."""
     cover = {}
     with open(path, encoding='utf-8') as f:
         for line in f:
@@ -504,27 +507,40 @@ def load_coverage(path, manifest):
                 cover.setdefault(raw, []).append((out, int(out_size)))
     missing = [k for k in manifest if k not in cover]
     if missing:
-        raise SystemExit(f'{len(missing)} manifest keys have no --ke-coverage row at their size, e.g. {missing[0]}')
+        raise SystemExit(f'{len(missing)} manifest keys have no coverage row at their size, e.g. {missing[0]}')
     return cover
 
 
+# A covering output is registered (one catalog row at its HEAD size), in a collated hour, keep-held
+# (an exact, unexempted delivery keep hold or an owner keep), named by no receipt, reservation or
+# nonraw intent, and not a NAS restore left unverified; each raw's clip is in its source_clip_ids
+# and its catalog time span lies inside the output's.
 VERIFY_SQL = """BEGIN READ ONLY;
 SET LOCAL statement_timeout='900s';
 COPY (
  WITH r AS (SELECT * FROM jsonb_to_recordset(:'raws'::jsonb) AS x(key text, clip bigint)),
       p AS (SELECT * FROM jsonb_to_recordset(:'pairs'::jsonb) AS x(raw text, clip bigint, output text)),
       o AS (SELECT DISTINCT output AS key FROM p)
- SELECT 'raw', r.key, c.size_bytes::text, (c.purged_at IS NULL)::text, r2_owner_keep_held('stoarama',r.key)::text, NULL, NULL
+ SELECT 'raw', r.key, c.size_bytes::text, (c.purged_at IS NULL)::text, r2_owner_keep_held('stoarama',r.key)::text,
+  NULL, NULL, NULL, NULL, NULL, NULL
  FROM r JOIN recording_clips c ON c.id=r.clip AND c.bucket='stoarama' AND c.object_key=r.key
  UNION ALL
  SELECT 'output', o.key, count(x.id)::text, min(x.size_bytes)::text,
   EXISTS(SELECT FROM r2_object_retirements z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
   EXISTS(SELECT FROM r2_retirement_reservations z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
-  EXISTS(SELECT FROM r2_nonraw_intents z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text
- FROM o LEFT JOIN recording_collation_outputs x ON x.object_key=o.key GROUP BY o.key
+  EXISTS(SELECT FROM r2_nonraw_intents z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
+  coalesce(bool_and(h.status='collated'), false)::text,
+  coalesce((SELECT d.size_bytes::text||':'||btrim(d.etag,'"') FROM delivery_keep_holds d
+            WHERE d.bucket='stoarama' AND d.object_key=o.key AND NOT r2_delivery_exempt('stoarama',o.key)), ''),
+  r2_owner_keep_held('stoarama',o.key)::text,
+  (SELECT CASE WHEN count(*)=0 THEN 'none' WHEN bool_or(q.state='verified') THEN 'verified' ELSE 'unverified' END
+   FROM recording_collation_outputs y JOIN nas_restore_requests q ON q.output_id=y.id AND q.target='output' WHERE y.object_key=o.key)
+ FROM o LEFT JOIN recording_collation_outputs x ON x.object_key=o.key LEFT JOIN recording_collation_hours h ON h.id=x.collation_hour_id
+ GROUP BY o.key
  UNION ALL
- SELECT 'pair', p.raw, p.output, EXISTS(SELECT FROM recording_collation_outputs x
-   WHERE x.object_key=p.output AND p.clip=ANY(x.source_clip_ids))::text, NULL, NULL, NULL
+ SELECT 'pair', p.raw, p.output, EXISTS(SELECT FROM recording_collation_outputs x JOIN recording_clips c ON c.id=p.clip
+   WHERE x.object_key=p.output AND p.clip=ANY(x.source_clip_ids)
+    AND c.clip_start_at>=x.start_at AND c.clip_end_at<=x.end_at)::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL
  FROM p
 ) TO STDOUT WITH (FORMAT csv, DELIMITER E'\\t');
 ROLLBACK;
@@ -562,17 +578,21 @@ def verify_chunk(cfg, store, batch, manifest, sources, cover, attempted, held):
         if got is None or got[2:5] != [str(manifest[k]['size']), 'true', 'false']:
             raise SystemExit(f'verify: recording_clips row for {k} [size, purged_at NULL, owner keep] is {got and got[2:5]}, '
                              f'want size {manifest[k]["size"]}, purged_at NULL and no owner keep')
-    # A covering output's owner keep (e.g. collation_v2_recovery_held) is the protection a
-    # sole copy must have, so it is not checked here; a raw's owner keep refuses above.
+    # A covering output's keep (an owner keep such as collation_v2_recovery_held, or the GSS page's
+    # delivery keep hold at its live size and ETag) is the protection a sole copy must have, so it is
+    # required; a raw's owner keep refuses above.
     for o in outputs:
         got = db[('output', o)]
-        if got[2:7] != ['1', str(heads[o][0]), 'false', 'false', 'false']:
-            raise SystemExit(f'verify: covering output {o} catalog [rows, size, receipt, reservation, nonraw intent] '
-                             f'is {got[2:7]}, want one row at size {heads[o][0]} with none of the others')
+        size, etag = heads[o][0], heads[o][1]
+        held = got[9] == 'true' or got[8] == f'{size}:{etag}'
+        if got[2:8] != ['1', str(size), 'false', 'false', 'false', 'true'] or not held or got[10] == 'unverified':
+            raise SystemExit(f'verify: covering output {o} catalog [rows, size, receipt, reservation, nonraw intent, collated, '
+                             f'delivery hold, owner keep, NAS restore] is {got[2:11]}, want one collated row at size {size}, '
+                             f'none of the others, keep-held, and no unverified restore')
     for k in batch:
         for o, _ in cover[k]:
             if db[('pair', k, o)][3] != 'true':
-                raise SystemExit(f'verify: {k} is no longer in source_clip_ids of {o}')
+                raise SystemExit(f'verify: {k} is no longer in source_clip_ids of {o} with its time span inside it')
     return ''.join('\t'.join(map(str, r)) + '\n' for r in sorted(rows))
 
 
@@ -600,16 +620,17 @@ def delete(cfg, W, args, lock_fd):
         raise SystemExit('manifest digest differs from --expected-sha256')
     manifest = read_manifest(manifest_path)
     classes = {row['class'] for row in manifest.values()}
-    mode = Mode.VERIFY if KE_CLASS in classes else Mode.LISTING
+    covered = classes & COVERAGE.keys()
+    mode = Mode.VERIFY if covered else Mode.LISTING
     if mode is Mode.VERIFY:
-        if classes != {KE_CLASS}:
-            raise SystemExit(f'a {KE_CLASS} manifest must hold only that class; plan it separately')
+        if len(classes) != 1:
+            raise SystemExit(f'a {"/".join(sorted(covered))} manifest must hold only that class; plan it separately')
         if options(args, 'fresh-listing') or options(args, 'limit'):
-            raise SystemExit(f'for {KE_CLASS} the wrapper owns --fresh-listing and chunks with --chunk/--chunks; drop --fresh-listing and --limit')
+            raise SystemExit(f'for {classes.pop()} the wrapper owns --fresh-listing and chunks with --chunk/--chunks; drop --fresh-listing and --limit')
         listing_sha = None
     else:
         if cfg.chunk is not None or cfg.chunks is not None:
-            raise SystemExit(f'--chunk and --chunks apply only to {KE_CLASS} manifests')
+            raise SystemExit(f'--chunk and --chunks apply only to {" and ".join(sorted(COVERAGE))} manifests')
         listing_sha = sha(one_option(args, 'fresh-listing'))
     Path(W).mkdir(parents=True, exist_ok=True)
     intent_path = Path(W, 'delete-intent.json')
@@ -651,7 +672,7 @@ def delete(cfg, W, args, lock_fd):
         return
 
     store = r2_store(cfg.r2_env)
-    cover = load_coverage(one_option(args, 'ke-coverage'), manifest)
+    cover = load_coverage(one_option(args, COVERAGE[next(iter(classes))]), manifest)
     held = set()
     for other, path in open_intents({Path(W).parent, Path(cfg.lane_cycles)}):
         if other != Path(W):
@@ -736,8 +757,8 @@ def main(argv):
         p.add_argument('--' + k.replace('_', '-'), default=v)
     sub = p.add_subparsers(dest='cmd', required=True)
     d = sub.add_parser('delete', help='resolve receipt sources, preflight, run r2prune delete, write receipts')
-    d.add_argument('--chunk', type=int, help=f'{KE_CLASS}: raws live-verified per r2prune call (default {CHUNK})')
-    d.add_argument('--chunks', type=int, help=f'{KE_CLASS}: stop after this many chunks (a canary)')
+    d.add_argument('--chunk', type=int, help=f'covered classes: raws live-verified per r2prune call (default {CHUNK})')
+    d.add_argument('--chunks', type=int, help='covered classes: stop after this many chunks (a canary)')
     d.add_argument('workdir')
     d.add_argument('args', nargs=argparse.REMAINDER, help='-- then the r2prune delete arguments (not --ledger)')
     r = sub.add_parser('receipts', help='write the receipts of a workdir whose intent is still open')

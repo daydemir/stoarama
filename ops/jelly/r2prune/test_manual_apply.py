@@ -71,7 +71,7 @@ if 'jsonb_to_recordset' in script:
         if r['key'] in db['clips']:
             print('\t'.join(['raw', r['key']] + db['clips'][r['key']] + [str(r['key'] in db.get('kept', [])).lower(), '', '']))
     for o in sorted({p['output'] for p in pairs}):
-        print('\t'.join(['output', o] + db['outputs'].get(o, ['0', '', 'false', 'false', 'false'])))
+        print('\t'.join(['output', o] + db['outputs'].get(o, ['0', '', 'false', 'false', 'false', 'false', '', 'false', 'none'])))
     for p in pairs:
         print('\t'.join(['pair', p['raw'], p['output'], 'true' if p['raw'] in db['contains'].get(p['output'], []) else 'false', '', '', '']))
     sys.exit(0)
@@ -469,16 +469,20 @@ class Backfill(Base):
 
 
 class ChunkVerify(Base):
+    CLS, FLAG = ma.KE_CLASS, '--ke-coverage'
+
     def setUp(self):
         super().setUp()
-        self.write_manifest([(k, ma.KE_CLASS) for k in KE])
+        self.write_manifest([(k, self.CLS) for k in KE])
         self.sources({k: ('raw', 11 + i, 'e1') for i, k in enumerate(KE)})
         self.coverage = self.d / 'ke-coverage.tsv'
         self.coverage.write_text(f'{KE[0]}\t100\t{OUT1}\t500\n{KE[1]}\t100\t{OUT1}\t500\n{KE[2]}\t100\t{OUT2}\t600\n'
                                  f'{KE[2]}\t999\t{OUT1}\t500\n')
         self.r2({**{k: [100, 'e1', 1] for k in KE}, OUT1: [500, 'o1', 5], OUT2: [600, 'o2', 6]})
+        # [rows, size, receipt, reservation, nonraw intent, collated, delivery hold size:etag, owner keep, NAS restore]
         self.db({'clips': {k: ['100', 'true'] for k in KE},
-                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false'], OUT2: ['1', '600', 'false', 'false', 'false']},
+                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false', 'true', '500:o1', 'false', 'none'],
+                             OUT2: ['1', '600', 'false', 'false', 'false', 'true', '', 'true', 'verified']},
                  'contains': {OUT1: KE[:2], OUT2: KE[2:]}})
 
     def r2(self, objects):
@@ -489,7 +493,7 @@ class ChunkVerify(Base):
 
     def delete(self, *wrapper, extra=()):
         return self.run_cli('delete', *wrapper, str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
-                            '--summary', 's.json', '--ke-coverage', str(self.coverage), *extra)
+                            '--summary', 's.json', self.FLAG, str(self.coverage), *extra)
 
     def listings(self):
         return [sorted(l.split('\t')[0] for l in p.read_text().splitlines()) for p in sorted(self.W.glob('listing-*.tsv'))]
@@ -510,7 +514,8 @@ class ChunkVerify(Base):
     def test_a_cover_under_owner_keep_still_covers(self):
         # collation_v2_recovery_held keeps every cover of the 2026-11-25 canary: the protection a sole copy needs
         db = json.loads((self.d / 'db.json').read_text())
-        self.db({**db, 'kept': [OUT1, OUT2]})
+        owner = ['1', '500', 'false', 'false', 'false', 'true', '', 'true', 'none']
+        self.db({**db, 'outputs': {OUT1: owner, OUT2: owner[:1] + ['600'] + owner[2:]}})
         self.delete('--chunk', '2')
         self.assertEqual(set(self.applied()), set(KE))
         self.assertTrue(self.result()['complete'])
@@ -556,13 +561,23 @@ class ChunkVerify(Base):
             'raw owner keep': (lambda: self.db({**db, 'kept': [KE[2]]}), 'recording_clips row for ' + KE[2]),
             'clip purged': (lambda: self.db({**db, 'clips': {**db['clips'], KE[2]: ['100', 'false']}}), 'recording_clips row for ' + KE[2]),
             'clip size': (lambda: self.db({**db, 'clips': {**db['clips'], KE[2]: ['101', 'true']}}), 'recording_clips row for ' + KE[2]),
-            'output receipted': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'true', 'false', 'false']}}), OUT2),
-            'output reserved': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'true', 'false']}}), OUT2),
-            'output nonraw intent': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'false', 'true']}}), OUT2),
-            'output catalog size': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '599', 'false', 'false', 'false']}}), OUT2),
-            'clip left the output': (lambda: self.db({**db, 'contains': {OUT1: KE[:2], OUT2: []}}), 'source_clip_ids of ' + OUT2),
+            'output receipted': (lambda: out2(2, 'true'), OUT2),
+            'output reserved': (lambda: out2(3, 'true'), OUT2),
+            'output nonraw intent': (lambda: out2(4, 'true'), OUT2),
+            'output catalog size': (lambda: out2(1, '599'), OUT2),
+            'output two catalog rows': (lambda: out2(0, '2'), OUT2),
+            'output hour not collated': (lambda: out2(5, 'false'), OUT2),
+            'output unheld': (lambda: out2(7, 'false'), OUT2),
+            'output held at another size': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: db['outputs'][OUT2][:6] + ['601:o2', 'false', 'none']}}), OUT2),
+            'output held at another etag': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: db['outputs'][OUT2][:6] + ['600:x', 'false', 'none']}}), OUT2),
+            'output restore unverified': (lambda: out2(8, 'unverified'), OUT2),
+            'clip left the output or its span': (lambda: self.db({**db, 'contains': {OUT1: KE[:2], OUT2: []}}), 'source_clip_ids of ' + OUT2),
             'output in another open intent': (other_intent, "another open intent's manifest"),
         }
+        def out2(i, value):
+            row = list(db['outputs'][OUT2])
+            row[i] = value
+            self.db({**db, 'outputs': {**db['outputs'], OUT2: row}})
         for name, (break_it, message) in cases.items():
             with self.subTest(name):
                 self.tearDown()
@@ -577,14 +592,27 @@ class ChunkVerify(Base):
                 self.assertEqual(len(self.listings()), 1)
                 self.assertFalse(self.result()['complete'])
 
-    def test_wrapper_owns_the_fresh_listing_for_class_a(self):
+    def test_wrapper_owns_the_fresh_listing_for_covered_classes(self):
         for extra in (['--fresh-listing', 'f.tsv'], ['--limit', '1']):
             with self.assertRaisesRegex(SystemExit, 'wrapper owns --fresh-listing'):
                 self.delete(extra=extra)
-        self.write_manifest([(KE[0], ma.KE_CLASS), (RAW, 'delete_raw_outside_window')])
-        with self.assertRaisesRegex(SystemExit, 'only that class'):
-            self.delete()
+        for other in ('delete_raw_outside_window', ma.KE_CLASS if self.CLS == ma.BEST14_CLASS else ma.BEST14_CLASS):
+            self.write_manifest([(KE[0], self.CLS), (RAW, other)])
+            with self.assertRaisesRegex(SystemExit, 'only that class'):
+                self.delete()
         self.assertEqual(self.calls(), [])
+
+    def test_the_coverage_flag_must_be_the_classs_own(self):
+        other = '--best14-coverage' if self.FLAG == '--ke-coverage' else '--ke-coverage'
+        with self.assertRaisesRegex(SystemExit, 'pass ' + self.FLAG + ' exactly once'):
+            self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
+                         '--summary', 's.json', other, str(self.coverage))
+        self.assertNotIn('r2prune', self.calls())
+
+
+class Best14ChunkVerify(ChunkVerify):
+    """Class (b), best-14 raws inside a served stitched output: the same verify, its own coverage flag."""
+    CLS, FLAG = ma.BEST14_CLASS, '--best14-coverage'
 
 
 if __name__ == '__main__':

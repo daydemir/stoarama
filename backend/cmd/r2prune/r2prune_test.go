@@ -676,3 +676,178 @@ func TestWindowOnlyHoldStaysForDerivedOnlyKey(t *testing.T) {
 		t.Fatalf("catalogued page key outside window: got %s, want %s", got, deleteCollatedOutsideWindow)
 	}
 }
+
+// best14Fixture extends the shared fixture with non-KE stream 10 raws inside
+// the 20-day window whose bytes are in a served stitched output, each with the
+// protection the test checks, plus the --best14-coverage TSV naming them.
+func best14Fixture(t *testing.T) (ruleFiles, map[string]int64) {
+	t.Helper()
+	files, _ := fixture(t)
+	sizes := map[string]int64{"cov": 140, "page": 141, "closure": 142, "hold": 143, "recent": 144, "absent": 145, "derived": 146,
+		"ke": 147, "out": 148}
+	key := func(n string) string {
+		if n == "ke" {
+			return "managed/acct-47/ke_folder/b14/ke.mp4"
+		}
+		return "managed/acct-47/a_folder/b14/" + n + ".mp4"
+	}
+	extra := &strings.Builder{}
+	for _, n := range []string{"cov", "page", "closure", "hold", "recent", "absent", "out"} {
+		fmt.Fprintf(extra, "raw\t%s\t10\t%d\t%d\t%d\tf\t0\ta_folder\t1\n", key(n), w0+day, w0+day+60, sizes[n])
+	}
+	fmt.Fprintf(extra, "raw\t%s\t20\t%d\t%d\t%d\tf\t0\tke_folder\t1\n", key("ke"), w0+day, w0+day+60, sizes["ke"])
+	f, _ := os.OpenFile(files.identities, os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString(extra.String())
+	f.Close()
+	dir := t.TempDir()
+	files.derived = writeFile(t, dir, "derived.tsv", fmt.Sprintf("raw\t%s\t10\t%d\t%d\t%d\tf\t0\ta_folder\t1\n", key("derived"), w0+day, w0+day+60, sizes["derived"]))
+	p, _ := os.OpenFile(files.dbProtect, os.O_APPEND|os.O_WRONLY, 0)
+	p.WriteString("page_link\t" + key("page") + "\nstitch_input_hold\t" + key("hold") + "\n")
+	p.Close()
+	c, _ := os.OpenFile(files.closure, os.O_APPEND|os.O_WRONLY, 0)
+	c.WriteString("window_output_input\t" + key("closure") + "\n")
+	c.Close()
+	rows := &strings.Builder{}
+	for _, n := range []string{"cov", "page", "closure", "hold", "recent", "derived", "ke"} {
+		fmt.Fprintf(rows, "%s\t%d\tjoined/recovery-best14-20261125/objects/served.mp4\t900\n", key(n), sizes[n])
+	}
+	fmt.Fprintf(rows, "%s\t%d\tjoined/recovery-best14-20261125/objects/gone.mp4\t901\n", key("absent"), sizes["absent"])
+	files.best14Coverage = writeFile(t, dir, "best14.tsv", rows.String())
+	out := map[string]int64{}
+	for n, s := range sizes {
+		out[key(n)] = s
+	}
+	return files, out
+}
+
+func TestBest14CoverageDecide(t *testing.T) {
+	files, sizes := best14Fixture(t)
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Outputs = map[string]int64{"joined/recovery-best14-20261125/objects/served.mp4": 900}
+	key := func(n string) string {
+		if n == "ke" {
+			return "managed/acct-47/ke_folder/b14/ke.mp4"
+		}
+		return "managed/acct-47/a_folder/b14/" + n + ".mp4"
+	}
+	for n, want := range map[string]class{
+		"cov":     deleteBest14RawStitched, // inside its window, covered: the window keeps the NAS copy only
+		"page":    protectLiveSite,         // still page-linked: the swap has not released it
+		"closure": protectWindowNotOnNAS,   // a NAS stitch input of its window
+		"hold":    protectWindowNotOnNAS,   // any key protection wins
+		"absent":  protectWindowNotOnNAS,   // its output is not in the listing
+		"derived": protectWindowNotOnNAS,   // no direct catalog identity
+		"ke":      protectKeepEverything,   // Keep Everything goes only by --ke-coverage
+		"out":     protectWindowNotOnNAS,   // no coverage row
+	} {
+		got, reason := r.decide(object{Key: key(n), Size: sizes[key(n)], MTime: w0})
+		if got != want {
+			t.Errorf("%s: got %s (%s), want %s", n, got, reason, want)
+		}
+		if want == deleteBest14RawStitched && reason != "covered_by:joined/recovery-best14-20261125" {
+			t.Errorf("%s: reason %s", n, reason)
+		}
+	}
+	if got, _ := r.decide(object{Key: key("recent"), Size: sizes[key("recent")], MTime: time.Now().Unix()}); got.deletes() {
+		t.Errorf("recent write: got %s", got)
+	}
+	if got, _ := r.decide(object{Key: key("cov"), Size: sizes[key("cov")] + 1, MTime: w0}); got.deletes() {
+		t.Errorf("raw size differs from its row: got %s", got)
+	}
+	r.Outputs["joined/recovery-best14-20261125/objects/served.mp4"] = 899
+	if got, _ := r.decide(object{Key: key("cov"), Size: sizes[key("cov")], MTime: w0}); got.deletes() {
+		t.Errorf("output size differs: got %s", got)
+	}
+	r.Outputs["joined/recovery-best14-20261125/objects/served.mp4"] = 900
+	delete(r.Windows, 10)
+	if got, _ := r.decide(object{Key: key("cov"), Size: sizes[key("cov")], MTime: w0}); got.deletes() {
+		t.Errorf("stream without a window: got %s", got)
+	}
+}
+
+func TestBest14CoverageOffLeavesWindowAlone(t *testing.T) {
+	files, sizes := best14Fixture(t)
+	files.best14Coverage = ""
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := "managed/acct-47/a_folder/b14/cov.mp4"
+	if got, reason := r.decide(object{Key: k, Size: sizes[k], MTime: w0}); got != protectWindowNotOnNAS {
+		t.Fatalf("without --best14-coverage: got %s (%s)", got, reason)
+	}
+}
+
+func TestBest14CoverageRefusesBadRows(t *testing.T) {
+	files, _ := best14Fixture(t)
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"malformed":     "a\t1\tb\n",
+		"zero raw size": "a\t0\tb\t2\n",
+		"duplicate":     "a\t1\tb\t2\na\t1\tb\t2\n",
+		"output as raw": "a\t1\tb\t2\nb\t1\tc\t2\n",
+		"manifest out":  "a\t1\tjoined/nightly-collation-v2/manifests/m.json\t2\n",
+	} {
+		bad := files
+		bad.best14Coverage = writeFile(t, dir, strings.ReplaceAll(name, " ", "_")+".tsv", body)
+		if _, err := bad.load(); err == nil {
+			t.Errorf("%s: must refuse", name)
+		}
+	}
+	both := files
+	both.keCoverage = writeFile(t, dir, "ke.tsv", "managed/acct-47/a_folder/b14/cov.mp4\t140\tjoined/x.mp4\t2\n")
+	if _, err := both.load(); err == nil || !strings.Contains(err.Error(), "both") {
+		t.Errorf("a raw in both coverage files must refuse, got %v", err)
+	}
+	cross := files
+	cross.keCoverage = writeFile(t, dir, "ke2.tsv", "joined/recovery-best14-20261125/objects/served.mp4\t900\tjoined/x.mp4\t2\n")
+	if _, err := cross.load(); err == nil {
+		t.Error("a best-14 output that is a KE raw row must refuse")
+	}
+}
+
+func TestBest14CoveragePlanThenDeleteRechecksOutput(t *testing.T) {
+	files, sizes := best14Fixture(t)
+	dir := t.TempDir()
+	k := "managed/acct-47/a_folder/b14/cov.mp4"
+	snapshot := writeFile(t, dir, "snapshot.tsv", fmt.Sprintf("%s\t%d\te\t%d\njoined/recovery-best14-20261125/objects/served.mp4\t900\te\t%d\n",
+		k, sizes[k], w0, w0))
+	out := filepath.Join(dir, "plan")
+	if err := runPlan([]string{"--snapshot", snapshot, "--out", out, "--identities", files.identities, "--derived-identities", files.derived,
+		"--db-protect", files.dbProtect, "--closure", files.closure, "--controller-protect", files.controller, "--picks", files.picks,
+		"--recent-from", files.recentFrom, "--best14-coverage", files.best14Coverage}); err != nil {
+		t.Fatal(err)
+	}
+	var sum summary
+	raw, _ := os.ReadFile(filepath.Join(out, "summary.json"))
+	if err := json.Unmarshal(raw, &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Inputs["best14_coverage"] == "" || sum.ByClass[deleteBest14RawStitched] == nil || sum.ByClass[deleteBest14RawStitched].Objects != 1 {
+		t.Fatalf("plan must pin the coverage digest and delete the one covered raw: %+v", sum)
+	}
+	manifest := filepath.Join(out, "delete-manifest.jsonl")
+	r, err := files.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fresh listing still has the raw but no longer its output: the key is skipped, never deleted.
+	fresh := writeFile(t, dir, "fresh.tsv", fmt.Sprintf("%s\t%d\te\t%d\n", k, sizes[k], w0))
+	if r.Fresh, err = loadFresh(fresh, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if r.Outputs, err = scanOutputSizes(fresh, r.OutputKeys); err != nil {
+		t.Fatal(err)
+	}
+	ledger := filepath.Join(dir, "ledger.jsonl")
+	if err := deleteManifest(context.Background(), store{bucket: "stoarama"}, r, runHeader{}, manifest, ledger, 2, 0); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(ledger)
+	if !strings.Contains(string(body), `"outcome":"skipped_protected"`) || strings.Contains(string(body), `"outcome":"deleted"`) {
+		t.Fatalf("output gone from the fresh listing must skip: %s", body)
+	}
+}
