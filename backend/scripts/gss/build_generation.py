@@ -51,12 +51,15 @@ every ledger file in R2: complete hours whole, other hours with what R2 holds.
   identical hold exists (a differing hold fails).
 - Each stream's timeline, manifest, catalog weeks and metadata window become its
   best-14 days; an hour whose parts are unchanged keeps its live hour as is.
+- A clock-join assembly (best14_ledger.py --clock-proofs) the live generation
+  does not list is added: its file entry, a manifest output with its
+  replacement_inputs, a growth repair of kind modelclock-prestitched, and a
+  video_assembly delivery_keep_holds row. Any other new assembly fails.
 - Fails closed, before writing, when any stream-day of the live generation
-  would serve fewer complete hours or fewer assemblies (days outside the new
-  window serve none). A live assembly on best14_ledger's veto list
-  (assembly-veto.tsv) does not count: its parts serve in its place. --dry-run
-  builds everything in memory, writes nothing and prints the counts, including
-  those regressions.
+  would serve less than it does: see regressions(). A live assembly on
+  best14_ledger's veto list (assembly-veto.tsv) is not served; its parts serve in
+  its place. --dry-run builds everything in memory, writes nothing and prints the
+  counts, including those regressions.
 - Every served day's grade is best14-grades.tsv's; a day it lacks fails.
 
 Every mode (--files, --days, --ledger) fails if a vetoed assembly would be published.
@@ -500,6 +503,8 @@ FILE_URL = '/api/v1/global-street-scores-delivery/file/'
 DAY_SCHEDULED_SECONDS = 12 * 3600
 FIRST_LOCAL_HOUR = 8
 COLLATED_HOLD_KIND = 'video_collated'
+ASSEMBLY_HOLD_KIND = 'video_assembly'
+CLOCK_VERSION = 'clock-prestitched'  # growth repair kind 'model' + this is best14_ledger's clock_assembly
 
 # What publishing from the ledger rebuilds only approximately for a day the
 # parent timeline does not hold (no source accounting is extracted for it).
@@ -546,6 +551,7 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
     catalogued key. Every published path must pass delivery_naming.check_paths. Each
     stream's timeline becomes its chosen window; a parent hour whose parts are
     unchanged keeps its accounting."""
+    from best14_ledger import Source
     from delivery_naming import check_paths, delivery_path
     reg = inputs.registry
     files = reg['files']
@@ -556,7 +562,7 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
     by_rid = collections.defaultdict(list)
     for h in hours:
         by_rid[h.recording_id].append(h)
-    overlay, present, added, file_holds, renamed, published, periods = {}, set(), {}, [], {}, [], {}
+    overlay, present, added, file_holds, renamed, published, periods, new_repairs = {}, set(), {}, [], {}, [], {}, []
     for rid in reg['recording_ids']:
         hs = sorted(by_rid[rid], key=lambda h: h.slot)
         tz = MS[rid]['timezone']
@@ -584,17 +590,30 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
                     renamed[x.file_id] = x.path
                 outputs.append(dict(base_out[x.file_id], path=x.path))
                 continue
-            if is_assembly(x):
-                raise SystemExit(f'assembly {x.file_id} is not in the parent: publishing new assemblies needs the clock-join builder')
-            _, p = part_of[x.file_id]
+            if is_assembly(x) and x.source is not Source.CLOCK_ASSEMBLY:
+                raise SystemExit(f'assembly {x.file_id} is not in the parent: only a clock-join assembly can be new')
             added[x.file_id] = {'etag': f'"{x.etag}"', 'key': x.key, 'path': x.path, 'recording_id': rid,
                                 'sha256': x.sha256, 'size_bytes': x.size_bytes, 'verified': True}
             held = inputs.holds.get(x.key)
             if held is None:
                 file_holds.append({'bucket': BUCKET, 'object_key': x.key, 'etag': x.etag, 'size_bytes': x.size_bytes,
-                                   'recording_id': rid, 'kind': COLLATED_HOLD_KIND, 'sha256': x.sha256, 'relative_path': x.path})
+                                   'recording_id': rid, 'kind': ASSEMBLY_HOLD_KIND if is_assembly(x) else COLLATED_HOLD_KIND,
+                                   'sha256': x.sha256, 'relative_path': x.path})
             elif held != (x.etag, x.size_bytes):
                 raise SystemExit(f'{x.key}: its keep hold {held} differs from R2 {(x.etag, x.size_bytes)}')
+            if is_assembly(x):
+                ids = [int(i) for i in x.registry_ids]
+                seconds = sum(epoch(part_of[i][1].end_at) - epoch(part_of[i][1].start_at) for i in x.registry_ids)
+                outputs.append({'id': x.file_id, 'sha256': x.sha256, 'size_bytes': x.size_bytes, 'path': x.path,
+                                'file_url': FILE_URL + x.file_id, 'available': True, 'recording_id': rid,
+                                'local_date': h.local_date, 'replacement_inputs': ids, 'production_version': CLOCK_VERSION})
+                new_repairs.append({'sha256': x.sha256, 'recording_id': rid, 'local_date': h.local_date, 'hour': h.delivery_hour,
+                                    'seconds': seconds, 'media_seconds_measurement': 'catalogued_part_spans',
+                                    'size_bytes': x.size_bytes, 'input_ids': ids, 'input_parts': len(ids),
+                                    'parts_reduced': len(ids) - 1, 'collections': ['available'], 'kind': 'model' + CLOCK_VERSION,
+                                    'production_version': CLOCK_VERSION, 'path': x.path, 'file_url': FILE_URL + x.file_id})
+                continue
+            _, p = part_of[x.file_id]
             outputs.append({'id': p.output_id, 'size_bytes': x.size_bytes, 'sha256': x.sha256, 'part': p.part, 'parts': p.parts,
                             'start_at': p.start_at, 'end_at': p.end_at, 'recording_id': rid, 'local_date': h.local_date,
                             'delivery_hour': h.delivery_hour, 'available': True, 'scope': 'audited',
@@ -676,6 +695,7 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
     for r in gr['repairs']:
         if 'sha256:' + r['sha256'] in renamed:
             r['path'] = renamed['sha256:' + r['sha256']]
+    gr['repairs'] += new_repairs
     overlay['/public/metadata.json'], overlay['/public/readiness.json'], overlay['/public/catalog.json'] = md, rd, cat
     overlay['/public/growth.json'] = gr
     return overlay, present, added, file_holds
@@ -700,11 +720,14 @@ def live_windows(registry, store, best14):
     return out
 
 
+def span(p):
+    return epoch(p.end_at) - epoch(p.start_at)
+
+
 def live_counts(inputs, store):
-    """{(recording_id, local_date): [complete hours, assemblies]} the live generation serves.
-    An hour is complete when one of its records has every part listed, directly or as an
-    assembly input. A vetoed assembly is not counted: the new generation serves its parts."""
-    from best14_ledger import VETOED
+    """{(recording_id, local_date): [complete hours, covered seconds]} the live generation
+    serves. An hour is complete when one of its records has every part listed, directly or as
+    an assembly input; covered seconds are the catalogued spans of every part it serves."""
     files = inputs.registry['files']
     inputs_of = {'sha256:' + r['sha256']: [str(i) for i in r['input_ids']] for r in store.load('/public/growth.json')['repairs']}
     slot_of = {str(p.output_id): slot for slot, rs in inputs.records.items() for r in rs for p in r.parts}
@@ -712,39 +735,51 @@ def live_counts(inputs, store):
     unknown = sorted(i for i in covered if i not in slot_of)
     if unknown:
         raise SystemExit(f'{len(unknown)} live parts are not in the extract, e.g. {unknown[:3]}')
-    live = collections.defaultdict(lambda: [0, 0])
+    part_of = {str(p.output_id): p for rs in inputs.records.values() for r in rs for p in r.parts}
+    live = collections.defaultdict(lambda: [0, 0.0])
     for slot, rs in inputs.records.items():
         if any(r.complete() and all(str(p.output_id) in covered for p in r.parts) for r in rs):
             live[slot[:2]][0] += 1
-    for f in files:
-        if f.startswith('sha256:') and f not in VETOED:
-            live[slot_of[inputs_of[f][0]][:2]][1] += 1
+    for i in covered:
+        live[slot_of[i][:2]][1] += span(part_of[i])
     return live
 
 
-def new_counts(hours, is_assembly):
-    new = collections.defaultdict(lambda: [0, 0])
+def new_counts(hours):
+    """{(recording_id, local_date): [complete hours, covered seconds]} a ledger selection serves."""
+    part_of = {str(p.output_id): p for h in hours if h.record for p in h.record.parts}
+    new = collections.defaultdict(lambda: [0, 0.0])
     for h in hours:
         new[h.slot[:2]][0] += h.ok
-        new[h.slot[:2]][1] += sum(1 for x in h.served if is_assembly(x))
+    for h in hours:
+        for x in h.served:
+            if x.live:
+                for i in x.registry_ids:
+                    new[h.slot[:2]][1] += span(part_of[i])
     return new
 
 
+COVERAGE_TOLERANCE_S = 1e-6  # float summation order only: any real lost coverage fails
+
+
 def regressions(live, new, days):
-    """The days where the new generation serves fewer complete hours or fewer assemblies than live."""
-    return {d: (live[d], new[d]) for d in sorted(days) if new[d][0] < live[d][0] or new[d][1] < live[d][1]}
+    """The days where the new generation serves fewer complete hours or less covered time than
+    live. Joining files (fewer assemblies or parts) is not a regression; losing any of their
+    time is."""
+    return {d: (live[d], new[d]) for d in sorted(days)
+            if new[d][0] < live[d][0] or new[d][1] < live[d][1] - COVERAGE_TOLERANCE_S}
 
 
-def choose_windows(best14_hours, live_hours, live, is_assembly):
+def choose_windows(best14_hours, live_hours, live):
     """{recording_id: Window}: best-14 when every best-14 day is complete in R2, or when it
-    serves at least the live window's complete hours and assemblies; else the live window."""
+    serves at least the live window's complete hours and covered seconds; else the live window."""
     def totals(counts, hours):
-        out = collections.defaultdict(lambda: [0, 0])
+        out = collections.defaultdict(lambda: [0, 0.0])
         for day in {h.slot[:2] for h in hours}:
             out[day[0]][0] += counts[day][0]
             out[day[0]][1] += counts[day][1]
         return out
-    b14, old = totals(new_counts(best14_hours, is_assembly), best14_hours), totals(live, live_hours)
+    b14, old = totals(new_counts(best14_hours), best14_hours), totals(live, live_hours)
     captured = collections.defaultdict(list)
     for h in best14_hours:
         if h.captured:
@@ -762,19 +797,19 @@ def main_ledger(a):
         best14_hours = best14_ledger.select(inputs)
         live_hours = best14_ledger.select(dataclasses.replace(inputs, best14=live_windows(inputs.registry, store, inputs.best14)))
         live = live_counts(inputs, store)
-        windows = choose_windows(best14_hours, live_hours, live, is_assembly)
+        windows = choose_windows(best14_hours, live_hours, live)
         chosen = [h for h in best14_hours if windows[h.recording_id] is Window.BEST14] + \
                  [h for h in live_hours if windows[h.recording_id] is Window.ORIGINAL]
         best14_ledger.check_rules(chosen, inputs.names)
     except best14_ledger.LedgerError as e:
         raise SystemExit(f'best14 ledger: {e}')
-    lost = regressions(live, new_counts(chosen, is_assembly), {h.slot[:2] for h in chosen})
+    lost = regressions(live, new_counts(chosen), {h.slot[:2] for h in chosen})
     report = {'windows': {w.value: sum(v is w for v in windows.values()) for w in Window},
               'regressed_stream_days': len(lost),
-              'regressions_live_vs_new_[complete_hours,assemblies]': {f'{r} {d}': v for (r, d), v in lost.items()}}
+              'regressions_live_vs_new_[complete_hours,covered_seconds]': {f'{r} {d}': v for (r, d), v in lost.items()}}
     if lost and not a.dry_run:
         print(json.dumps(report, indent=1))
-        raise SystemExit(f'{len(lost)} stream-days would serve fewer complete hours or assemblies than the live generation')
+        raise SystemExit(f'{len(lost)} stream-days would serve fewer complete hours or less covered time than the live generation')
     overlay, present, added, file_holds = ledger_generation(inputs, chosen, store, read_grades(a.grades), is_assembly, windows)
     best14 = collections.defaultdict(set)
     for d in best14_ledger.day_rows(best14_hours):

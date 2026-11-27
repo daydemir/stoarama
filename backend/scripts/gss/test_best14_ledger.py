@@ -272,6 +272,23 @@ class AssemblyTests(unittest.TestCase):
         with self.assertRaisesRegex(L.LedgerError, 'crosses an hour'):
             self.w.select()
 
+    def test_clock_join_replaces_live_assemblies_inside_it(self):
+        v79 = self.w.assembly(self.rec, [1, 2], 'aa', L.Source.V79_ASSEMBLY, path='v79.mp4')
+        v85 = self.w.assembly(self.rec, [3, 4], 'bb', L.Source.V85_ASSEMBLY, path='v85.mp4')
+        a = self.w.assembly(self.rec, [1, 2, 3, 4], 'cc')
+        hours = self.w.select()
+        h = self.w.hour(hours, DAYS[3], 5)
+        self.assertEqual([(s.file_id, s.path, s.source) for s in h.served], [(a.file_id, path(DAYS[3], 5), L.Source.CLOCK_ASSEMBLY)])
+        served = {s.file_id for x in hours for s in x.served}
+        self.assertFalse({v79.file_id, v85.file_id} & served)
+        self.assertIn(v79.key, self.w.listing)  # the replaced assembly stays in R2 for rollback
+
+    def test_clock_join_partly_over_a_live_assembly_fails(self):
+        self.w.assembly(self.rec, [1, 2, 3], 'aa', L.Source.V79_ASSEMBLY, path='v79.mp4')
+        self.w.assembly(self.rec, [3, 4], 'cc')
+        with self.assertRaisesRegex(L.LedgerError, 'only partly inside'):
+            self.w.select()
+
     def test_registry_assemblies_need_a_matching_hold(self):
         a = self.w.assembly(self.rec, [1, 2], live=False)
         registry = {'files': {a.file_id: {'key': a.key, 'size_bytes': a.size_bytes, 'etag': f'"{ETAG}"', 'sha256': a.sha256, 'path': 'p.mp4'}}}
