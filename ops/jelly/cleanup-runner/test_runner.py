@@ -7,6 +7,7 @@ import importlib.util
 import json
 import sys
 import os
+import random
 import shutil
 import subprocess
 from types import SimpleNamespace
@@ -1921,6 +1922,7 @@ class DayVerifyTests(unittest.TestCase):
         for name, mutate in {
             'unlive name': lambda p, c: c[0].update(unlive=1),
             'sha256 differs from R2': lambda p, c: c[0].update(mismatch=1),
+            'hashless': lambda p, c: c[0].update(hashless=1),
             'totals differ': lambda p, c: p['units'][0].update(names=names[:1]),
             'unsorted names': lambda p, c: p['units'][0].update(names=names[::-1]),
             'boundary day': lambda p, c: p['units'][0].update(local_date='2026-09-13', relative_dir=day_dir(seoul, self.d(2026, 9, 13))),
@@ -2070,33 +2072,25 @@ class DayLoopTests(unittest.TestCase):
             self.assertEqual(job.day_checked(job.day), 200)
             self.assertEqual(job.samples, [77])  # Every passing check restore-samples the plan.
 
-    def test_one_owned_day_plan_enables_through_the_gate_then_pauses_and_closes(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'):
-            job = FakeDayRunner(root)
-            def deleted(pid):
-                job.events.append('day_monitor')
-                for u in job.day['units']:
-                    u.update(state='deleted', receipts=[dict(attempt=1, outcome='deleted', media_files=2, media_bytes=200)])
-                job.day.update(deleted_media_files=2, deleted_media_bytes=200)
-                r.Runner.day_monitor(job, pid)
-            job.day_monitor = deleted
-            job.run_day()
-            self.assertEqual(job.events, ['idle', 'idle', 'day-plans/77/control', 'day_monitor', 'day-plans/77/control', 'day-plans/77/close'])
-            self.assertEqual(job.control['reason'][:6], 'comple')
-            self.assertEqual(job.day['mode'], 'retired')
-            self.assertIsNone(job.status['current_day_plan'])
-            self.assertEqual((job.status['day_deleted_files'], job.status['day_deleted_bytes']), (2, 200))
-            self.assertEqual(job.status['phase'], 'day_complete')
-
-    def test_enable_body_is_the_day_approval(self):
+    def test_day_activation_fails_closed_until_shared_wire_reservation_exists(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
             job = FakeDayRunner(root)
-            bodies = []
-            job.day_monitor = lambda pid: job.stopping or setattr(job, 'stopping', True)
-            original = job.api
-            job.api = lambda method, path, body=None: bodies.append(body) or original(method, path, body)
-            job.run_day()
-            self.assertEqual(bodies[0], {'mode': 'enabled', 'plan_sha256': job.day['plan_sha256'], 'approval_hours': 24, 'reason': r.DAY_REASON})
+            with self.assertRaisesRegex(r.Halt, 'shared persistent survivor reservation'):
+                job.run_day()
+            self.assertEqual(job.day['mode'], 'dry_run')
+            self.assertEqual(job.samples, [77])
+            self.assertNotIn('day-plans/77/control', job.events)
+
+    def test_legacy_enabled_plan_is_paused_and_drained_not_resumed(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeDayRunner(root)
+            job.day.update(mode='enabled', approved_until=(NOW + timedelta(hours=1)).isoformat())
+            job.status.update(current_day_plan=77, started_day_plan_sha256=job.day['plan_sha256'])
+            job.day_monitor = lambda pid: self.fail('legacy unprotected operation resumed')
+            with self.assertRaisesRegex(r.Halt, 'shared persistent survivor reservation'):
+                job.run_day()
+            self.assertEqual(job.events, ['day-plans/77/control', 'day-plans/77/close'])
+            self.assertEqual(job.day['mode'], 'retired')
 
     def test_dry_run_never_enables(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
@@ -2119,9 +2113,9 @@ class DayLoopTests(unittest.TestCase):
             def refused(pid):
                 job.day['units'][0]['state'] = 'client_refused'
                 r.Runner.day_monitor(job, pid)
-            job.day_monitor = refused
+            job.day.update(mode='enabled', approved_until=(NOW + timedelta(hours=1)).isoformat())
             with self.assertRaisesRegex(r.Halt, 'refused a permitted directory-day'):
-                job.run_day()
+                refused(77)
             self.assertNotIn('day-plans/77/close', job.events)
 
     def test_a_plan_without_a_proven_second_copy_is_closed_finished_or_refused(self):
@@ -2160,73 +2154,104 @@ class DayLoopTests(unittest.TestCase):
 
 
 class RestoreSampleTests(unittest.TestCase):
-    """The per-plan R2 restore sample of Keep Everything names."""
+    """Full byte reads against a local conditional-S3 CLI fixture, never a live store."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.job = FakeDayRunner(self.tmp.name)
-        self.job.repo = Path(__file__).resolve().parents[3]  # The preparer's r2_live_raw builds the SQL.
-        self.job.day['units'][0]['names'] = [dict(name='%03d.mp4' % n, size_bytes=1) for n in range(30)]
+        self.root = Path(self.tmp.name)
+        self.job = FakeDayRunner(self.root)
+        self.job.repo = Path(__file__).resolve().parents[3]
         self.bodies = {'managed/%d' % n: b'clip %d' % n for n in range(30)}
+        self.plan_names(30)
+        self.aws = self.root / 'aws'
+        self.log = self.root / 'aws.jsonl'
+        self.aws.write_text(r"""#!/usr/bin/python3 -I
+import hashlib, json, os, pathlib, sys, time
+args = sys.argv[1:]
+operation = args[1]
+key = args[args.index('--key') + 1]
+body = bytes.fromhex(json.loads(os.environ['FIXTURE_BODIES'])[key])
+etag = hashlib.md5(body).hexdigest()
+assert args[args.index('--if-match') + 1] == '"' + etag + '"'
+assert 's3cret' not in args
+assert os.environ['AWS_SECRET_ACCESS_KEY'] == 's3cret'
+with open(os.environ['FIXTURE_LOG'], 'a') as out:
+    out.write(json.dumps([operation, key]) + '\n')
+mode = os.environ.get('FAIL', '')
+if mode == 'timeout': time.sleep(2)
+if mode == 'transport': sys.exit(1)
+version = 'fixture-version'
+if operation == 'get-object':
+    assert args[args.index('--version-id') + 1] == version
+    pathlib.Path(args[-1]).write_bytes(body[:-1] if mode == 'short' else (b'x' * len(body) if mode == 'changed' else body))
+    if mode == 'version': version = 'replacement'
+print(json.dumps({'ETag': '"' + etag + '"', 'ContentLength': len(body), 'VersionId': version}))
+""")
+        self.aws.chmod(0o755)
+        self.env = dict(R2_ACCESS_KEY_ID='id', R2_SECRET_ACCESS_KEY='s3cret', R2_ACCOUNT_ID='acct', R2_BUCKET='bucket',
+                        FIXTURE_BODIES=json.dumps({key: b.hex() for key, b in self.bodies.items()}), FIXTURE_LOG=str(self.log))
 
-    def row(self, n, cat=True, nas=True):
-        sha = hashlib.sha256(self.bodies['managed/%d' % n]).hexdigest()
-        return ['managed/%d' % n, len(self.bodies['managed/%d' % n]), sha if cat else None, sha if nas else None]
+    def plan_names(self, count):
+        self.job.day['units'][0]['names'] = [dict(name='%03d.mp4' % n, size_bytes=len(self.bodies['managed/%d' % n])) for n in range(count)]
+        self.job.day['plan_sha256'] = r.day_digest(self.job.day['units'])
 
-    def sample(self, rows):
-        fetched = []
-        def fetch(key):
-            fetched.append(key)
-            return len(self.bodies[key]), hashlib.sha256(self.bodies[key]).hexdigest()
+    def row(self, n):
+        body = self.bodies['managed/%d' % n]
+        sha = hashlib.sha256(body).hexdigest()
+        return ['managed/%d' % n, len(body), sha, sha, hashlib.md5(body).hexdigest()]
+
+    def sample(self, rows, **env):
         sql = []
         with patch.object(self.job, 'query', side_effect=lambda q, step: sql.append(q) or rows), \
-             patch.object(self.job, 'r2_sha256', side_effect=fetch), patch.object(r, 'utcnow', return_value=NOW):
+             patch.object(r, 'AWS', self.aws), patch.dict(os.environ, self.env | env), patch.object(r, 'utcnow', return_value=NOW):
             r.Runner.day_sample(self.job, self.job.day)
-        return fetched, sql[0]
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [key for operation, key in calls if operation == 'get-object'], sql[0]
 
-    def test_twenty_random_hashed_names_match_r2(self):
-        rows = [self.row(n, cat=n % 3 != 0, nas=n % 3 != 1) for n in range(20)]
+    def test_twenty_random_hashed_names_are_actually_read(self):
+        # The migrated-schema test executes the SQL selector; this seeded
+        # fixture performs the full read and hash for a random subset.
+        rows = [self.row(n) for n in random.Random(20261127).sample(range(30), 20)]
         fetched, sql = self.sample(rows)
         self.assertEqual(fetched, [row[0] for row in rows])
         self.assertIn('ORDER BY random() LIMIT 20', sql)
-        self.assertIn('WHERE live AND (cat_sha IS NOT NULL OR nas_sha IS NOT NULL)', sql)
+        self.assertIn('WHERE live AND cat_sha=nas_sha', sql)
         self.assertNotIn('collation_outputs', sql)
-        [line] = [json.loads(l) for l in (Path(self.tmp.name) / 'runner.jsonl').read_text().splitlines()]
+        [line] = [json.loads(l) for l in (self.root / 'runner.jsonl').read_text().splitlines()]
         self.assertEqual((line['phase'], line['names'], line['sampled']), ('day_restore_sample', 30, 20))
+        self.assertEqual(line['verify_until'], (NOW + timedelta(seconds=r.RESTORE_TIMEOUT_SEC)).isoformat())
+        self.assertEqual([e['key'] for e in line['survivors']], fetched)
+        self.assertTrue(all(e['version_id'] == 'fixture-version' for e in line['survivors']))
 
-    def test_a_short_sample_or_any_difference_stops(self):
-        with self.assertRaisesRegex(r.Halt, 'too few hashed names'):
-            self.sample([self.row(n) for n in range(19)])
-        for change in ({2: 'f' * 64}, {3: 'f' * 64}, {1: 999}):
-            rows = [self.row(n) for n in range(20)]
-            rows[5] = [v if i not in change else change[i] for i, v in enumerate(rows[5])]
-            with self.subTest(change=change), self.assertRaisesRegex(r.Halt, 'restore sample differs'):
-                self.sample(rows)
+    def test_short_duplicate_hashless_or_mismatched_sample_stops(self):
+        rows = [self.row(n) for n in range(20)]
+        for bad in (rows[:-1], rows[:-1] + rows[:1]):
+            with self.assertRaisesRegex(r.Halt, 'too few distinct hashed names'):
+                self.sample(bad)
+        for change in ({2: None}, {3: 'f' * 64}, {2: 'f' * 64, 3: 'f' * 64}, {1: 999}):
+            bad = copy.deepcopy(rows)
+            bad[0] = [change.get(i, v) for i, v in enumerate(bad[0])]
+            with self.subTest(change=change), self.assertRaises(r.Halt):
+                self.sample(bad)
 
-    def test_a_small_plan_samples_every_name(self):
-        self.job.day['units'][0]['names'] = [dict(name='a.mp4', size_bytes=1), dict(name='b.mp4', size_bytes=1)]
-        fetched, _ = self.sample([self.row(0), self.row(1)])
-        self.assertEqual(len(fetched), 2)
-        with self.assertRaisesRegex(r.Halt, 'too few hashed names'):
-            self.sample([self.row(0)])
+    def test_small_plan_reads_every_name_and_fails_on_change_short_read_or_transport(self):
+        self.plan_names(2)
+        rows = [self.row(0), self.row(1)]
+        fetched, _ = self.sample(rows)
+        self.assertEqual(fetched, [row[0] for row in rows])
+        for failure in ('short', 'changed', 'version', 'transport'):
+            with self.subTest(failure=failure), self.assertRaises(r.Halt):
+                self.sample(rows, FAIL=failure)
 
-    def test_fetch_streams_the_object_with_credentials_only_in_the_environment(self):
-        aws = Path(self.tmp.name) / 'aws'
-        log = Path(self.tmp.name) / 'aws.json'
-        aws.write_text('#!/usr/bin/python3 -I\nimport json, os, sys\n'
-                       'json.dump({"argv": sys.argv[1:], "key": os.environ.get("AWS_SECRET_ACCESS_KEY")}, open(%r, "w"))\n'
-                       'sys.stdout.buffer.write(b"x" * 3000000)\nsys.exit(int(os.environ.get("FAIL", "0")))\n' % str(log))
-        aws.chmod(0o755)
-        env = dict(R2_ACCESS_KEY_ID='id', R2_SECRET_ACCESS_KEY='s3cret', R2_ACCOUNT_ID='acct', R2_BUCKET='bucket')
-        with patch.object(r, 'AWS', aws), patch.dict(os.environ, env):
-            self.assertEqual(r.Runner.r2_sha256(self.job, 'managed/a b.mp4'), (3000000, hashlib.sha256(b'x' * 3000000).hexdigest()))
-            call = json.loads(log.read_text())
-            self.assertEqual(call['argv'][:3], ['s3', 'cp', 's3://bucket/managed/a b.mp4'])
-            self.assertIn('https://acct.r2.cloudflarestorage.com', call['argv'])
-            self.assertNotIn('s3cret', ' '.join(call['argv']))
-            self.assertEqual(call['key'], 's3cret')
-            with patch.dict(os.environ, FAIL='1'), self.assertRaisesRegex(r.Halt, 'fetch failed'):
-                r.Runner.r2_sha256(self.job, 'managed/a b.mp4')
+    def test_stalled_read_is_bounded_and_changed_plan_is_refused(self):
+        self.plan_names(1)
+        rows = [self.row(0)]
+        with patch.object(r, 'RESTORE_TIMEOUT_SEC', 0.1), self.assertRaisesRegex(r.Halt, 'timed out'):
+            self.sample(rows, FAIL='timeout')
+        changed = copy.deepcopy(self.job.day)
+        changed['mode'] = 'enabled'
+        with patch.object(self.job, 'day_plan', return_value=changed), self.assertRaisesRegex(r.Halt, 'plan changed'):
+            self.sample(rows)
 
 
 class DayReconcileTests(unittest.TestCase):
@@ -2312,7 +2337,7 @@ class DayReconcileTests(unittest.TestCase):
             with self.assertRaisesRegex(r.Halt, r'HTTP request failed \(POST\)'):
                 job.day_control(77, 'control', self.body(job), 'enabled')
 
-    def test_enable_pause_and_close_all_reconcile(self):
+    def test_pause_and_close_of_legacy_plan_reconcile(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'), \
              patch.object(r.sys, 'stderr', new=io.StringIO()):
             job = FakeDayRunner(root)
@@ -2322,14 +2347,13 @@ class DayReconcileTests(unittest.TestCase):
                 raise r.MutationUnconfirmed('HTTP request failed (POST)')
             job.api = flaky
             job.call = lambda method, path, body=None: copy.deepcopy(job.day)
-            def deleted(pid):
-                for u in job.day['units']:
-                    u.update(state='deleted', receipts=[dict(attempt=1, outcome='deleted', media_files=2, media_bytes=200)])
-                r.Runner.day_monitor(job, pid)
-            job.day_monitor = deleted
-            job.run_day()
-            self.assertEqual(job.events, ['idle', 'idle', 'day-plans/77/control', 'day-plans/77/control', 'day-plans/77/close'])
-            self.assertEqual((job.day['mode'], job.status['phase']), ('retired', 'day_complete'))
+            job.day.update(mode='enabled', approved_until=(NOW + timedelta(hours=1)).isoformat())
+            job.status.update(current_day_plan=77, started_day_plan_sha256=job.day['plan_sha256'])
+            with self.assertRaisesRegex(r.Halt, 'shared persistent survivor reservation'):
+                job.run_day()
+            self.assertEqual(job.events, ['day-plans/77/control', 'day-plans/77/close'])
+            self.assertEqual(job.day['mode'], 'retired')
+
 
 
 if __name__ == '__main__': unittest.main()

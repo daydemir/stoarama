@@ -340,19 +340,19 @@ class DayPlanTests(unittest.TestCase):
             ke_clip(out, 2, hhmmss='113000'),                                   # no raw (a stitched output is not a copy): stays
             ke_clip(out, 3, hhmmss='123000', raw_key='managed/a/3.mp4'),        # raw listed with another size: stays
             ke_clip(out, 4, hhmmss='133000', raw_key='managed/a/4.mp4'),        # raw not listed: stays
-            ke_clip(out, 5, hhmmss='143000', raw_key='managed/a/5.mp4', nas_sha=None),   # no NAS hash: named, counted hashless
+            ke_clip(out, 5, hhmmss='143000', raw_key='managed/a/5.mp4', nas_sha=None),   # no NAS hash: stays, counted hashless
             ke_clip(out, 6, hhmmss='153000', raw_key='managed/a/6.mp4', catalogued=11),  # NAS size differs from the clip
             ke_clip(out, 7, hhmmss='163000', size=-1, raw_key='managed/a/7.mp4'),        # not on the NAS
             ke_clip(out, 8, hhmmss='173000', raw_key='managed/a/8.mp4', nas_sha='d' * 64),  # NAS sha differs: stays
-            ke_clip(out, 9, hhmmss='183000', raw_key='managed/a/9.mp4', cat_sha=None))      # no catalogue hash: named, hashless
+            ke_clip(out, 9, hhmmss='183000', raw_key='managed/a/9.mp4', cat_sha=None))      # no catalogue hash: stays, hashless
         listing = {'managed/a/1.mp4': 10, 'managed/a/3.mp4': 99, 'managed/a/5.mp4': 10, 'managed/a/6.mp4': 11,
                    'managed/a/8.mp4': 10, 'managed/a/9.mp4': 10}
         asked = []
         units, excluded = k.day_units(ke, self.folders, facts, lambda keys: asked.append(keys) or {x: listing[x] for x in keys if x in listing})
         [unit] = units
-        self.assertEqual([n['name'] for n in unit['names']], [plaza(out, h, SEOUL).rsplit('/', 1)[1] for h in ('103000', '143000', '183000')])
-        self.assertEqual((unit['files'], unit['bytes'], unit['names'][0]['size_bytes']), (3, 30, 10))
-        self.assertEqual(excluded, {'files': 4, 'bytes': 40, 'hash_mismatch_files': 1, 'hash_mismatch_bytes': 10, 'hashless_files': 2})
+        self.assertEqual([n['name'] for n in unit['names']], [plaza(out, h, SEOUL).rsplit('/', 1)[1] for h in ('103000',)])
+        self.assertEqual((unit['files'], unit['bytes'], unit['names'][0]['size_bytes']), (1, 10, 10))
+        self.assertEqual(excluded, {'files': 4, 'bytes': 40, 'hash_mismatch_files': 1, 'hash_mismatch_bytes': 10, 'hashless_files': 2, 'hashless_bytes': 20})
         self.assertEqual(len(asked), 1)
         self.assertEqual(asked[0], {'managed/a/%d.mp4' % n for n in (1, 3, 4, 5, 6, 8, 9)})
         # A deleted KE unit's name stays out until the NAS reports the file again after the deletion
@@ -360,7 +360,7 @@ class DayPlanTests(unittest.TestCase):
         lister = lambda keys: {x: listing[x] for x in keys if x in listing}
         deleted = lambda at: dict(facts, claimed=[[unit['relative_dir'], '2026-09-20', 'deleted', unit['names'][:1], at]])
         again = self.units(ke, deleted('2026-11-02T00:00:00Z'), lister)
-        self.assertEqual([n['name'] for n in again[0]['names']], [n['name'] for n in unit['names'][1:]])
+        self.assertEqual(again, [])
         self.assertEqual(self.units(ke, deleted('2026-10-31T00:00:00Z'), lister), units)
         self.assertEqual(self.units(ke, dict(facts, claimed=[[unit['relative_dir'], '2026-09-20', 'pending', unit['names'][:1],
                                                              '2026-11-02T00:00:00Z']]), lister), [])
@@ -487,7 +487,7 @@ class DayAdmissionReconcileTests(unittest.TestCase):
             self.assertEqual([facts for facts, _ in seen], [policy[5], policy[6]])  # Stream 9 is never read.
             self.assertTrue(all(callable(listed) for _, listed in seen))
             summary = json.loads((Path(out) / 'summary.json').read_text())
-            self.assertEqual((summary['streams'], summary['named_hashless_files']), ([5, 6], 0))
+            self.assertEqual((summary['streams'], summary['excluded_hashless_files']), ([5, 6], 0))
             a.stream = [9]
             with self.assertRaisesRegex(SystemExit, 'non-Keep-Everything day plans are disabled'):
                 k.day_main(a, policy)

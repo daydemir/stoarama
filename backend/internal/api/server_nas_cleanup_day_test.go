@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -490,8 +491,26 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 			t.Fatalf("dry-run plan issued %s a permit: %d %+v", version, code, p)
 		}
 	}
-	if w := dayCall(s.handleServiceNASCleanupDayControl, planID, map[string]any{"plan_sha256": sha, "mode": "enabled", "reason": "fixture", "approval_hours": 1}); w.Code != 200 {
-		t.Fatalf("enable: %d %s", w.Code, w.Body)
+	if w := dayCall(s.handleServiceNASCleanupDayControl, planID, map[string]any{"plan_sha256": sha, "mode": "enabled", "reason": "fixture", "approval_hours": 1}); w.Code != 409 || !strings.Contains(w.Body.String(), nasCleanupDayNonKEBlock) {
+		t.Fatalf("non-KE enable: %d %s", w.Code, w.Body)
+	}
+	// A plan enabled by the old API must not receive another permit either.
+	// Seed old issued receipts explicitly to keep testing reconciliation.
+	exec(`UPDATE nas_cleanup_day_plans SET mode='enabled',approval_reason='legacy fixture',approved_until=now()+interval '1 hour' WHERE id=$1`, admitted.ID)
+	for _, version := range nasCleanupDayVersions {
+		exec(`UPDATE connections SET client_version=$1 WHERE id=13`, version)
+		if code, p := permit(version); code != 409 || p != nil {
+			t.Fatalf("legacy non-KE permit %s: %d %+v", version, code, p)
+		}
+	}
+	legacyPermit := func(ordinal int, attempt int) *nasCleanupDayPermit {
+		t.Helper()
+		p := &nasCleanupDayPermit{Attempt: attempt, Token: strings.Repeat("a", 64)}
+		if err := pool.QueryRow(ctx, `UPDATE nas_cleanup_day_units SET state='permitted',attempt=$3,permit_token_sha256=$4,permit_expires_at=now()+interval '10 minutes'
+		 WHERE plan_id=$1 AND ordinal=$2 RETURNING id`, admitted.ID, ordinal, attempt, cleanupSHA([]byte(p.Token))).Scan(&p.UnitID); err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
 	for _, older := range []string{nasFastCopyClientVersion, nasKeep20CleanupClientVersion} {
 		exec(`UPDATE connections SET client_version=$1 WHERE id=13`, older)
@@ -509,10 +528,7 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 		}
 		return cleanupCall(t, s.handleAccountNASCleanupDayReceipt, 47, 47, "", "", body, "fixture-boot "+nasTunableDayClientVersion)
 	}
-	code, first := permit(nasTunableDayClientVersion)
-	if code != 200 || first == nil || first.LocalDate != "2026-09-12" || first.Files != 2 || first.Timezone != "Asia/Tokyo" || first.Attempt != 1 {
-		t.Fatalf("first permit: %d %+v", code, first)
-	}
+	first := legacyPermit(1, 1)
 	if w := receipt(first, nasCleanupDayPartial, 1, 100, 1); w.Code != 200 {
 		t.Fatalf("partial receipt: %d %s", w.Code, w.Body)
 	}
@@ -522,17 +538,11 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan)).Output()
 	if w := receipt(first, nasCleanupDayDeleted, 2, 300, 0); w.Code != 409 {
 		t.Fatalf("contradictory receipt accepted: %d", w.Code)
 	}
-	_, again := permit(nasTunableDayClientVersion)
-	if again == nil || again.UnitID != first.UnitID || again.Attempt != 2 {
-		t.Fatalf("partial unit was not re-permitted: %+v", again)
-	}
+	again := legacyPermit(1, 2)
 	if w := receipt(again, nasCleanupDayDeleted, 1, 200, 0); w.Code != 200 {
 		t.Fatal(w.Body.String())
 	}
-	_, second := permit(nasTunableDayClientVersion)
-	if second == nil || second.LocalDate != "2026-10-10" {
-		t.Fatalf("second unit: %+v", second)
-	}
+	second := legacyPermit(2, 1)
 	if w := receipt(second, nasCleanupDayRefused, 0, 0, 0); w.Code != 200 {
 		t.Fatal(w.Body.String())
 	}
@@ -682,9 +692,8 @@ func dayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUnit) (in
 	return files, bytes, err
 }
 
-// The tunable-modes client receives names mode (exact inventory entries) for a
-// flat directory and dir mode for a plaza day directory; older clients get
-// today's permit. Expiry no longer follows the last heartbeat.
+// Historical day permit layouts remain recognizable for verification and
+// receipt reconciliation; neither layout receives new authority.
 func TestNASCleanupDayPermitModes(t *testing.T) {
 	pool, exec, insert := dayFixture(t)
 	ctx := context.Background()
@@ -721,42 +730,20 @@ func TestNASCleanupDayPermitModes(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT id FROM nas_cleanup_day_plans WHERE label='kday-modes'`).Scan(&planID); err != nil {
 		t.Fatal(err)
 	}
-	if w := dayCall(s.handleServiceNASCleanupDayControl, fmt.Sprint(planID), map[string]any{"plan_sha256": sha, "mode": "enabled", "reason": "fixture", "approval_hours": 1}); w.Code != 200 {
-		t.Fatalf("enable: %d %s", w.Code, w.Body)
+	if w := dayCall(s.handleServiceNASCleanupDayControl, fmt.Sprint(planID), map[string]any{"plan_sha256": sha, "mode": "enabled", "reason": "fixture", "approval_hours": 1}); w.Code != 409 || !strings.Contains(w.Body.String(), nasCleanupDayNonKEBlock) {
+		t.Fatalf("non-KE enable: %d %s", w.Code, w.Body)
 	}
-	permit := func(version string) *nasCleanupDayPermit {
-		t.Helper()
-		// A heartbeat 3.5 minutes old used to cap the permit at 1.5 minutes.
-		exec(`UPDATE connections SET client_version=$1,client_boot_id='fixture-boot',last_seen_at=now()-interval '210 seconds' WHERE id=13`, version)
-		w := cleanupCall(t, s.handleAccountNASCleanupDayPermit, 47, 47, "", "", map[string]any{"client_version": version}, "fixture-boot "+version)
-		var out struct {
-			Unit *nasCleanupDayPermit `json:"unit"`
-		}
-		if json.Unmarshal(w.Body.Bytes(), &out) != nil || w.Code != 200 || out.Unit == nil {
-			t.Fatalf("%s permit: %d %s", version, w.Code, w.Body)
-		}
-		if out.Unit.ExpiresAt.Before(time.Now().Add(nasCleanupDayPermitTTL - time.Minute)) {
-			t.Fatalf("permit expiry follows the heartbeat: %v", out.Unit.ExpiresAt)
-		}
-		exec(`UPDATE nas_cleanup_day_units SET permit_expires_at=now() WHERE id=$1`, out.Unit.UnitID)
-		return out.Unit
-	}
-	if old := permit(nasTunableDayClientVersion); old.Mode != "" || old.Entries != nil || old.RelativeDir != flatDir {
-		t.Fatalf("tunable-day permit changed shape: %+v", old)
-	}
-	names := permit(nasCleanupDayModesClientVersion)
+	// Preserve the offline layout/entry assertions without issuing deletion
+	// authority. The NAS-only path is now disabled for either layout.
+	entries, err := cleanupDayCheck(ctx, pool, units[0], nil)
 	want := []nasCleanupDayEntry{{Name: a, SizeBytes: 101}, {Name: a + ".stoarama.json", SizeBytes: 50, Sidecar: true}, {Name: b, SizeBytes: 102}}
-	if names.Mode != nasCleanupDayNames || fmt.Sprint(names.Entries) != fmt.Sprint(want) {
-		t.Fatalf("names permit: %+v", names)
+	if err != nil || cleanupDayModeOf(units[0]) != nasCleanupDayNames || fmt.Sprint(entries) != fmt.Sprint(want) {
+		t.Fatalf("names check: %v %v", entries, err)
 	}
-	if w := cleanupCall(t, s.handleAccountNASCleanupDayReceipt, 47, 47, "", "", map[string]any{"client_version": nasCleanupDayModesClientVersion,
-		"unit_id": names.UnitID, "attempt": names.Attempt, "permit_token": names.Token, "outcome": nasCleanupDayDeleted, "media_files": 2,
-		"media_bytes": 203, "sidecar_files": 1, "sidecar_bytes": 50, "remaining_files": 0, "refusal": ""}, "fixture-boot "+nasCleanupDayModesClientVersion); w.Code != 200 {
-		t.Fatalf("names receipt: %d %s", w.Code, w.Body)
+	if cleanupDayModeOf(units[1]) != nasCleanupDayDir {
+		t.Fatal("plaza layout changed")
 	}
-	if dir := permit(nasCleanupDayModesClientVersion); dir.Mode != nasCleanupDayDir || dir.Entries != nil || dir.LocalDate != "2026-10-10" {
-		t.Fatalf("dir permit: %+v", dir)
-	}
+
 }
 
 // Keep Everything (Deniz: "nas shoul dnot have any of the keep everything
@@ -793,10 +780,10 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 		t.Helper()
 		at, _ := time.ParseInLocation("2006-01-02 150405", "2026-10-10 "+hhmmss, seoul)
 		exec(`INSERT INTO recording_clips(id,recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,etag,sha256,
- fire_at,clip_start_at,clip_end_at,display_path,purged_at) VALUES($1,31,1,'https://storage.example.test','fixture',$2,$3,'etag',repeat('a',64),$4,$4,$5,$6,
- CASE WHEN $7 THEN now() END)`, id, fmt.Sprintf("managed/ke/%d.mp4", id), size, at, at.Add(time.Minute), dir+"/"+name(hhmmss), purged)
+ fire_at,clip_start_at,clip_end_at,display_path,purged_at) VALUES($1,31,1,'https://storage.example.test','fixture',$2,$3,$8,$9,$4,$4,$5,$6,
+ CASE WHEN $7 THEN now() END)`, id, fmt.Sprintf("managed/ke/%d.mp4", id), size, at, at.Add(time.Minute), dir+"/"+name(hhmmss), purged, fmt.Sprintf("%x", md5.Sum(make([]byte, size))), cleanupSHA(make([]byte, size)))
 		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,client_updated_at)
- VALUES(13,$1,31,$2,$3,repeat('a',64),'present',now())`, id, dir+"/"+name(hhmmss), nasSize)
+ VALUES(13,$1,31,$2,$3,$4,'present',now())`, id, dir+"/"+name(hhmmss), nasSize, cleanupSHA(make([]byte, nasSize)))
 	}
 	keClip(11, "100000", 100, 100, false) // raw object live
 	keClip(12, "110000", 100, 100, true)  // raw purged, no stitched output
@@ -804,7 +791,7 @@ INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron
 	keClip(14, "130000", 100, 99, false)  // raw live, but the NAS file has another size
 	keClip(15, "140000", 100, 100, true)  // raw purged, its only stitched output retired
 	exec(`UPDATE nas_inventory_files SET sidecar_relative_path=relative_path||'.stoarama.json',sidecar_size_bytes=7,sidecar_sha256=repeat('b',64),
- file_ctime_ns=1,file_inode=1,file_device=1 WHERE clip_id=13`)
+ file_ctime_ns=1,file_inode=1,file_device=1 WHERE clip_id=11`)
 	exec(`BEGIN; SET LOCAL session_replication_role=replica;
 INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,
  manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
@@ -851,63 +838,45 @@ COMMIT`)
 	raw11, out13 := "managed/ke/11.mp4", "joined/goodplus-x/objects/"+strings.Repeat("c", 64)+".mp4"
 	bucket.put(raw11, make([]byte, 100))
 	bucket.put(out13, make([]byte, 900))
-	if files, bytes, err := keCheck(all); err != nil || files != 2 || bytes != 200 {
+	if files, bytes, err := keCheck(all); err != nil || files != 1 || bytes != 100 {
 		t.Fatalf("KE evidence: %d files %d bytes %v", files, bytes, err)
 	}
-	// The catalogue is not R2: each permitted file needs at least one
-	// catalogue-live counterpart R2 holds at its catalogued size, and any R2
-	// error refuses the whole unit. Clip 11 is also covered, clip-exactly, by a
-	// stitched output for these cases.
-	out11 := "joined/goodplus-x/objects/" + strings.Repeat("f", 64) + ".mp4"
-	exec(fmt.Sprintf(`BEGIN; SET LOCAL session_replication_role=replica;
-INSERT INTO recording_collation_hours(id,hour_id,batch_id,generation,recording_id,local_date,delivery_hour,status,manifest_object_key,manifest_sha256,
- manifest,source_clip_count,included_clip_count,excluded_clip_count,join_count,split_count)
- VALUES(2,'goodplus-x__recording-31__date-2026-10-10__hour-09__generation-2','goodplus-x',2,31,'2026-10-10',9,'collated','m/2',repeat('a',64),'{}',1,1,0,0,0);
-INSERT INTO recording_collation_outputs(id,collation_hour_id,part,parts,object_key,nas_relative_path,size_bytes,sha256,start_at,end_at,source_clip_ids,r2_verified_at)
- VALUES(3,2,1,1,'%s','x/3.mp4',700,repeat('f',64),'2026-10-10T00:00:00Z','2026-10-10T01:00:00Z',ARRAY[11],now());
-COMMIT`, out11))
-	bucket.put(out11, make([]byte, 700))
-	type object struct {
-		key  string
-		body []byte // nil: missing from R2
-	}
-	for label, c := range map[string]struct {
-		objects []object
-		fail    bool
-		want    string // "" permits both live files
+	// A stitched output is not byte-for-byte redundancy. Wrong generation,
+	// wrong size, absence and transport failures must refuse the raw survivor.
+	for _, c := range []struct {
+		label string
+		body  []byte
+		fail  bool
+		want  string
 	}{
-		"all counterparts live":                     {},
-		"raw gone, stitched output live":            {objects: []object{{key: raw11}}},
-		"raw live, stitched output missing":         {objects: []object{{key: out11}}},
-		"raw of another size, stitched output live": {objects: []object{{key: raw11, body: make([]byte, 99)}}},
-		"raw and stitched output both gone": {objects: []object{{key: raw11}, {key: out11}},
-			want: "is live: " + raw11 + " is missing; " + out11 + " is missing"},
-		"only stitched output of another live size": {objects: []object{{key: out13, body: make([]byte, 901)}},
-			want: out13 + " is 901 bytes, catalogued 900"},
-		"only stitched output missing": {objects: []object{{key: out13}}, want: out13 + " is missing"},
-		"R2 error":                     {fail: true, want: "unverified"},
+		{"raw live", make([]byte, 100), false, ""},
+		{"raw gone, stitched output live", nil, false, "is missing"},
+		{"raw of another size", make([]byte, 99), false, "is 99 bytes, catalogued 100"},
+		{"raw of same size but another generation", bytes.Repeat([]byte{1}, 100), false, "generation differs"},
+		{"R2 error", make([]byte, 100), true, "unverified"},
 	} {
-		saved := map[string][]byte{}
-		for _, o := range c.objects {
-			saved[o.key] = bucket.objects[o.key]
-			delete(bucket.objects, o.key)
-			if o.body != nil {
-				bucket.put(o.key, o.body)
-			}
+		delete(bucket.objects, raw11)
+		if c.body != nil {
+			bucket.put(raw11, c.body)
 		}
 		bucket.headFailures = map[bool]int{true: 1}[c.fail]
 		files, _, err := keCheck(all)
-		if c.want == "" && (err != nil || files != 2) || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
-			t.Errorf("%s: %d files, %v", label, files, err)
-		}
-		bucket.headFailures = 0
-		for key, body := range saved {
-			bucket.put(key, body)
+		if c.want == "" && (err != nil || files != 1) || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
+			t.Errorf("%s: %d files, %v", c.label, files, err)
 		}
 	}
-	exec(`BEGIN; SET LOCAL session_replication_role=replica; DELETE FROM recording_collation_outputs WHERE id=3;
-DELETE FROM recording_collation_hours WHERE id=2; COMMIT`)
-	delete(bucket.objects, out11)
+	bucket.headFailures = 0
+	bucket.put(raw11, make([]byte, 100))
+	exec(`UPDATE recording_clips SET sha256='' WHERE id=11`)
+	if _, _, err := keCheck(unit(named(11))); err == nil {
+		t.Fatal("hashless catalogue qualified")
+	}
+	exec(`UPDATE recording_clips SET sha256=$1 WHERE id=11`, cleanupSHA(make([]byte, 100)))
+	exec(`UPDATE nas_inventory_files SET sha256=repeat('f',64) WHERE clip_id=11`)
+	if _, _, err := keCheck(unit(named(11))); err == nil {
+		t.Fatal("mismatching NAS hash qualified")
+	}
+	exec(`UPDATE nas_inventory_files SET sha256=$1 WHERE clip_id=11`, cleanupSHA(make([]byte, 100)))
 	// A non-KE unit never reads R2.
 	at := dayAt("2026-10-10", "103000")
 	insert(21, "2026-10-10", "103000", 500, at, at.Add(time.Minute))
@@ -951,7 +920,7 @@ if sys.argv[1] == "sql":
     k.day_stream_rows(w, "psql")
 else:
     facts = json.load(sys.stdin)
-    sizes = {c[7]: c[6] for c in facts["clips"] if c[7]} | {o[0]: o[1] for o in facts["outputs"]}
+    sizes = {c[7]: c[6] for c in facts["clips"] if c[7]}
     print(json.dumps(k.day_units(w, k.load_folders(), facts, lambda keys: {x: sizes[x] for x in keys if x in sizes})))`
 	env := append(os.Environ(), "R2_BUCKET=fixture")
 	sqlCmd := osexec.Command(python, "-B", "-c", script, "sql")
@@ -968,7 +937,7 @@ else:
 	prepare.Env, prepare.Stdin = env, bytes.NewReader(facts)
 	prepared, err := prepare.Output()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("preparer: %v", err)
 	}
 	var out []json.RawMessage
 	var preparedUnits []nasCleanupDayUnit
@@ -976,9 +945,9 @@ else:
 	if json.Unmarshal(prepared, &out) != nil || json.Unmarshal(out[0], &preparedUnits) != nil || json.Unmarshal(out[1], &excluded) != nil {
 		t.Fatalf("preparer output %s", prepared)
 	}
-	want := unit(named(11, 13))
-	if fmt.Sprint(preparedUnits) != fmt.Sprint([]nasCleanupDayUnit{want}) || excluded.Files != 3 || excluded.Bytes != 299 {
-		t.Fatalf("preparer KE units %s, want %v and 3 files / 299 bytes excluded", prepared, want)
+	want := unit(named(11))
+	if fmt.Sprint(preparedUnits) != fmt.Sprint([]nasCleanupDayUnit{want}) || excluded.Files != 4 || excluded.Bytes != 399 {
+		t.Fatalf("preparer KE units %s, want %v and 4 files / 399 bytes excluded", prepared, want)
 	}
 	runnerUnlive := func(u nasCleanupDayUnit) string {
 		t.Helper()
@@ -1007,7 +976,7 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 	if got := runnerUnlive(want); !strings.Contains(got, `"unlive" : 0`) {
 		t.Fatalf("runner KE catalog: %s", got)
 	}
-	if got := runnerUnlive(all); !strings.Contains(got, `"unlive" : 3`) {
+	if got := runnerUnlive(all); !strings.Contains(got, `"unlive" : 4`) {
 		t.Fatalf("runner missed KE names without a live counterpart: %s", got)
 	}
 
@@ -1017,7 +986,7 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 		return dayCall(s.handleServiceNASCleanupDayCreate, "", map[string]any{"label": label, "policy_sha256": cleanupPolicySHA,
 			"plan_sha256": cleanupDayDigest(units), "files": u.Files, "bytes": u.Bytes, "units": units})
 	}
-	if w := admit("kday-s78-all", all); w.Code != 409 || !strings.Contains(w.Body.String(), "2 files, 200 bytes") {
+	if w := admit("kday-s78-all", all); w.Code != 409 || !strings.Contains(w.Body.String(), "1 files, 100 bytes") {
 		t.Fatalf("KE plan naming files without counterparts admitted: %d %s", w.Code, w.Body)
 	}
 	w := admit("kday-s78-day-0001", want)
@@ -1040,66 +1009,124 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 		return dayCall(s.handleServiceNASCleanupDayControl, fmt.Sprint(admitted.ID), map[string]any{"plan_sha256": admitted.PlanSHA256,
 			"mode": "enabled", "reason": "fixture", "approval_hours": 1})
 	}
-	// Enable re-verifies R2 live: a counterpart gone since admission refuses it.
-	delete(bucket.objects, out13)
-	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "no pending unit still qualifies") {
-		t.Fatalf("enable with a counterpart missing from R2: %d %s", w.Code, w.Body)
+	// Enable re-verifies raw R2 live, and cannot continue while a sibling wire
+	// executor is not part of the durable survivor-reservation contract.
+	delete(bucket.objects, raw11)
+	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "is missing") {
+		t.Fatalf("missing survivor enable: %d %s", w.Code, w.Body)
 	}
-	bucket.put(out13, make([]byte, 900))
-	if w := enable(); w.Code != 200 {
-		t.Fatalf("enable: %d %s", w.Code, w.Body)
+	bucket.put(raw11, make([]byte, 100))
+	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "shared persistent survivor reservation") {
+		t.Fatalf("unfenced enable: %d %s", w.Code, w.Body)
 	}
-	permit := func(version string) *nasCleanupDayPermit {
-		t.Helper()
-		exec(`UPDATE connections SET client_version=$1,client_boot_id='fixture-boot',last_seen_at=now() WHERE id=13`, version)
-		w := cleanupCall(t, s.handleAccountNASCleanupDayPermit, 47, 47, "", "", map[string]any{"client_version": version}, "fixture-boot "+version)
-		var out struct {
-			Unit *nasCleanupDayPermit `json:"unit"`
-		}
-		if json.Unmarshal(w.Body.Bytes(), &out) != nil || w.Code != 200 {
-			t.Fatalf("%s permit: %d %s", version, w.Code, w.Body)
-		}
-		return out.Unit
+
+	// The primitive records the exact plan, generation, size and SHA. A stale
+	// input or mismatching identity cannot produce a hold. It is not an enable.
+	var unitID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM nas_cleanup_day_units WHERE plan_id=$1`, admitted.ID).Scan(&unitID); err != nil {
+		t.Fatal(err)
 	}
-	for _, older := range []string{nasTunableDayClientVersion, nasCleanupDayModesClientVersion} {
-		if p := permit(older); p != nil {
-			t.Fatalf("%s received a Keep Everything permit: %+v", older, p)
-		}
-	}
-	p := permit(nasCleanupDayKEClientVersion)
-	wantEntries := []nasCleanupDayEntry{{Name: name("100000"), SizeBytes: 100}, {Name: name("120000"), SizeBytes: 100},
-		{Name: name("120000") + ".stoarama.json", SizeBytes: 7, Sidecar: true}}
-	if p == nil || p.Mode != nasCleanupDayNames || fmt.Sprint(p.Entries) != fmt.Sprint(wantEntries) || p.DroppedNames != 0 {
-		t.Fatalf("KE plaza day must go in names mode with evidenced entries only: %+v", p)
-	}
-	// The raw object of clip 11 leaves R2 before the next attempt: its NAS copy stays.
-	exec(`UPDATE nas_cleanup_day_units SET permit_expires_at=now() WHERE id=$1`, p.UnitID)
-	exec(`UPDATE recording_clips SET purged_at=now() WHERE id=11`)
-	again := permit(nasDayInventoryClientVersion)
-	if again == nil || fmt.Sprint(again.Entries) != fmt.Sprint(wantEntries[1:]) || again.DroppedNames != 1 {
-		t.Fatalf("re-permit kept a file whose counterpart left R2: %+v", again)
-	}
-	var dropped struct {
-		Units []struct {
-			DroppedNames int64 `json:"dropped_names"`
+	const insertHold = `INSERT INTO nas_cleanup_day_survivor_holds(bucket,object_key,clip_id,unit_id,etag,version_id,size_bytes,sha256,verified_at,verify_until)
+	 SELECT bucket,object_key,id,$1,$2,'',size_bytes,sha256,$3,$3::timestamptz+interval '15 min' FROM recording_clips WHERE id=11`
+	etag := fmt.Sprintf("%x", md5.Sum(make([]byte, 100)))
+	for _, bad := range []struct {
+		etag string
+		at   time.Time
+	}{{etag, time.Now().Add(-time.Hour)}, {"replacement", time.Now()}} {
+		if _, err := pool.Exec(ctx, insertHold, unitID, bad.etag, bad.at); err == nil {
+			t.Fatal("stale or changed survivor reserved")
 		}
 	}
-	if json.Unmarshal(dayCall(s.handleServiceNASCleanupDayStatus, fmt.Sprint(admitted.ID), nil).Body.Bytes(), &dropped) != nil ||
-		len(dropped.Units) != 1 || dropped.Units[0].DroppedNames != 1 {
-		t.Fatalf("status does not surface the dropped name: %+v", dropped)
+	// A concurrent retirement ledger admission holds the same key lock.
+	other, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// A permit re-verifies R2 live: the stitched output's live size differs from
-	// its catalogued size, so the unit is refused and reported, never permitted.
-	exec(`UPDATE nas_cleanup_day_units SET permit_expires_at=now() WHERE id=$1`, again.UnitID)
-	bucket.put(out13, make([]byte, 901))
-	if p := permit(nasCleanupDayKEClientVersion); p != nil {
-		t.Fatalf("permitted a unit whose stitched output differs in R2: %+v", p)
+	if _, err = other.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(nas_stitch_r2_hold_lock('fixture',$1))`, raw11); err != nil {
+		t.Fatal(err)
 	}
-	var state, refusal string
-	if err := pool.QueryRow(ctx, `SELECT state,refusal FROM nas_cleanup_day_units WHERE id=$1`, again.UnitID).Scan(&state, &refusal); err != nil ||
-		state != "refused" || !strings.Contains(refusal, out13+" is 901 bytes, catalogued 900") {
-		t.Fatalf("unit %s: %q %v", state, refusal, err)
+	if _, err := pool.Exec(ctx, insertHold, unitID, etag, time.Now()); err == nil {
+		t.Fatal("busy retirement key reserved")
 	}
+	if err = other.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exec(insertHold, unitID, etag, time.Now())
+	var reserved bool
+	if err = pool.QueryRow(ctx, `SELECT nas_cleanup_r2_file_reserved('raw',11)`).Scan(&reserved); err != nil || !reserved {
+		t.Fatalf("reservation absent: %v %v", reserved, err)
+	}
+	for _, stmt := range []string{
+		`UPDATE recording_clips SET etag='replacement' WHERE id=11`,
+		`UPDATE recording_clips SET endpoint='https://replacement.example.invalid' WHERE id=11`,
+		`UPDATE recording_clips SET purged_at=now() WHERE id=11`,
+		`DELETE FROM nas_cleanup_day_survivor_holds WHERE clip_id=11`,
+		`TRUNCATE nas_cleanup_day_survivor_holds`,
+		`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
+		 SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('d',64) FROM recording_clips WHERE id=11`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err == nil {
+			t.Fatalf("durable survivor guard allowed %s", stmt)
+		}
+	}
+	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "shared persistent survivor reservation") {
+		t.Fatalf("DB hold alone enabled: %d %s", w.Code, w.Body)
+	}
+	// Existing enabled rows (e.g. older binaries) cannot get KE permits once
+	// this check is installed. This fixture simulates that legacy state only.
+	exec(`UPDATE nas_cleanup_day_plans SET mode='enabled',approved_until=now()+interval '1 hour',approval_reason='fixture' WHERE id=$1`, admitted.ID)
+	exec(`UPDATE connections SET client_version=$1,client_boot_id='fixture-boot',last_seen_at=now() WHERE id=13`, nasCleanupDayKEClientVersion)
+	w = cleanupCall(t, s.handleAccountNASCleanupDayPermit, 47, 47, "", "", map[string]any{"client_version": nasCleanupDayKEClientVersion}, "fixture-boot "+nasCleanupDayKEClientVersion)
+	if w.Code != 409 || !strings.Contains(w.Body.String(), "shared persistent survivor reservation") {
+		t.Fatalf("legacy KE permit: %d %s", w.Code, w.Body)
+	}
+
+	// Execute the runner's actual random selector against the migrated schema.
+	// The Python fixture separately exercises each selected object's conditional
+	// full read and SHA, including timeout, replacement and short-read failures.
+	var sampleNames []nasCleanupDayName
+	for n := 0; n < 30; n++ {
+		hhmmss := fmt.Sprintf("1600%02d", n)
+		keClip(int64(100+n), hhmmss, 100, 100, false)
+		sampleNames = append(sampleNames, nasCleanupDayName{Name: name(hhmmss), SizeBytes: 100})
+	}
+	for _, count := range []int{30, 3} {
+		candidate := unit(sampleNames[:count])
+		units := []nasCleanupDayUnit{candidate}
+		plan, _ := json.Marshal(map[string]any{"id": admitted.ID, "mode": "dry_run", "plan_sha256": cleanupDayDigest(units), "units": units})
+		cmd := osexec.Command(python, "-B", "-c", `import json, sys
+from pathlib import Path
+sys.path.insert(0, "../../../ops/jelly/cleanup-runner")
+import runner as r
+job = r.Runner(Path("../../.."), Path("."))
+def query(sql, step):
+    print(sql)
+    raise SystemExit(0)
+job.query = query
+job.day_sample(json.loads(sys.argv[1]))`, string(plan))
+		cmd.Env = env
+		sql, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("sample selector: %v %s", err, sql)
+		}
+		var raw []byte
+		if err = pool.QueryRow(ctx, string(sql)).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var sampled [][]any
+		if err = json.Unmarshal(raw, &sampled); err != nil || len(sampled) != min(20, count) {
+			t.Fatalf("sample count %s: %v", raw, err)
+		}
+		seen := map[string]bool{}
+		for _, row := range sampled {
+			key, ok := row[0].(string)
+			if !ok || seen[key] || row[1] != float64(100) || row[2] != cleanupSHA(make([]byte, 100)) || row[3] != row[2] || row[4] != etag {
+				t.Fatalf("sample evidence %v", row)
+			}
+			seen[key] = true
+		}
+	}
+
 }
 
 func TestNASCleanupDayDeletedMediaCountsEachUnitOnce(t *testing.T) {

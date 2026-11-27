@@ -56,19 +56,17 @@ RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'}
 # Redundancy gate (Deniz, 2026-11-27, verbatim: "yuea double check everything be
 # 100% sure redundancy before deleting"): a NAS file leaves only against another
 # verified copy of the same content. A KE name's raw R2 object is that copy: live
-# at the same size, the same sha256 wherever the catalogue and the NAS inventory
-# both record one, and before every enable RESTORE_SAMPLE random hashed names are
+# at the same size, the same valid sha256 in both the catalogue and present NAS inventory,
+# and before any activation RESTORE_SAMPLE random hashed names are
 # fetched from R2 and hash-matched. A stitched output is not the same content.
 # Non-KE day units prove no second copy: they are never planned, enabled or left
 # running.
-DAY_REASON = ('Deniz approval (verbatim: "nas shoul dnot have any of the keep everything (except the keep 20)"; '
-              '"yuea double check everything be 100% sure redundancy before deleting"): Keep Everything NAS raw outside the '
-              'pinned 20-day window, each name against its live raw R2 copy (same size, same sha256 where recorded, '
-              'R2 restore sample hash-matched); server and independent folder/window/hold check PASS; one owned plan.')
 R2PRUNE = Path.home() / 'stoarama-r2prune-lane' / 'r2prune'
 AWS = Path.home() / 'aws-cli' / 'aws'
 RESTORE_SAMPLE = 20
+# Bound the entire sample, not just reads which produce output.
 RESTORE_TIMEOUT_SEC = 900
+DAY_INTEGRATION_BLOCK = 'day cleanup blocked: no shared persistent survivor reservation at the R2 wire boundary'
 FOLDERS = 'backend/internal/api/nas_cleanup_folder_streams.json'
 FOLDERS_SHA = '94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88bc33c4c90cae0e7ab8'
 DAY_MAX_UNITS = 1000
@@ -82,7 +80,8 @@ DAY_TERMINAL = {'deleted', 'refused', 'client_refused', 'retired'}
 # the catalogued and present NAS inventory sha256 (null when unrecorded).
 KE_NAME_COPIES = """n AS (SELECT u.dir,u.d,u.sid,x->>'name' name,(x->>'size_bytes')::bigint size
             FROM u CROSS JOIN jsonb_array_elements(u.names) x),
-          k AS (SELECT n.dir,n.d,n.name,rc.object_key,rc.size_bytes,__RAW_LIVE__ live,
+          k AS (SELECT n.dir,n.d,n.name,rc.object_key,rc.size_bytes,trim(both '"' from rc.etag) etag,
+              (__RAW_LIVE__ AND f.size_bytes=n.size AND rc.etag<>'') live,
               lower(nullif(rc.sha256,'')) cat_sha,lower(nullif(f.sha256,'')) nas_sha
             FROM n JOIN recordings r ON r.account_id=47 AND r.stream_id=n.sid
             JOIN recording_clips rc ON rc.recording_id=r.id AND rc.display_path=n.dir||'/'||n.name AND rc.size_bytes=n.size
@@ -341,6 +340,7 @@ def day_verify(plan, windows, timezones, keep_everything, folders, catalog):
                 'directory-day has a held or in-window catalogued clip')
         require(row['unlive'] == 0, 'a Keep Everything name lacks its live same-size raw R2 object in the catalogue')
         require(row['mismatch'] == 0, 'a Keep Everything name differs in sha256 from its raw R2 object')
+        require(row['hashless'] == 0, 'a Keep Everything name lacks both valid sha256 hashes')
     require(len({u['stream_id'] for u in units}) == 1, 'day plan must be one stream')
     return plan['bytes']
 
@@ -862,6 +862,7 @@ class Runner:
         return self.admission
 
     def enable(self, plan, day=False):
+        require(not day, DAY_INTEGRATION_BLOCK)
         # D's existing gate orders attempt journals with lane-lock ownership.
         # Acquire the tick lock only after proving no abandoned attempt. Keep
         # the gate through the POST so a new D tick cannot mistake our lock for
@@ -879,13 +880,9 @@ class Runner:
                         require('tick' not in record['active'], 'interrupted finish tick requires reconciliation')
                         if self.stopped():
                             return False
-                        if day:
-                            self.day_control(plan['id'], 'control', {'mode': 'enabled',
-                                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24, 'reason': DAY_REASON}, 'enabled')
-                        else:
-                            self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
-                                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
-                                'allow_long_approval': True, 'reason': REASON})
+                        self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
+                            'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
+                            'allow_long_approval': True, 'reason': REASON})
                         return True
             # Wait outside the gate and snapshot lock, then revalidate before
             # acquiring it again. No active cleanup is waiting here.
@@ -1556,8 +1553,9 @@ class Runner:
             WHERE c.clip_start_at>=u.d::timestamp AT TIME ZONE u.tz AND c.clip_start_at<(u.d+1)::timestamp AT TIME ZONE u.tz
               AND left(c.display_path,length(u.dir)+1)=u.dir||'/' AND strpos(substr(c.display_path,length(u.dir)+2),'/')=0),
           """ + self.ke_name_copies() + """,
-          s AS (SELECT n.dir,n.d,n.name,coalesce(bool_or(k.live),false) live,coalesce(bool_or(k.cat_sha<>k.nas_sha),false) mismatch,
-              coalesce(bool_or(k.cat_sha IS NOT NULL AND k.nas_sha IS NOT NULL),false) hashed
+          s AS (SELECT n.dir,n.d,n.name,(count(k.object_key)=1 AND coalesce(bool_and(k.live),false)) live,
+              coalesce(bool_or(k.cat_sha<>k.nas_sha),false) mismatch,
+              (count(k.object_key)=1 AND coalesce(bool_and(k.cat_sha ~ '^[0-9a-f]{64}$' AND k.nas_sha ~ '^[0-9a-f]{64}$'),false)) hashed
             FROM n LEFT JOIN k ON k.dir=n.dir AND k.d=n.d AND k.name=n.name GROUP BY n.dir,n.d,n.name)
           SELECT coalesce(json_agg(json_build_object('relative_dir',u.dir,'local_date',u.d::text,
             'held',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND nas_cleanup_day_clip_held(c.id,u.ke)),
@@ -1572,46 +1570,84 @@ class Runner:
         return KE_NAME_COPIES.replace('__RAW_LIVE__', prepare.r2_live_raw('rc', prepare.R2_BUCKET))
 
     def day_sample(self, p):
-        """Restore sample of a Keep Everything plan: fetch RESTORE_SAMPLE random hashed names (every name of a
-        smaller plan) from their raw R2 object; each must have the catalogued size and every recorded sha256."""
+        """Random, full readback of >=20 distinct raw survivors (all if fewer).
+
+        Keep the evidence bound to the immutable plan and one monotonic deadline.
+        This is a readback, not authority to execute: the persistent cross-lane
+        reservation is a separate prerequisite.
+        """
+        require(p['mode'] == 'dry_run' and day_digest(p['units']) == p['plan_sha256'], 'restore sample plan differs')
         names = sum(len(u.get('names') or ()) for u in p['units'])
+        require(names > 0, 'restore sample has no names')
+        deadline = time.monotonic() + RESTORE_TIMEOUT_SEC
+        verified_until = utcnow() + timedelta(seconds=RESTORE_TIMEOUT_SEC)
         rows = [{'dir': u['relative_dir'], 'd': u['local_date'], 'sid': u['stream_id'], 'names': u.get('names') or []}
                 for u in p['units']]
         encoded = base64.b64encode(json.dumps(rows).encode()).decode()
         sample = self.query("""WITH u AS (SELECT x->>'dir' dir,(x->>'d')::date d,(x->>'sid')::bigint sid,x->'names' names
           FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
           """ + self.ke_name_copies() + """
-          SELECT coalesce(json_agg(json_build_array(object_key,size_bytes,cat_sha,nas_sha)),'[]')
-          FROM (SELECT * FROM (SELECT DISTINCT ON (object_key) * FROM k WHERE live AND (cat_sha IS NOT NULL OR nas_sha IS NOT NULL)) h
-            ORDER BY random() LIMIT """ + str(RESTORE_SAMPLE) + ') s', 'restore sample query')
-        require(len(sample) == min(RESTORE_SAMPLE, names), 'too few hashed names for the R2 restore sample')
-        for key, size, cat_sha, nas_sha in sample:
-            got = self.r2_sha256(key)
-            require(got[0] == size and all(h is None or h == got[1] for h in (cat_sha, nas_sha)),
-                    'R2 restore sample differs from the catalogue or the NAS inventory')
+          SELECT coalesce(json_agg(json_build_array(object_key,size_bytes,cat_sha,nas_sha,etag)),'[]')
+          FROM (SELECT * FROM (SELECT DISTINCT ON (object_key) * FROM k WHERE live AND cat_sha=nas_sha
+            AND cat_sha ~ '^[0-9a-f]{64}$') h ORDER BY random() LIMIT """ + str(RESTORE_SAMPLE) + ') s', 'restore sample query')
+        require(len(sample) == min(RESTORE_SAMPLE, names) and len({row[0] for row in sample}) == len(sample),
+                'too few distinct hashed names for the R2 restore sample')
+        evidence = []
+        for key, size, cat_sha, nas_sha, etag in sample:
+            require(cat_sha == nas_sha and re.fullmatch('[0-9a-f]{64}', cat_sha or '') and size > 0 and etag,
+                    'R2 restore sample lacks exact identity')
+            got = self.r2_sha256(key, etag, size, deadline)
+            require(got[:2] == (size, cat_sha), 'R2 restore sample differs from the catalogue or the NAS inventory')
+            evidence.append(dict(key=key, etag=etag, version_id=got[2], size_bytes=size, sha256=cat_sha))
+        require(time.monotonic() < deadline, 'R2 restore sample deadline exceeded')
+        # Re-read the plan after I/O, not before it, so a stale sample cannot be
+        # attached to another plan or a started/changed one.
+        require(self.day_plan(p['id']) == p, 'day plan changed during restore sample')
+        require(time.monotonic() < deadline, 'R2 restore sample deadline exceeded')
         with (self.root / 'runner.jsonl').open('a') as output:
             output.write(json.dumps(dict(at=utcnow().isoformat(), phase='day_restore_sample', day_plan=p['id'],
-                                         plan_sha256=p['plan_sha256'], names=names, sampled=len(sample))) + '\n')
+                                         plan_sha256=p['plan_sha256'], names=names, sampled=len(sample),
+                                         verify_until=verified_until.isoformat(), survivors=evidence)) + '\n')
             output.flush(); os.fsync(output.fileno())
 
-    def r2_sha256(self, key):
-        """Fetch one R2 object read-only: (bytes, sha256). R2 credentials reach the CLI only through its environment."""
+    def r2_sha256(self, key, etag, expected_size, deadline):
+        """Read the exact current survivor generation using a conditional GET.
+
+        R2 may not expose a VersionId; the ETag is still mandatory. Never accept
+        a replacement, short body, error, or a read that runs past the deadline.
+        """
         env = dict(os.environ, AWS_ACCESS_KEY_ID=os.environ['R2_ACCESS_KEY_ID'],
                    AWS_SECRET_ACCESS_KEY=os.environ['R2_SECRET_ACCESS_KEY'], AWS_DEFAULT_REGION='auto')
         endpoint = 'https://%s.r2.cloudflarestorage.com' % os.environ['R2_ACCOUNT_ID']
-        digest, size = hashlib.sha256(), 0
-        deadline = time.monotonic() + RESTORE_TIMEOUT_SEC
-        with subprocess.Popen([str(AWS), 's3', 'cp', 's3://%s/%s' % (os.environ.get('R2_BUCKET', 'stoarama'), key), '-',
-                               '--endpoint-url', endpoint, '--only-show-errors'],
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env) as proc:
-            for block in iter(lambda: proc.stdout.read(1 << 20), b''):
-                digest.update(block)
-                size += len(block)
-                if time.monotonic() > deadline:
-                    proc.kill()
-                    raise Halt('R2 restore sample fetch timed out')
-            require(proc.wait() == 0, 'R2 restore sample fetch failed')
-        return size, digest.hexdigest()
+        base = [str(AWS), 's3api']
+        args = ['--bucket', os.environ.get('R2_BUCKET', 'stoarama'), '--key', key, '--if-match', '"' + etag + '"',
+                '--endpoint-url', endpoint, '--output', 'json', '--no-cli-pager']
+        def request(operation, extra=()):
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, 'R2 restore sample deadline exceeded')
+            try:
+                result = subprocess.run(base + [operation] + args + list(extra), env=env,
+                                        capture_output=True, timeout=remaining, check=True)
+                metadata = json.loads(result.stdout)
+            except (subprocess.SubprocessError, ValueError, OSError):
+                raise Halt('R2 restore sample fetch failed or timed out') from None
+            require(metadata.get('ETag') == '"' + etag + '"' and metadata.get('ContentLength') == expected_size,
+                    'R2 restore sample version or size differs')
+            return metadata.get('VersionId') or ''
+        version = request('head-object')
+        with tempfile.TemporaryDirectory() as scratch:
+            body = Path(scratch) / 'object'
+            require(request('get-object', (['--version-id', version] if version else []) + [str(body)]) == version,
+                    'R2 restore sample version differs')
+            digest, size = hashlib.sha256(), 0
+            with body.open('rb') as f:
+                for block in iter(lambda: f.read(1 << 20), b''):
+                    require(time.monotonic() < deadline, 'R2 restore sample deadline exceeded')
+                    digest.update(block)
+                    size += len(block)
+                    require(size <= expected_size, 'R2 restore sample size differs')
+            require(size == expected_size and request('head-object') == version, 'R2 restore sample version or size differs')
+        return size, digest.hexdigest(), version
 
     def unproven(self, p):
         """The plan has a unit no second copy is proven for: any non-Keep-Everything unit."""
@@ -1639,6 +1675,7 @@ class Runner:
             self.save('day_replan', current_day_plan=None)
             return None
         catalog = self.day_catalog(p)
+        self.save(self.status.get('phase', 'day_dry_run'), day_hashless_names=sum(c['hashless'] for c in catalog))
         if not self.dry_run and p['mode'] == 'dry_run' and any(c.get('unlive') for c in catalog):
             closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
                                       'reason': 'Keep Everything name lost its live R2 counterpart; replanning.'}, 'retired')
@@ -1647,7 +1684,6 @@ class Runner:
             return None
         size = day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
         self.day_sample(p)
-        self.save(self.status.get('phase', 'day_dry_run'), day_hashless_names=sum(c['hashless'] for c in catalog))
         return size
 
     def ke_held(self):
@@ -1724,7 +1760,7 @@ class Runner:
                   day_deleted_files=final['deleted_media_files'], day_deleted_bytes=final['deleted_media_bytes'])
 
     def run_day(self):
-        """One owned day plan at a time: admit, verify independently, enable, monitor, close."""
+        """Verify a day plan without enabling; pause/drain any legacy active plan."""
         self.check_restart()
         if not self.owner_validated:
             self.validate_owner()
@@ -1741,7 +1777,8 @@ class Runner:
             p = self.day_plan(pid)
             require(self.status.get('started_day_plan_sha256') == p['plan_sha256'] and p['master_deletion_enabled'] is True,
                     'saved enabled day plan is unhealthy; owner review required')
-            self.day_monitor(pid)
+            self.day_finish(p)
+            raise Halt(DAY_INTEGRATION_BLOCK)
         elif pid and self.day_plan(pid)['mode'] == 'paused':
             self.day_finish(self.day_plan(pid))
         self.check_delivery()
@@ -1758,18 +1795,7 @@ class Runner:
             if self.dry_run:
                 self.save('day_dry_run_pass', proposed_bytes=size)
                 return
-            self.idle()
-            require(p['master_deletion_enabled'] is True, 'controller must enable the runtime master before activation')
-            if self.stopped():
-                break
-            p = self.day_plan(pid)
-            if self.day_checked(p) is None:
-                continue
-            self.idle()
-            self.save('day_enabling', started_day_plan_sha256=p['plan_sha256'])
-            if self.stopped() or not self.enable(p, day=True):
-                break
-            self.day_monitor(pid)
+            raise Halt(DAY_INTEGRATION_BLOCK)
         self.save('stopped')
 
     def fail(self, error):

@@ -73,12 +73,11 @@ is named only when all of these hold:
   retired);
 - a fresh read-only R2 listing (`r2prune list`, --r2prune) shows that key at that
   size;
-- where the catalogue and the NAS inventory both record a sha256, the two are
-  equal.
+- the catalogue and the present NAS inventory record the same valid sha256.
 A stitched output is not the same content and never counts. Every other file
 stays on the NAS and is counted as excluded (`excluded_no_r2_*`, or
-`excluded_hash_mismatch_*`). Named files without both hashes are counted as
-`named_hashless_files`.
+`excluded_hash_mismatch_*`). Files without both valid hashes stay on the NAS and are counted separately as
+`excluded_hashless_files` and `excluded_hashless_bytes`.
 
 Environment: DATABASE_URL (read-only use) and, for --submit, SERVICE_TOKEN.
 """
@@ -400,9 +399,17 @@ def day_digest(units):
 
 
 def r2_live_raw(clip, bucket):
-    """SQL: the clip's raw R2 object is live in the catalogue (the server's cleanupDayR2LiveSQL raw branch)."""
-    return ("(%s.bucket=%s AND %s.purged_at IS NULL AND %s.object_key<>'' AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x "
-            "WHERE x.kind='raw' AND x.source_id=%s.id))" % (clip, "'" + bucket.replace("'", "''") + "'", clip, clip, clip))
+    """A raw object has neither retired nor pending retirement identity."""
+    bucket_sql = "'" + bucket.replace("'", "''") + "'"
+    same_key = f'x.bucket={clip}.bucket AND x.object_key={clip}.object_key'
+    raw_id = f"x.kind='raw' AND x.source_id={clip}.id"
+    clauses = [f'{clip}.bucket={bucket_sql}', f'{clip}.purged_at IS NULL',
+               f"{clip}.object_key<>''", f"{clip}.etag<>''"]
+    for table in ('r2_object_retirements', 'r2_retirement_reservations'):
+        clauses.append(f'NOT EXISTS(SELECT 1 FROM {table} x WHERE ({same_key}) OR ({raw_id}))')
+    for table in ('r2_inverse_intents', 'r2_keep28_intents'):
+        clauses.append(f'NOT EXISTS(SELECT 1 FROM {table} x WHERE ({same_key}) OR x.source_id={clip}.id)')
+    return '(' + ' AND '.join(clauses) + ')'
 
 
 def day_stream_rows(w, psql, bucket=R2_BUCKET):
@@ -454,9 +461,9 @@ def r2_listing(r2prune, out):
 def day_units(w, folders, facts, listed=None):
     """Admissible units of one stream, the server's rule applied to the same catalogue, the Keep Everything
     media excluded for lacking a listed raw R2 copy (files, bytes) or for a sha256 that differs from it
-    (hash_mismatch_*), and the named files without both hashes (hashless_files): (units, excluded)."""
+    (hash_mismatch_*), and excluded files without both valid hashes (hashless_*): (units, excluded)."""
     sid, ke = w['stream_id'], w['keep_everything']
-    excluded = {'files': 0, 'bytes': 0, 'hash_mismatch_files': 0, 'hash_mismatch_bytes': 0, 'hashless_files': 0}
+    excluded = {'files': 0, 'bytes': 0, 'hash_mismatch_files': 0, 'hash_mismatch_bytes': 0, 'hashless_files': 0, 'hashless_bytes': 0}
     if not facts['keep20_active']:
         return [], excluded
     zone = zoneinfo.ZoneInfo(w['tz'])
@@ -496,12 +503,14 @@ def day_units(w, folders, facts, listed=None):
         names = present
         if ke:
             copied = [c for c in present if c[3] == c[6] and c[7] and sizes.get(c[7]) == c[6]]
-            names = sorted((c for c in copied if not (c[8] and c[9] and c[8] != c[9])), key=lambda c: c[5])
-            excluded['hash_mismatch_files'] += len(copied) - len(names)
-            excluded['hash_mismatch_bytes'] += sum(c[3] for c in copied) - sum(c[3] for c in names)
+            hashed = [c for c in copied if all(re.fullmatch('[0-9a-f]{64}', h or '') for h in c[8:10])]
+            names = sorted((c for c in hashed if c[8] == c[9]), key=lambda c: c[5])
+            excluded['hash_mismatch_files'] += len(hashed) - len(names)
+            excluded['hash_mismatch_bytes'] += sum(c[3] for c in hashed) - sum(c[3] for c in names)
             excluded['files'] += len(present) - len(copied)
             excluded['bytes'] += sum(c[3] for c in present) - sum(c[3] for c in copied)
-            excluded['hashless_files'] += sum(not (c[8] and c[9]) for c in names)
+            excluded['hashless_files'] += len(copied) - len(hashed)
+            excluded['hashless_bytes'] += sum(c[3] for c in copied) - sum(c[3] for c in hashed)
         if not names:
             continue
         unit = {'relative_dir': directory, 'local_date': date.isoformat(), 'stream_id': sid,
@@ -517,7 +526,7 @@ def redundancy_counts(excluded):
     get = lambda k: excluded.get(k, 0)
     return {'excluded_no_r2_files': get('files'), 'excluded_no_r2_bytes': get('bytes'),
             'excluded_hash_mismatch_files': get('hash_mismatch_files'), 'excluded_hash_mismatch_bytes': get('hash_mismatch_bytes'),
-            'named_hashless_files': get('hashless_files')}
+            'excluded_hashless_files': get('hashless_files'), 'excluded_hashless_bytes': get('hashless_bytes')}
 
 
 def day_plans(units, prefix, max_units):
