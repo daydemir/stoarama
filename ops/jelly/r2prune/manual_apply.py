@@ -749,8 +749,8 @@ def delete(cfg, W, args, lock_fd):
     for other, path in open_intents({Path(W).parent, Path(cfg.lane_cycles)}):
         if other != Path(W):
             held |= read_manifest(path).keys()
-    if (cfg.chunk or CHUNK) > CHUNK:
-        raise SystemExit(f'--chunk is at most {CHUNK}: one live verify covers one chunk')
+    if not 1 <= (CHUNK if cfg.chunk is None else cfg.chunk) <= CHUNK or (cfg.chunks is not None and cfg.chunks < 1):
+        raise SystemExit(f'--chunk is 1 to {CHUNK} (one live verify covers one chunk) and --chunks at least 1')
     if cfg.chunks is None and not State(W, intent, manifest).final:
         raise SystemExit('run the canary first: --chunks 1, then check it, then rerun without --chunks')
     for n in range(cfg.chunks or sys.maxsize):

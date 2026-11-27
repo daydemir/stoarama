@@ -647,8 +647,10 @@ class ChunkVerify(Base):
     def test_an_unbounded_run_needs_a_canary_and_chunks_are_capped(self):
         with self.assertRaisesRegex(SystemExit, 'run the canary first'):
             self.delete('--chunk', '2', full=True)
-        with self.assertRaisesRegex(SystemExit, '--chunk is at most'):
-            self.delete('--chunk', str(ma.CHUNK + 1), '--chunks', '1')
+        for bad in (('--chunk', str(ma.CHUNK + 1), '--chunks', '1'), ('--chunk', '-1', '--chunks', '1'),
+                    ('--chunk', '0', '--chunks', '1'), ('--chunk', '2', '--chunks', '0')):
+            with self.assertRaisesRegex(SystemExit, '--chunk is 1 to'):
+                self.delete(*bad)
         self.assertNotIn('r2prune', self.calls())
         self.delete('--chunk', '2', '--chunks', '1')
         self.delete('--chunk', '2', full=True)
