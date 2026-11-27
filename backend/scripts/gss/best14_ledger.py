@@ -723,7 +723,8 @@ def write(out_dir, page_hours, hours, unheld, pub, published):
 
 def live_check(out_dir, src):
     """Problems unless the ledger in out_dir describes the generation the live page serves,
-    with the same windows and availability. With none, marks the ledger published."""
+    with the same windows and availability, and neither serves a vetoed assembly. With none,
+    marks the ledger published."""
     rows = read_tsv(os.path.join(out_dir, 'best14-ledger-streams.tsv'), STREAM_COLUMNS)
     gens = {r['generation'] for r in rows}
     live = src.get('/public/growth.json')['generation']
@@ -743,6 +744,7 @@ def live_check(out_dir, src):
         if s:
             man = src.get(f'/api/coverage-delivery/manifest?stream={rid}&scope=available', live)
             files = {str(o['id']) for o in man['outputs'] if o.get('available')}
+            problems += [f'recording {rid}: serves vetoed assembly {f}' for f in sorted((files | served[rid]) & VETOED)]
             if served[rid] != files or int(r['served_files']) != len(files):
                 problems.append(f'recording {rid}: ledger serves {len(served[rid])} files, live {len(files)} '
                                 f'({len(served[rid] - files)} only in the ledger, {len(files - served[rid])} only live)')

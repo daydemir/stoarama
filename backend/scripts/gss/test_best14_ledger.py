@@ -448,6 +448,9 @@ class LiveCheckTests(unittest.TestCase):
             rolled = [dict(live[0], window='original', availability='partial')]
             self.assertEqual(len(L.live_check(d, FakeLive('ab' * 16, rolled, files))), 1)
             self.assertEqual(len(L.live_check(d, FakeLive('ab' * 16, live, set(list(files)[1:])))), 1)
+            vetoed = sorted(files)[0]  # as if the ledger and the live page both served a vetoed assembly
+            with mock.patch.object(L, 'VETOED', frozenset({vetoed})):
+                self.assertEqual(L.live_check(d, FakeLive('ab' * 16, live, files)), [f'recording {RID}: serves vetoed assembly {vetoed}'])
             self.assertIn('published=n', Path(d, L.SUMMARY_FILE).read_text())
             self.assertEqual(L.live_check(d, FakeLive('ab' * 16, live, files)), [])
             self.assertIn(f'generation={"ab" * 16} published=y', Path(d, L.SUMMARY_FILE).read_text())
@@ -500,9 +503,6 @@ class ExtractSqlTests(unittest.TestCase):
                                   8: ['reserved_raw_source'], 9: ['nonraw_intent_collated']})
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class VetoTests(unittest.TestCase):
     def test_committed_veto_list(self):
@@ -523,3 +523,7 @@ class VetoTests(unittest.TestCase):
                 else:
                     with self.assertRaises(L.LedgerError, msg=name):
                         L.read_veto(p)
+
+
+if __name__ == '__main__':
+    unittest.main()

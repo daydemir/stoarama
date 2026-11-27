@@ -161,6 +161,14 @@ class SyntheticBuildTests(unittest.TestCase):
         body = Path(local).read_bytes() if os.path.exists(local) else Path(os.path.join(self.fx.assets_dir, o['key'])).read_bytes()
         return json.loads(gzip.decompress(body) if path.endswith('.gz') else body)
 
+    def test_a_vetoed_assembly_is_never_published(self):
+        rid = RIDS[0]
+        present = b.select_files(self.fx.parent, list(self.fx.parent['files']))
+        with mock.patch.object(L, 'VETOED', frozenset({assembly_id(rid)})), \
+                self.assertRaisesRegex(SystemExit, 'vetoed assemblies would be published'):
+            self.fx.build(present, self.out('gen'))
+        self.assertFalse(os.path.exists(self.out('gen')))
+
     def test_present_file_selection(self):
         gone, empty = RIDS[0], RIDS[1]
         drop = {assembly_id(gone)} | {k for k, v in self.fx.parent['files'].items() if v['recording_id'] == empty}
