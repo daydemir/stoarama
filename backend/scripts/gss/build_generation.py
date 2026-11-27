@@ -1,7 +1,8 @@
 """Build a Global Street Scores (GSS) public delivery generation.
 
 Rebuilds every page asset of a base generation for a file selection, marks each
-stream available or partial for its best 14 days, and writes into a new, empty
+stream available or partial for its best 14 days, serves this directory's
+download_script.py as /download-script.py, and writes into a new, empty
 output directory:
 
   registry.json.gz   the new public registry (gzip, deterministic)
@@ -86,7 +87,12 @@ class Availability(str, enum.Enum):
 
 
 # Assets this builder carries over byte for byte: they do not list files.
-UNTOUCHED_ASSETS = ('/download-script.py', '/public/images.json', '/public/blue-observations.json')
+UNTOUCHED_ASSETS = ('/public/images.json', '/public/blue-observations.json')
+
+# Every generation serves this repository's download script (one-line.js pins
+# its sha256 from the manifest's download_script_sha256).
+DOWNLOAD_SCRIPT_ASSET = '/download-script.py'
+DOWNLOAD_SCRIPT = Path(__file__).resolve().with_name('download_script.py')
 
 # Fields that depend on the file set but are not recomputed (no source data in
 # the assets to recompute them from). They keep the parent's values.
@@ -338,8 +344,20 @@ def rebuild(store, recording_ids, present, gen_id, now, refresh_paths=False):
     return out, changed_streams
 
 
-def rebuilt_asset(path):
-    return not (path in UNTOUCHED_ASSETS or path.startswith('/public/images/'))
+def new_body(p, out, store):
+    """The new generation's bytes for asset p, or None when it keeps the base object."""
+    if p in UNTOUCHED_ASSETS or p.startswith('/public/images/'):
+        return None
+    old = store.raw(p)
+    if p == DOWNLOAD_SCRIPT_ASSET:
+        body = DOWNLOAD_SCRIPT.read_bytes()
+        return None if body == old else body
+    gz = p.endswith('.gz')
+    obj = out[p[:-3] if gz else p]
+    if json.loads(gzip.decompress(old) if gz else old) == obj:
+        return None
+    body = dumps(obj)
+    return gzip.compress(body, compresslevel=9, mtime=0) if gz else body
 
 
 def select_files(parent, ids):
@@ -417,16 +435,9 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
     if out_dir is not None:
         os.makedirs(out_dir)
     for p in assets:
-        if not rebuilt_asset(p):
+        body = new_body(p, out, store)
+        if body is None:
             continue
-        gz = p.endswith('.gz')
-        obj = out[p[:-3] if gz else p]
-        old = store.raw(p)
-        if json.loads(gzip.decompress(old) if gz else old) == obj:
-            continue
-        body = dumps(obj)
-        if gz:
-            body = gzip.compress(body, compresslevel=9, mtime=0)
         if len(body) > MAX_ASSET_BYTES:
             raise SystemExit(f'asset over 64 MiB: {p}')
         sha = hashlib.sha256(body).hexdigest()
