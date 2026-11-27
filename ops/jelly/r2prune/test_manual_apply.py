@@ -4,6 +4,7 @@
 import contextlib
 import email.utils
 import fcntl
+import gzip
 import hashlib
 import http.server
 import importlib.util
@@ -26,6 +27,9 @@ SHA = 'a' * 64
 RAW = 'managed/acct-47/recordings/1/continuous/1.mp4'
 COL = 'joined/nightly-collation-v2/objects/x.mp4'
 KE = [f'managed/acct-47/ke/{i}.mp4' for i in (1, 2, 3)]
+GEN = 'b' * 32
+ASSET = 'datasets/global-street-scores-delivery/47/assets/a.json'
+SERVED = 'joined/recovery-best14-20261125/objects/served.mp4'
 OUT1, OUT2 = 'joined/goodplus-20260821-generation-1/objects/o1.mp4', 'joined/goodplus-20260821-generation-1/objects/o2.mp4'
 
 # psql stub: answers the catalog lookup from sources.json, the chunk verify from db.json, the
@@ -38,9 +42,13 @@ script = sys.stdin.read()
 args = sys.argv[1:]
 f = args[args.index('-f') + 1] if '-f' in args else ''
 tsv = open('receipt-backfill.tsv').read() if f and os.path.exists('receipt-backfill.tsv') else None
+kind = 'pin' if 'gss_public_generation_pin' in script else 'verify' if 'jsonb_to_recordset' in script else 'stdin'
 with open(S + '/calls.jsonl', 'a') as c:
-    c.write(json.dumps({'psql': os.path.basename(f) or ('verify' if 'jsonb_to_recordset' in script else 'stdin'), 'args': args,
-                        'cwd': os.getcwd(), 'ro': os.environ['PGOPTIONS'].endswith('=on'), 'tsv': tsv, 'script_bytes': len(script)}) + '\n')
+    c.write(json.dumps({'psql': os.path.basename(f) or kind, 'args': args,
+                        'cwd': os.getcwd(), 'ro': 'default_transaction_read_only=on' in os.environ['PGOPTIONS'], 'tsv': tsv, 'script_bytes': len(script)}) + '\n')
+if kind == 'pin':
+    print(open(S + '/pin').read().strip())
+    sys.exit(0)
 if f.endswith('receipt-apply.sql'):
     rc = int(open(S + '/apply.rc').read()) if os.path.exists(S + '/apply.rc') else 0
     if rc:
@@ -71,7 +79,7 @@ if 'jsonb_to_recordset' in script:
         if r['key'] in db['clips']:
             print('\t'.join(['raw', r['key']] + db['clips'][r['key']] + [str(r['key'] in db.get('kept', [])).lower(), '', '']))
     for o in sorted({p['output'] for p in pairs}):
-        print('\t'.join(['output', o] + db['outputs'].get(o, ['0', '', 'false', 'false', 'false'])))
+        print('\t'.join(['output', o] + db['outputs'].get(o, ['0', '', 'false', 'false', 'false', 'false', '', 'false', 'none'])))
     for p in pairs:
         print('\t'.join(['pair', p['raw'], p['output'], 'true' if p['raw'] in db['contains'].get(p['output'], []) else 'false', '', '', '']))
     sys.exit(0)
@@ -122,6 +130,18 @@ sys.exit(int(open(S + '/r2prune.rc').read()) if flag('rc') else 0)
 
 
 class Head(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = Path(os.environ['STUB'], 'bodies', self.path.split('/', 2)[2])
+        if not body.exists():
+            self.send_response(404)
+            self.end_headers()
+            return
+        data = body.read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_HEAD(self):
         objects = json.loads(Path(os.environ['STUB'], 'r2.json').read_text())
         key = self.path.split('/', 2)[2]
@@ -162,6 +182,23 @@ class Base(unittest.TestCase):
         self.root = self.d / 'manual'
         self.W = self.root / 'work'
         self.manifest = self.d / 'delete-manifest.jsonl'
+        # The pinned generation serves SERVED; the plan protects and classifies it.
+        self.serve(GEN, [SERVED])
+        self.plan = self.d / 'plan'
+        self.plan.mkdir()
+        self.protect = self.d / 'protect-db-now.tsv'
+        self.protect.write_text(f'page_link\t{SERVED}\npage_link\t{ASSET}\nstitch_input_hold\tx\n')
+        (self.plan / 'classified.tsv').write_text(f'{SERVED}\t5\tprotect_live_site\tdb:page_link\n{RAW}\t100\tdelete_raw_outside_window\tr\n')
+
+    def serve(self, gen, keys, pin=None):
+        (self.d / 'pin').write_text(pin or gen)
+        body = self.d / 'bodies' / f'{ma.GSS_PREFIX}public/generations/{gen}.json'
+        body.parent.mkdir(parents=True, exist_ok=True)
+        body.write_bytes(gzip.compress(json.dumps({'generation': gen, 'files': {str(i): {'key': k} for i, k in enumerate(keys)},
+                                                   'assets': {'/a.json': {'key': ASSET}}}).encode()))
+
+    def rule_args(self):
+        return ['--summary', str(self.plan / 'summary.json'), '--db-protect', str(self.protect)]
 
     def tearDown(self):
         self.server.shutdown()
@@ -194,7 +231,9 @@ class Base(unittest.TestCase):
     def calls(self, kind=None):
         p = self.d / 'calls.jsonl'
         calls = [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
-        return [c.get('psql', 'r2prune') for c in calls] if kind is None else [c for c in calls if c.get('psql', 'r2prune') == kind]
+        if kind is None:  # the gate's pin read is asserted by the Gate tests
+            return [c.get('psql', 'r2prune') for c in calls if c.get('psql') != 'pin']
+        return [c for c in calls if c.get('psql', 'r2prune') == kind]
 
     def applied(self):
         """{key: deleted_at} over every receipt-apply.sql call."""
@@ -214,7 +253,7 @@ class ListingMode(Base):
 
     def delete(self, *extra):
         return self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
-                            '--summary', 's.json', '--fresh-listing', str(self.listing), *extra)
+                            *self.rule_args(), '--fresh-listing', str(self.listing), *extra)
 
     def test_apply_writes_receipts_through_receipt_apply(self):
         self.delete()
@@ -226,8 +265,9 @@ class ListingMode(Base):
         self.assertEqual({r[12] for r in rows}, {policy})
         self.assertEqual(self.calls(), ['stdin', 'dry-run.sql', 'r2prune', 'receipt-apply.sql'])
         calls = [json.loads(l) for l in (self.d / 'calls.jsonl').read_text().splitlines()]
-        self.assertEqual([c['ro'] for c in calls if 'psql' in c], [True, True, False])
-        apply = calls[-1]
+        self.assertEqual([(c['psql'], c['ro']) for c in calls if 'psql' in c],
+                         [('stdin', True), ('pin', True), ('dry-run.sql', True), ('receipt-apply.sql', False), ('pin', True)])
+        apply = [c for c in calls if c.get('psql') == 'receipt-apply.sql'][-1]
         self.assertEqual((apply['cwd'], apply['args'][apply['args'].index('total=2') - 1]), (str(self.W), '-v'))
         self.assertNotIn('secretpw', json.dumps(calls))
         self.assertTrue(self.result()['complete'])
@@ -469,16 +509,20 @@ class Backfill(Base):
 
 
 class ChunkVerify(Base):
+    CLS, FLAG = ma.KE_CLASS, '--ke-coverage'
+
     def setUp(self):
         super().setUp()
-        self.write_manifest([(k, ma.KE_CLASS) for k in KE])
+        self.write_manifest([(k, self.CLS) for k in KE])
         self.sources({k: ('raw', 11 + i, 'e1') for i, k in enumerate(KE)})
         self.coverage = self.d / 'ke-coverage.tsv'
         self.coverage.write_text(f'{KE[0]}\t100\t{OUT1}\t500\n{KE[1]}\t100\t{OUT1}\t500\n{KE[2]}\t100\t{OUT2}\t600\n'
                                  f'{KE[2]}\t999\t{OUT1}\t500\n')
         self.r2({**{k: [100, 'e1', 1] for k in KE}, OUT1: [500, 'o1', 5], OUT2: [600, 'o2', 6]})
+        # [rows, size, receipt, reservation, nonraw intent, collated, delivery hold size:etag, owner keep, NAS restore]
         self.db({'clips': {k: ['100', 'true'] for k in KE},
-                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false'], OUT2: ['1', '600', 'false', 'false', 'false']},
+                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false', 'true', '500:o1', 'true', 'none'],
+                             OUT2: ['1', '600', 'false', 'false', 'false', 'true', '', 'true', 'verified']},
                  'contains': {OUT1: KE[:2], OUT2: KE[2:]}})
 
     def r2(self, objects):
@@ -487,9 +531,12 @@ class ChunkVerify(Base):
     def db(self, db):
         (self.d / 'db.json').write_text(json.dumps(db))
 
-    def delete(self, *wrapper, extra=()):
+    def delete(self, *wrapper, extra=(), full=False):
+        # A bounded run unless full: an unbounded one needs a canary first (test_an_unbounded_run_needs_a_canary).
+        if not full and '--chunks' not in wrapper:
+            wrapper += ('--chunks', '99')
         return self.run_cli('delete', *wrapper, str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
-                            '--summary', 's.json', '--ke-coverage', str(self.coverage), *extra)
+                            *self.rule_args(), self.FLAG, str(self.coverage), *extra)
 
     def listings(self):
         return [sorted(l.split('\t')[0] for l in p.read_text().splitlines()) for p in sorted(self.W.glob('listing-*.tsv'))]
@@ -510,7 +557,8 @@ class ChunkVerify(Base):
     def test_a_cover_under_owner_keep_still_covers(self):
         # collation_v2_recovery_held keeps every cover of the 2026-11-25 canary: the protection a sole copy needs
         db = json.loads((self.d / 'db.json').read_text())
-        self.db({**db, 'kept': [OUT1, OUT2]})
+        owner = ['1', '500', 'false', 'false', 'false', 'true', '', 'true', 'none']
+        self.db({**db, 'outputs': {OUT1: owner, OUT2: owner[:1] + ['600'] + owner[2:]}})
         self.delete('--chunk', '2')
         self.assertEqual(set(self.applied()), set(KE))
         self.assertTrue(self.result()['complete'])
@@ -556,13 +604,22 @@ class ChunkVerify(Base):
             'raw owner keep': (lambda: self.db({**db, 'kept': [KE[2]]}), 'recording_clips row for ' + KE[2]),
             'clip purged': (lambda: self.db({**db, 'clips': {**db['clips'], KE[2]: ['100', 'false']}}), 'recording_clips row for ' + KE[2]),
             'clip size': (lambda: self.db({**db, 'clips': {**db['clips'], KE[2]: ['101', 'true']}}), 'recording_clips row for ' + KE[2]),
-            'output receipted': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'true', 'false', 'false']}}), OUT2),
-            'output reserved': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'true', 'false']}}), OUT2),
-            'output nonraw intent': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '600', 'false', 'false', 'true']}}), OUT2),
-            'output catalog size': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: ['1', '599', 'false', 'false', 'false']}}), OUT2),
-            'clip left the output': (lambda: self.db({**db, 'contains': {OUT1: KE[:2], OUT2: []}}), 'source_clip_ids of ' + OUT2),
+            'output receipted': (lambda: out2(2, 'true'), OUT2),
+            'output reserved': (lambda: out2(3, 'true'), OUT2),
+            'output nonraw intent': (lambda: out2(4, 'true'), OUT2),
+            'output catalog size': (lambda: out2(1, '599'), OUT2),
+            'output two catalog rows': (lambda: out2(0, '2'), OUT2),
+            'output hour not collated': (lambda: out2(5, 'false'), OUT2),
+            'output unheld': (lambda: out2(7, 'false'), OUT2),
+            'output with only a delivery keep hold': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: db['outputs'][OUT2][:6] + ['600:o2', 'false', 'none']}}), OUT2),
+            'output restore unverified': (lambda: out2(8, 'unverified'), OUT2),
+            'clip left the output or its span': (lambda: self.db({**db, 'contains': {OUT1: KE[:2], OUT2: []}}), 'source_clip_ids of ' + OUT2),
             'output in another open intent': (other_intent, "another open intent's manifest"),
         }
+        def out2(i, value):
+            row = list(db['outputs'][OUT2])
+            row[i] = value
+            self.db({**db, 'outputs': {**db['outputs'], OUT2: row}})
         for name, (break_it, message) in cases.items():
             with self.subTest(name):
                 self.tearDown()
@@ -577,14 +634,124 @@ class ChunkVerify(Base):
                 self.assertEqual(len(self.listings()), 1)
                 self.assertFalse(self.result()['complete'])
 
-    def test_wrapper_owns_the_fresh_listing_for_class_a(self):
+    def test_wrapper_owns_the_fresh_listing_for_covered_classes(self):
         for extra in (['--fresh-listing', 'f.tsv'], ['--limit', '1']):
             with self.assertRaisesRegex(SystemExit, 'wrapper owns --fresh-listing'):
                 self.delete(extra=extra)
-        self.write_manifest([(KE[0], ma.KE_CLASS), (RAW, 'delete_raw_outside_window')])
-        with self.assertRaisesRegex(SystemExit, 'only that class'):
-            self.delete()
+        for other in ('delete_raw_outside_window', ma.KE_CLASS if self.CLS == ma.BEST14_CLASS else ma.BEST14_CLASS):
+            self.write_manifest([(KE[0], self.CLS), (RAW, other)])
+            with self.assertRaisesRegex(SystemExit, 'only that class'):
+                self.delete()
         self.assertEqual(self.calls(), [])
+
+    def test_an_unbounded_run_needs_a_canary_and_chunks_are_capped(self):
+        with self.assertRaisesRegex(SystemExit, 'run the canary first'):
+            self.delete('--chunk', '2', full=True)
+        for bad in (('--chunk', str(ma.CHUNK + 1), '--chunks', '1'), ('--chunk', '-1', '--chunks', '1'),
+                    ('--chunk', '0', '--chunks', '1'), ('--chunk', '2', '--chunks', '0')):
+            with self.assertRaisesRegex(SystemExit, '--chunk is 1 to'):
+                self.delete(*bad)
+        self.assertNotIn('r2prune', self.calls())
+        self.delete('--chunk', '2', '--chunks', '1')
+        self.delete('--chunk', '2', full=True)
+        self.assertTrue(self.result()['complete'])
+
+    def test_a_pin_move_during_a_chunk_stops_after_its_receipts(self):
+        real = ma.run_r2prune
+
+        def publish_during(*a, **k):
+            out = real(*a, **k)
+            self.serve('c' * 32, [SERVED])
+            return out
+        with unittest.mock.patch.object(ma, 'run_r2prune', publish_during):
+            with self.assertRaisesRegex(SystemExit, 'pinned generation moved'):
+                self.delete('--chunk', '2')
+        self.assertEqual(set(self.applied()), set(KE[:2]))
+
+    def test_the_coverage_flag_must_be_the_classs_own(self):
+        other = '--best14-coverage' if self.FLAG == '--ke-coverage' else '--ke-coverage'
+        with self.assertRaisesRegex(SystemExit, 'pass ' + self.FLAG + ' exactly once'):
+            self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
+                         *self.rule_args(), other, str(self.coverage))
+        self.assertNotIn('r2prune', self.calls())
+
+
+class Best14ChunkVerify(ChunkVerify):
+    """Class (b), best-14 raws inside a served stitched output: the same verify, its own coverage flag."""
+    CLS, FLAG = ma.BEST14_CLASS, '--best14-coverage'
+
+
+class Gate(Best14ChunkVerify):
+    """The served-generation gate: before every chunk, from the generation pinned now."""
+
+    def test_the_pin_is_read_before_and_after_every_chunk(self):
+        self.delete('--chunk', '2')
+        self.assertEqual(len(self.calls('pin')), 4)
+        self.assertTrue(self.result()['complete'])
+
+    def test_a_generation_swap_mid_run_is_caught_before_the_next_chunk(self):
+        self.delete('--chunk', '2', '--chunks', '1')
+        self.serve('c' * 32, [SERVED, 'joined/recovery-best14nas-20261126/objects/new.mp4'])
+        with self.assertRaisesRegex(SystemExit, 'gate: 1 keys served by c{32} have no page_link row'):
+            self.delete('--chunk', '2')
+        self.assertEqual(self.calls().count('r2prune'), 1)
+
+    def test_fails_closed(self):
+        def other_registry():
+            gens = self.d / 'bodies' / f'{ma.GSS_PREFIX}public/generations'
+            (gens / f'{"e" * 32}.json').write_bytes((gens / f'{GEN}.json').read_bytes())
+            (self.d / 'pin').write_text('e' * 32)
+        cases = {
+            'served key in the delete': (lambda: self.serve(GEN, [SERVED, KE[0]]), 'are in this delete'),
+            'served key without page_link': (lambda: self.protect.write_text(f'page_link\t{ASSET}\n'), 'no page_link row'),
+            'served key classified otherwise': (lambda: (self.plan / 'classified.tsv').write_text(
+                f'{SERVED}\t5\tprotect_unclassified\tno_catalog_identity\n'), 'not classified protect_live_site'),
+            'no pin': (lambda: (self.d / 'pin').write_text(''), 'want one generation'),
+            'pin without registry': (lambda: (self.d / 'pin').write_text('d' * 32), 'is not in R2'),
+            'registry of another generation': (other_registry, 'names generation'),
+        }
+        for name, (break_it, message) in cases.items():
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                break_it()
+                with self.assertRaisesRegex(SystemExit, 'gate: .*' + message):
+                    self.delete('--chunk', '2')
+                self.assertNotIn('r2prune', self.calls())
+                self.assertFalse((self.W / 'delete-intent.json').exists())
+
+    def test_protect_served_unions_and_never_removes(self):
+        gss, cycle = self.d / 'gss-protect.tsv', self.d / 'cycle.py'
+        gss.write_text(f'page_link\told1\npage_link\t{SERVED}\n')
+        cycle.write_text('x = 1\n        if rows.count("\\n") < 2:\n            raise ValueError\n')
+        args = ['--gss-protect', str(gss), '--cycle', str(cycle), 'protect-served']
+        out = self.run_cli(*args)
+        self.assertEqual((out[0]['added'], out[0]['rows']), (1, 3))
+        self.assertEqual(gss.read_text(), f'page_link\told1\npage_link\t{SERVED}\npage_link\t{ASSET}\n')
+        self.assertIn('rows.count("\\n") < 3:', cycle.read_text())
+        self.assertEqual(len(list(self.d.glob('gss-protect.tsv.pre-served-*'))), 1)
+        self.assertEqual(self.run_cli(*args)[0]['added'], 0)
+        gss.write_text('stitch_input_hold\tx\n')
+        with self.assertRaisesRegex(SystemExit, 'unexpected row'):
+            self.run_cli(*args)
+        gss.write_text('page_link\ta\n' * 1 + 'page_link\tb\npage_link\tc\npage_link\td\n')
+        with self.assertRaisesRegex(SystemExit, 'threshold at most'):
+            cycle.write_text('if rows.count("\\n") < 99:\n')
+            self.run_cli(*args)
+
+    def test_served_keys_writes_the_pinned_generation(self):
+        out = self.d / 'served.txt'
+        got = self.run_cli('served-keys', str(out))
+        self.assertEqual((got[0]['generation'], got[0]['served_keys']), (GEN, 2))
+        self.assertEqual(out.read_text(), f'{ASSET}\n{SERVED}\n')
+
+    def test_gate_command_on_a_plan(self):
+        (self.plan / 'delete-manifest.jsonl').write_text(self.manifest.read_text())
+        out = self.run_cli('gate', str(self.plan), '--db-protect', str(self.protect))
+        self.assertEqual(out, [{'gate': 'pass', 'generation': GEN, 'served_keys': 2}])
+        self.serve(GEN, [SERVED, KE[1]])
+        with self.assertRaisesRegex(SystemExit, 'are in this delete'):
+            self.run_cli('gate', str(self.plan), '--db-protect', str(self.protect))
 
 
 if __name__ == '__main__':

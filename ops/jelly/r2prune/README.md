@@ -15,18 +15,20 @@ delete modes, chosen by the manifest's classes:
   --manifest plan/delete-manifest.jsonl --expected-sha256 HEX --summary plan/summary.json \
   --fresh-listing snapshot.tsv <the plan's rule flags> [--limit N] [--workers 8]
 
-# verify: a manifest of delete_ke_raw_stitched rows only (class (a)); the wrapper owns --fresh-listing
+# verify: a manifest of one covered class only, delete_ke_raw_stitched (class (a), --ke-coverage)
+# or delete_best14_raw_stitched (class (b), --best14-coverage); the wrapper owns --fresh-listing
 /usr/bin/python3 -I ops/jelly/r2prune/manual_apply.py delete [--chunk 5000] [--chunks K] WORKDIR -- \
   --manifest plan/delete-manifest.jsonl --expected-sha256 HEX --summary plan/summary.json \
-  <the plan's rule flags, including --ke-coverage> [--workers 8]
+  <the plan's rule flags, including the class's coverage flag> [--workers 8]
 ```
 
 Everything after `--` is passed to `r2prune delete` unchanged, except `--ledger`
 (and in verify mode `--fresh-listing`), which the wrapper owns. Use one new
 `WORKDIR` per reviewed manifest; a canary and the full run share it.
 
-`r2prune` itself lives only on unmerged branches (`backend/cmd/r2prune`); the
-binary is `~/stoarama-r2prune-lane/r2prune`. The wrapper does not change it.
+`r2prune`'s source is `backend/cmd/r2prune`; the binary is
+`~/stoarama-r2prune-lane/r2prune` (`go version -m` names the commit it was built
+from). The wrapper does not change it.
 
 ## What the wrapper does
 
@@ -78,25 +80,29 @@ key an earlier attempt really deleted would close without a receipt. A full run
 same command so r2prune settles them. A canary leaves the intent open without
 failing.
 
-### Verify mode (class (a), `delete_ke_raw_stitched`)
+### Verify mode (covered classes (a) `delete_ke_raw_stitched` and (b) `delete_best14_raw_stitched`)
 
-The owner's condition for the class (a) delete: every chunk is re-verified live
+The owner's condition for the covered deletes: every chunk is re-verified live
 right before its own `r2prune` call. A chunk is the previous chunks' unsettled raws
 first, then up to `--chunk` (default 5000) raws not yet sent. For each, read-only:
 
 - **Raw:** R2 HEAD shows the planned size, ETag and mtime; its `recording_clips`
   row has the planned size and `purged_at IS NULL`; the raw key has no owner keep.
-- **Every covering output** (each `--ke-coverage` row at the raw's size): R2 HEAD
-  shows the coverage size; exactly one `recording_collation_outputs` row at that
-  size; the raw's clip is still in its `source_clip_ids`; no
-  `r2_object_retirements` row, `r2_retirement_reservations` row or
-  `r2_nonraw_intents` row for the output key (an owner keep on the output, such as
-  `collation_v2_recovery_held`, is the protection a sole copy must have and is
-  allowed); the output
-  is in no other open intent's manifest (manual workdirs beside `WORKDIR` and lane
+- **Every covering output** (each coverage row at the raw's size): R2 HEAD shows
+  the coverage size; exactly one `recording_collation_outputs` row at that size, in
+  a `collated` hour; the raw's clip is still in its `source_clip_ids` and its
+  catalog `clip_start_at`..`clip_end_at` lies inside the output's
+  `start_at`..`end_at`; the output has an owner keep (such as
+  `collation_v2_recovery_held`), the protection a sole copy must have (a
+  `delivery_keep_holds` row alone blocks no retirement since 0244); no
+  `r2_object_retirements`, `r2_retirement_reservations` or `r2_nonraw_intents` row
+  for the output key; no NAS output restore left unverified; and the output is in
+  no other open intent's manifest (manual workdirs beside `WORKDIR` and lane
   cycles).
 
-**The first mismatch stops the run before that chunk's `r2prune` call.** The
+**The first mismatch stops the run before that chunk's `r2prune` call.** `--chunk`
+is at most 5,000, and a run without `--chunks` is refused until a canary chunk
+(`--chunks 1`) has settled in the workdir. The
 wrapper then writes `listing-<stamp>.tsv` holding only the chunk's verified raws
 (at their planned identity) and their covering outputs (as HEAD reported them),
 and passes it as `--fresh-listing`. r2prune logs every key outside the chunk as
@@ -107,6 +113,65 @@ sent to DELETE (`failed` or unlogged) may already be gone from R2; it is listed 
 its planned identity so r2prune's idempotent DELETE acknowledges it and it gets
 its receipt. A chunk that leaves any of its keys unsettled stops the run; rerun the
 same command. `--chunks K` stops after K chunks (a canary) with the intent open.
+
+### Class (b): best-14 raws the public GSS page serves stitched
+
+Owner, Nov 26: "ok lets just make sure we're deleting the raw clips that we know
+are already stitched. we dont need both". `best14/` builds the `--best14-coverage`
+rows. `extract.py` reads the serving hour records and manifests from the analysis
+snapshot (prod by `hour_id` for any the snapshot lacks), lists R2 under the
+returned prefixes with `r2prune list`, then reads raw catalog rows and output
+holds from prod by key, 5,000 per statement. `best14_coverage.py` is offline. A
+raw is covered only when its clip is `included` in a part of an hour record the
+best-14 ledger serves in the named generation, and that part:
+
+- is the one registered output of that part, in a `collated` hour, verified by
+  the manifest (`payload_chain_matches`, `video_timing_matches`, `edge_decode_ok`);
+- holds the clip's exact catalog bytes (key, size, sha256, ETag) in its
+  `source_clip_ids`, with the clip's catalog time span inside its own;
+- is live in R2 at its catalog size with an owner keep (as above), named by no
+  receipt, reservation or nonraw intent, with no unverified NAS restore, and not a
+  Keep Everything sole copy.
+
+It also stays (an exclusion wins over coverage from any other row of the same raw)
+when the hour is served by a clock assembly or follows one, sits at
+a seam the audit flagged (both hours, any verdict) or holds a reviewer-exception
+clip, or is named by `--exclude-hour`. `--within KEYS` limits coverage to raws the
+owner approved by count. `r2prune` decides `delete_best14_raw_stitched` for a
+non-KE raw with a matching row even inside its 20-day window (the window keeps the
+NAS copy, not the R2 one), but never for Keep Everything, a key with any key or
+prefix protection (a raw still in `gss-protect.tsv` stays `protect_live_site`), a
+derived identity, an unmapped stream or interval, or a recent write. The window
+stitch closure (every source of an output overlapping a window) does not hold a
+covered raw: being such a source is what the coverage row proves. Tests:
+
+```sh
+/usr/bin/python3 -I ops/jelly/r2prune/best14/test_best14_coverage.py -q
+go -C backend test ./cmd/r2prune
+```
+
+### Served-generation gate
+
+Before every `r2prune` call (both modes, every chunk) the wrapper reads the
+generation `gss_public_generation_pin` names now, GETs its registry
+`public/generations/<id>.json` and fails closed unless no key that generation
+serves (files and assets) is in the keys about to be deleted, every one has a
+`page_link` row in the plan's `--db-protect` file, and every one the plan's
+`classified.tsv` (beside `--summary`) lists is `protect_live_site`. Re-deriving it
+per chunk catches a generation swap between chunks; the pin is read again after
+each chunk, and a move during one stops the run once its receipts are written. `manual_apply.py gate PLAN_DIR
+--db-protect FILE` runs the same check on a plan.
+
+`manual_apply.py served-keys OUT` writes the same served keys, one per line, for
+`r2prune --served`: each is `protect_live_site` everywhere, where a `page_link` row
+holds only inside a window or on Keep Everything. A plan meant for a manual delete
+passes it, so the gate's classification check holds for every served key the
+plan lists.
+
+`manual_apply.py protect-served` unions the pinned generation's served keys into
+`~/stoarama-gss-freeze/gss-protect.tsv` under `cycle.lock`. It never removes a row,
+backs up `gss-protect.tsv` and the lane's `cycle.py`, and raises `cycle.py`'s
+short-list threshold to the new count. Run it after every publish.
 
 ## Other commands
 

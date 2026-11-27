@@ -14,6 +14,7 @@ import datetime
 import email.utils
 import enum
 import fcntl
+import gzip
 import hashlib
 import hmac
 import json
@@ -36,10 +37,15 @@ DEFAULTS = {
     'psql': '/opt/homebrew/opt/libpq/bin/psql',
     'db_env': str(Path.home() / 'Build/stoarama/local/recording-supervisor.env'),
     'r2_env': str(Path.home() / 'Build/stoarama/local/render.env'),
+    'gss_protect': str(Path.home() / 'stoarama-gss-freeze/gss-protect.tsv'),
+    'cycle': str(LANE / 'cycle.py'),
 }
 BUCKET = 'stoarama'
 COLLATED = ('joined/goodplus-', 'joined/nightly-collation-v2/', 'joined/best14-20261021/')
 KE_CLASS = 'delete_ke_raw_stitched'  # class (a): Keep Everything raw inside a stitched R2 output
+BEST14_CLASS = 'delete_best14_raw_stitched'  # class (b): best-14 raw inside a stitched output the GSS page serves
+# Covered classes and the r2prune flag naming each one's coverage rows; each runs in verify mode.
+COVERAGE = {KE_CLASS: 'ke-coverage', BEST14_CLASS: 'best14-coverage'}
 OUTCOMES = {'deleted', 'failed', 'skipped_protected', 'skipped_changed'}
 FINAL = OUTCOMES - {'failed'}  # a failed DELETE may still have removed the object
 ABSENT = 'absent_from_fresh_listing'
@@ -52,7 +58,7 @@ ROWS_PER_STATEMENT = 5000
 
 class Mode(enum.Enum):
     LISTING = 'listing'    # the operator's --fresh-listing, pinned for the life of the intent
-    VERIFY = 'verify'      # class (a): the wrapper writes one live-verified listing per chunk
+    VERIFY = 'verify'      # covered classes: the wrapper writes one live-verified listing per chunk
     BACKFILL = 'backfill'  # receipts for a run made without the wrapper; never deletes
 
 
@@ -102,7 +108,9 @@ def pg_env(path, read_only):
     u = urllib.parse.urlsplit(e.pop('DATABASE_URL'))
     e.update(PGHOST=u.hostname or '', PGPORT=str(u.port or 5432), PGUSER=urllib.parse.unquote(u.username or ''),
              PGPASSWORD=urllib.parse.unquote(u.password or ''), PGDATABASE=u.path.lstrip('/'),
-             PGOPTIONS='-c default_transaction_read_only=' + ('on' if read_only else 'off'))
+             # A read-only statement runs under the capped read-only path's limits (sqlro.py): work_mem 32MB, 5 min.
+             PGOPTIONS='-c default_transaction_read_only=on -c work_mem=32MB -c statement_timeout=300000' if read_only
+             else '-c default_transaction_read_only=off')
     for k, v in urllib.parse.parse_qsl(u.query):
         if k == 'sslmode':
             e['PGSSLMODE'] = v
@@ -164,7 +172,7 @@ def receipt_ready(key, size, etag, source):
 
 # Exactly one catalog row per key, with the identity receipt-apply.sql verifies.
 SOURCES_SQL = """BEGIN READ ONLY;
-SET LOCAL statement_timeout='900s';
+SET LOCAL statement_timeout='300s';
 COPY (
  WITH k AS (SELECT DISTINCT key FROM jsonb_array_elements_text(:'keys'::jsonb) key)
  SELECT k.key, 'raw', c.id, r.stream_id, c.size_bytes, lower(c.sha256), btrim(c.etag,'"')
@@ -452,7 +460,7 @@ def open_intents(roots):
                 yield path.parent, Path(intent.get('manifest') or path.parent / 'plan/delete-manifest.jsonl')
 
 
-# ---- class (a): live re-verify of each chunk before its r2prune call ----
+# ---- covered classes (a) and (b): live re-verify of each chunk before its r2prune call ----
 
 def r2_store(path):
     e = env_file(path)
@@ -461,8 +469,8 @@ def r2_store(path):
             'bucket': e['R2_BUCKET']}
 
 
-def r2_head(store, key):
-    """(size, etag, mtime) of a live R2 object, or None when absent. SigV4, region auto, path style."""
+def r2_request(store, method, key):
+    """(headers, body) of one signed R2 request, or None when the key is absent. SigV4, region auto, path style."""
     path = urllib.parse.quote(f'/{store["bucket"]}/{key}', safe='/')
     for attempt in range(8):
         at = now_utc()
@@ -470,7 +478,7 @@ def r2_head(store, key):
         payload = hashlib.sha256(b'').hexdigest()
         headers = {'host': urllib.parse.urlsplit(store['endpoint']).netloc, 'x-amz-content-sha256': payload, 'x-amz-date': amz}
         signed = ';'.join(sorted(headers))
-        canonical = '\n'.join(['HEAD', path, ''] + [f'{k}:{headers[k]}' for k in sorted(headers)] + ['', signed, payload])
+        canonical = '\n'.join([method, path, ''] + [f'{k}:{headers[k]}' for k in sorted(headers)] + ['', signed, payload])
         scope = f'{day}/auto/s3/aws4_request'
         k = ('AWS4' + store['secret']).encode()
         for part in (day, 'auto', 's3', 'aws4_request'):
@@ -479,23 +487,84 @@ def r2_head(store, key):
                        hashlib.sha256).hexdigest()
         headers['authorization'] = f'AWS4-HMAC-SHA256 Credential={store["access"]}/{scope}, SignedHeaders={signed}, Signature={sig}'
         try:
-            with urllib.request.urlopen(urllib.request.Request(store['endpoint'] + path, method='HEAD', headers=headers), timeout=60) as r:
-                return (int(r.headers['Content-Length']), r.headers['ETag'].strip('"'),
-                        int(email.utils.parsedate_to_datetime(r.headers['Last-Modified']).timestamp()))
+            with urllib.request.urlopen(urllib.request.Request(store['endpoint'] + path, method=method, headers=headers), timeout=60) as r:
+                return r.headers, r.read() if method == 'GET' else b''
         except urllib.error.HTTPError as err:
             if err.code == 404:
                 return None
             if err.code not in (429, 500, 502, 503, 504) or attempt == 7:
-                raise SystemExit(f'R2 HEAD {key}: HTTP {err.code}')
+                raise SystemExit(f'R2 {method} {key}: HTTP {err.code}')
         except (urllib.error.URLError, OSError) as err:
             if attempt == 7:
-                raise SystemExit(f'R2 HEAD {key}: {type(err).__name__}')
+                raise SystemExit(f'R2 {method} {key}: {type(err).__name__}')
         time.sleep(2 ** attempt)
 
 
+def r2_head(store, key):
+    """(size, etag, mtime) of a live R2 object, or None when absent."""
+    got = r2_request(store, 'HEAD', key)
+    if got is None:
+        return None
+    h = got[0]
+    return int(h['Content-Length']), h['ETag'].strip('"'), int(email.utils.parsedate_to_datetime(h['Last-Modified']).timestamp())
+
+
+# ---- served-generation gate: before the plan is used and before every delete chunk ----
+
+GSS_PREFIX = 'datasets/global-street-scores-delivery/47/'
+PIN_SQL = """BEGIN READ ONLY;
+COPY (SELECT generation FROM gss_public_generation_pin) TO STDOUT;
+ROLLBACK;
+"""
+
+
+def served_keys(cfg, store):
+    """(generation, every R2 key it serves): the generation gss_public_generation_pin names now, read
+    from its registry public/generations/<id>.json (gzip), its files and assets."""
+    rows = read_only_copy(cfg, PIN_SQL)
+    if [len(r) for r in rows] != [1] or not re.fullmatch('[0-9a-f]{32}', rows[0][0]):
+        raise SystemExit(f'gate: gss_public_generation_pin reads {rows}, want one generation')
+    gen = rows[0][0]
+    got = r2_request(store, 'GET', f'{GSS_PREFIX}public/generations/{gen}.json')
+    if got is None:
+        raise SystemExit(f'gate: the registry of pinned generation {gen} is not in R2')
+    body = got[1]
+    registry = json.loads(gzip.decompress(body) if body[:2] == b'\x1f\x8b' else body)
+    if registry.get('generation') != gen or not registry.get('files'):
+        raise SystemExit(f'gate: registry of {gen} names generation {registry.get("generation")} with {len(registry.get("files") or {})} files')
+    return gen, {f['key'] for f in registry['files'].values()} | {a['key'] for a in registry['assets'].values()}
+
+
+def gate(cfg, store, delete_keys, protect_path, classified_path):
+    """Fails closed unless no key the pinned generation serves is about to be deleted, every one has a
+    page_link row in the plan's protect input, and every one the plan classified is protect_live_site."""
+    gen, served = served_keys(cfg, store)
+    hit = served & set(delete_keys)
+    if hit:
+        raise SystemExit(f'gate: {len(hit)} keys served by {gen} are in this delete, e.g. {sorted(hit)[0]}')
+    page = set()
+    with open(protect_path, encoding='utf-8') as f:
+        for line in f:
+            reason, _, key = line.rstrip('\n').partition('\t')
+            if reason == 'page_link':
+                page.add(key)
+    unprotected = served - page
+    if unprotected:
+        raise SystemExit(f'gate: {len(unprotected)} keys served by {gen} have no page_link row in {protect_path}, e.g. {sorted(unprotected)[0]}')
+    wrong = []
+    with open(classified_path, encoding='utf-8') as f:
+        for line in f:
+            key, _, cls, _ = line.rstrip('\n').split('\t', 3)
+            if key in served and cls != 'protect_live_site':
+                wrong.append((key, cls))
+    if wrong:
+        raise SystemExit(f'gate: {len(wrong)} keys served by {gen} are not classified protect_live_site, e.g. {wrong[0]}')
+    return gen, len(served)
+
+
 def load_coverage(path, manifest):
-    """{raw key: [(output key, output size)]}: the --ke-coverage rows r2prune would match for
-    each manifest raw (raw_size equal to the planned size)."""
+    """{raw key: [(output key, output size)]}: the coverage rows r2prune would match for each
+    manifest raw (raw_size equal to the planned size)."""
     cover = {}
     with open(path, encoding='utf-8') as f:
         for line in f:
@@ -504,27 +573,40 @@ def load_coverage(path, manifest):
                 cover.setdefault(raw, []).append((out, int(out_size)))
     missing = [k for k in manifest if k not in cover]
     if missing:
-        raise SystemExit(f'{len(missing)} manifest keys have no --ke-coverage row at their size, e.g. {missing[0]}')
+        raise SystemExit(f'{len(missing)} manifest keys have no coverage row at their size, e.g. {missing[0]}')
     return cover
 
 
+# A covering output is registered (one catalog row at its HEAD size), in a collated hour, keep-held
+# (an exact, unexempted delivery keep hold or an owner keep), named by no receipt, reservation or
+# nonraw intent, and not a NAS restore left unverified; each raw's clip is in its source_clip_ids
+# and its catalog time span lies inside the output's.
 VERIFY_SQL = """BEGIN READ ONLY;
-SET LOCAL statement_timeout='900s';
+SET LOCAL statement_timeout='300s';
 COPY (
  WITH r AS (SELECT * FROM jsonb_to_recordset(:'raws'::jsonb) AS x(key text, clip bigint)),
       p AS (SELECT * FROM jsonb_to_recordset(:'pairs'::jsonb) AS x(raw text, clip bigint, output text)),
       o AS (SELECT DISTINCT output AS key FROM p)
- SELECT 'raw', r.key, c.size_bytes::text, (c.purged_at IS NULL)::text, r2_owner_keep_held('stoarama',r.key)::text, NULL, NULL
+ SELECT 'raw', r.key, c.size_bytes::text, (c.purged_at IS NULL)::text, r2_owner_keep_held('stoarama',r.key)::text,
+  NULL, NULL, NULL, NULL, NULL, NULL
  FROM r JOIN recording_clips c ON c.id=r.clip AND c.bucket='stoarama' AND c.object_key=r.key
  UNION ALL
  SELECT 'output', o.key, count(x.id)::text, min(x.size_bytes)::text,
   EXISTS(SELECT FROM r2_object_retirements z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
   EXISTS(SELECT FROM r2_retirement_reservations z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
-  EXISTS(SELECT FROM r2_nonraw_intents z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text
- FROM o LEFT JOIN recording_collation_outputs x ON x.object_key=o.key GROUP BY o.key
+  EXISTS(SELECT FROM r2_nonraw_intents z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
+  coalesce(bool_and(h.status='collated'), false)::text,
+  coalesce((SELECT d.size_bytes::text||':'||btrim(d.etag,'"') FROM delivery_keep_holds d
+            WHERE d.bucket='stoarama' AND d.object_key=o.key AND NOT r2_delivery_exempt('stoarama',o.key)), ''),
+  r2_owner_keep_held('stoarama',o.key)::text,
+  (SELECT CASE WHEN count(*)=0 THEN 'none' WHEN bool_or(q.state='verified') THEN 'verified' ELSE 'unverified' END
+   FROM recording_collation_outputs y JOIN nas_restore_requests q ON q.output_id=y.id AND q.target='output' WHERE y.object_key=o.key)
+ FROM o LEFT JOIN recording_collation_outputs x ON x.object_key=o.key LEFT JOIN recording_collation_hours h ON h.id=x.collation_hour_id
+ GROUP BY o.key
  UNION ALL
- SELECT 'pair', p.raw, p.output, EXISTS(SELECT FROM recording_collation_outputs x
-   WHERE x.object_key=p.output AND p.clip=ANY(x.source_clip_ids))::text, NULL, NULL, NULL
+ SELECT 'pair', p.raw, p.output, EXISTS(SELECT FROM recording_collation_outputs x JOIN recording_clips c ON c.id=p.clip
+   WHERE x.object_key=p.output AND p.clip=ANY(x.source_clip_ids)
+    AND c.clip_start_at>=x.start_at AND c.clip_start_at<c.clip_end_at AND c.clip_end_at<=x.end_at)::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL
  FROM p
 ) TO STDOUT WITH (FORMAT csv, DELIMITER E'\\t');
 ROLLBACK;
@@ -562,17 +644,20 @@ def verify_chunk(cfg, store, batch, manifest, sources, cover, attempted, held):
         if got is None or got[2:5] != [str(manifest[k]['size']), 'true', 'false']:
             raise SystemExit(f'verify: recording_clips row for {k} [size, purged_at NULL, owner keep] is {got and got[2:5]}, '
                              f'want size {manifest[k]["size"]}, purged_at NULL and no owner keep')
-    # A covering output's owner keep (e.g. collation_v2_recovery_held) is the protection a
-    # sole copy must have, so it is not checked here; a raw's owner keep refuses above.
+    # A covering output's owner keep (such as collation_v2_recovery_held) is the protection a sole copy
+    # must have, so it is required: a delivery keep hold alone blocks no retirement since 0244. A raw's
+    # owner keep refuses above.
     for o in outputs:
         got = db[('output', o)]
-        if got[2:7] != ['1', str(heads[o][0]), 'false', 'false', 'false']:
-            raise SystemExit(f'verify: covering output {o} catalog [rows, size, receipt, reservation, nonraw intent] '
-                             f'is {got[2:7]}, want one row at size {heads[o][0]} with none of the others')
+        size = heads[o][0]
+        if got[2:8] != ['1', str(size), 'false', 'false', 'false', 'true'] or got[9] != 'true' or got[10] == 'unverified':
+            raise SystemExit(f'verify: covering output {o} catalog [rows, size, receipt, reservation, nonraw intent, collated, '
+                             f'delivery hold, owner keep, NAS restore] is {got[2:11]}, want one collated row at size {size}, '
+                             f'none of the others, an owner keep, and no unverified restore')
     for k in batch:
         for o, _ in cover[k]:
             if db[('pair', k, o)][3] != 'true':
-                raise SystemExit(f'verify: {k} is no longer in source_clip_ids of {o}')
+                raise SystemExit(f'verify: {k} is no longer in source_clip_ids of {o} with its time span inside it')
     return ''.join('\t'.join(map(str, r)) + '\n' for r in sorted(rows))
 
 
@@ -600,16 +685,17 @@ def delete(cfg, W, args, lock_fd):
         raise SystemExit('manifest digest differs from --expected-sha256')
     manifest = read_manifest(manifest_path)
     classes = {row['class'] for row in manifest.values()}
-    mode = Mode.VERIFY if KE_CLASS in classes else Mode.LISTING
+    covered = classes & COVERAGE.keys()
+    mode = Mode.VERIFY if covered else Mode.LISTING
     if mode is Mode.VERIFY:
-        if classes != {KE_CLASS}:
-            raise SystemExit(f'a {KE_CLASS} manifest must hold only that class; plan it separately')
+        if len(classes) != 1:
+            raise SystemExit(f'a {"/".join(sorted(covered))} manifest must hold only that class; plan it separately')
         if options(args, 'fresh-listing') or options(args, 'limit'):
-            raise SystemExit(f'for {KE_CLASS} the wrapper owns --fresh-listing and chunks with --chunk/--chunks; drop --fresh-listing and --limit')
+            raise SystemExit(f'for {classes.pop()} the wrapper owns --fresh-listing and chunks with --chunk/--chunks; drop --fresh-listing and --limit')
         listing_sha = None
     else:
         if cfg.chunk is not None or cfg.chunks is not None:
-            raise SystemExit(f'--chunk and --chunks apply only to {KE_CLASS} manifests')
+            raise SystemExit(f'--chunk and --chunks apply only to {" and ".join(sorted(COVERAGE))} manifests')
         listing_sha = sha(one_option(args, 'fresh-listing'))
     Path(W).mkdir(parents=True, exist_ok=True)
     intent_path = Path(W, 'delete-intent.json')
@@ -630,8 +716,13 @@ def delete(cfg, W, args, lock_fd):
         intent = {'mode': mode.value, 'manifest': manifest_path, 'manifest_sha256': expected,
                   'sources_sha256': sha(Path(W, 'receipt-sources.json')), 'fresh_listing_sha256': listing_sha}
 
+    store = r2_store(cfg.r2_env)
+    protect_path = one_option(args, 'db-protect')
+    classified_path = str(Path(one_option(args, 'summary')).parent / 'classified.tsv')
+
     def call(keys, listing):
-        """Preflight, bind the intent, one r2prune call, then its receipts."""
+        """Served-generation gate, preflight, bind the intent, one r2prune call, then its receipts."""
+        gen = gate(cfg, store, keys, protect_path, classified_path)[0]
         preflight(cfg, W, keys, manifest, sources, expected)
         if not intent_path.exists():
             durable_write(intent_path, json.dumps(intent) + '\n')
@@ -641,6 +732,9 @@ def delete(cfg, W, args, lock_fd):
         st = finish_receipts(cfg, W, only=ledger)
         if rc:
             raise SystemExit(f'r2prune delete exited {rc}; receipts for its acknowledged deletes are written')
+        now = served_keys(cfg, store)[0]
+        if now != gen:  # a publish during the call: its keys were not gated; stop loudly
+            raise SystemExit(f'the pinned generation moved from {gen} to {now} during this chunk; receipts are written, rerun to gate')
         return st
 
     if mode is Mode.LISTING:
@@ -650,12 +744,15 @@ def delete(cfg, W, args, lock_fd):
                              'rerun the same command with the same --fresh-listing')
         return
 
-    store = r2_store(cfg.r2_env)
-    cover = load_coverage(one_option(args, 'ke-coverage'), manifest)
+    cover = load_coverage(one_option(args, COVERAGE[next(iter(classes))]), manifest)
     held = set()
     for other, path in open_intents({Path(W).parent, Path(cfg.lane_cycles)}):
         if other != Path(W):
             held |= read_manifest(path).keys()
+    if not 1 <= (CHUNK if cfg.chunk is None else cfg.chunk) <= CHUNK or (cfg.chunks is not None and cfg.chunks < 1):
+        raise SystemExit(f'--chunk is 1 to {CHUNK} (one live verify covers one chunk) and --chunks at least 1')
+    if cfg.chunks is None and not State(W, intent, manifest).final:
+        raise SystemExit('run the canary first: --chunks 1, then check it, then rerun without --chunks')
     for n in range(cfg.chunks or sys.maxsize):
         st = State(W, intent, manifest)
         batch = (sorted(st.unresolved & st.attempted) + [k for k in manifest if k not in st.attempted])[:cfg.chunk or CHUNK]
@@ -716,6 +813,55 @@ def backfill(cfg, W, manifest_path, ledger_path, defer_blocked):
                          'they may or may not be gone from R2 and need their own reconciliation')
 
 
+def protect_served(cfg):
+    """Unions every key the pinned generation serves into gss-protect.tsv as page_link, under
+    cycle.lock (waits up to 20 min). Never removes a row: refuses a result with fewer rows. Backs up
+    gss-protect.tsv and cycle.py, replaces both atomically, and raises cycle.py's short-list threshold
+    to the new row count."""
+    with open(cfg.lock, 'a') as lock:
+        for _ in range(120):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(10)
+        else:
+            raise SystemExit(f'{cfg.lock} busy for 20 min')
+        gen, served = served_keys(cfg, r2_store(cfg.r2_env))
+        text = Path(cfg.gss_protect).read_text(encoding='utf-8')
+        rows = text.splitlines()
+        have = set()
+        for line in rows:
+            reason, _, key = line.partition('\t')
+            if reason != 'page_link' or not key:
+                raise SystemExit(f'{cfg.gss_protect}: unexpected row {line!r}')
+            have.add(key)
+        add = sorted(served - have)
+        if not add:
+            print(json.dumps({'generation': gen, 'served_keys': len(served), 'added': 0, 'rows': len(rows)}))
+            return
+        new = text + ''.join(f'page_link\t{k}\n' for k in add)
+        n = new.count('\n')
+        if n < len(rows) or not text.endswith('\n'):
+            raise SystemExit('refusing a gss-protect.tsv with fewer rows')
+        src = Path(cfg.cycle).read_text(encoding='utf-8')
+        found = re.findall(r'if rows\.count\("\\n"\) < (\d+):', src)
+        if len(found) != 1 or int(found[0]) > n:
+            raise SystemExit(f'{cfg.cycle}: want one short-list threshold at most {n}, found {found}')
+        stamp = now_utc().strftime('%Y%m%dT%H%M%SZ')
+        for path in (cfg.gss_protect, cfg.cycle):
+            backup = f'{path}.pre-served-{gen[:8]}-{stamp}'
+            Path(backup).write_bytes(Path(path).read_bytes())
+            os.chmod(backup, os.stat(path).st_mode & 0o777)
+        threshold = re.sub(r'(if rows\.count\("\\n"\) < )\d+:', lambda m: f'{m[1]}{n}:', src)
+        for path, body in ((cfg.gss_protect, new), (cfg.cycle, threshold)):
+            mode = os.stat(path).st_mode & 0o777
+            durable_write(path, body)
+            os.chmod(path, mode)
+        print(json.dumps({'generation': gen, 'served_keys': len(served), 'added': len(add), 'rows': n,
+                          'gss_protect_sha256': sha(cfg.gss_protect)}))
+
+
 def status(roots):
     n = 0
     for W, _ in open_intents(roots):
@@ -736,8 +882,8 @@ def main(argv):
         p.add_argument('--' + k.replace('_', '-'), default=v)
     sub = p.add_subparsers(dest='cmd', required=True)
     d = sub.add_parser('delete', help='resolve receipt sources, preflight, run r2prune delete, write receipts')
-    d.add_argument('--chunk', type=int, help=f'{KE_CLASS}: raws live-verified per r2prune call (default {CHUNK})')
-    d.add_argument('--chunks', type=int, help=f'{KE_CLASS}: stop after this many chunks (a canary)')
+    d.add_argument('--chunk', type=int, help=f'covered classes: raws live-verified per r2prune call (default {CHUNK})')
+    d.add_argument('--chunks', type=int, help='covered classes: stop after this many chunks (a canary)')
     d.add_argument('workdir')
     d.add_argument('args', nargs=argparse.REMAINDER, help='-- then the r2prune delete arguments (not --ledger)')
     r = sub.add_parser('receipts', help='write the receipts of a workdir whose intent is still open')
@@ -748,11 +894,29 @@ def main(argv):
     b.add_argument('--ledger', required=True)
     b.add_argument('--defer-blocked', action='store_true',
                    help='apply every receipt the dry run admits; record held keys in deferred-blocked.tsv and keep the intent open')
+    k = sub.add_parser('served-keys', help='write the pinned generation\'s served keys, one per line (r2prune --served)')
+    k.add_argument('out')
+    sub.add_parser('protect-served', help='union the pinned generation\'s served keys into gss-protect.tsv (after a publish)')
+    g = sub.add_parser('gate', help='the served-generation gate on a plan, read-only; exits non-zero on failure')
+    g.add_argument('plan', help='r2prune plan --out directory (delete-manifest.jsonl, classified.tsv)')
+    g.add_argument('--db-protect', required=True)
     s = sub.add_parser('status', help='list open delete intents under each root; exits non-zero if any')
     s.add_argument('roots', nargs='+')
     cfg = p.parse_args(argv)
     if cfg.cmd == 'status':
         return status(cfg.roots)
+    if cfg.cmd == 'served-keys':
+        gen, served = served_keys(cfg, r2_store(cfg.r2_env))
+        durable_write(cfg.out, ''.join(k + '\n' for k in sorted(served)))
+        print(json.dumps({'generation': gen, 'served_keys': len(served), 'sha256': sha(cfg.out)}))
+        return
+    if cfg.cmd == 'protect-served':
+        return protect_served(cfg)
+    if cfg.cmd == 'gate':
+        gen, n = gate(cfg, r2_store(cfg.r2_env), read_manifest(Path(cfg.plan, 'delete-manifest.jsonl')), cfg.db_protect,
+                      Path(cfg.plan, 'classified.tsv'))
+        print(json.dumps({'gate': 'pass', 'generation': gen, 'served_keys': n}))
+        return
     W = str(Path(cfg.workdir).resolve())
     with open(cfg.lock, 'a') as lock:
         try:
