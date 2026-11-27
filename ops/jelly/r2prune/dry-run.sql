@@ -11,7 +11,7 @@
 \set ON_ERROR_STOP on
 \set tsv `cat receipt-backfill.tsv`
 BEGIN READ ONLY;
-SET LOCAL statement_timeout = '900s';
+SET LOCAL statement_timeout = '300s';
 WITH b AS MATERIALIZED (
   SELECT split_part(l,E'\t',1)::bigint AS seq, split_part(l,E'\t',2) AS kind, split_part(l,E'\t',3)::bigint AS source_id,
          split_part(l,E'\t',4)::bigint AS stream_id, split_part(l,E'\t',5) AS object_key, split_part(l,E'\t',6)::bigint AS size_bytes,

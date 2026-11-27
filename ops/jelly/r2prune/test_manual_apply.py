@@ -40,7 +40,7 @@ f = args[args.index('-f') + 1] if '-f' in args else ''
 tsv = open('receipt-backfill.tsv').read() if f and os.path.exists('receipt-backfill.tsv') else None
 with open(S + '/calls.jsonl', 'a') as c:
     c.write(json.dumps({'psql': os.path.basename(f) or ('verify' if 'jsonb_to_recordset' in script else 'stdin'), 'args': args,
-                        'cwd': os.getcwd(), 'ro': os.environ['PGOPTIONS'].endswith('=on'), 'tsv': tsv, 'script_bytes': len(script)}) + '\n')
+                        'cwd': os.getcwd(), 'ro': 'default_transaction_read_only=on' in os.environ['PGOPTIONS'], 'tsv': tsv, 'script_bytes': len(script)}) + '\n')
 if f.endswith('receipt-apply.sql'):
     rc = int(open(S + '/apply.rc').read()) if os.path.exists(S + '/apply.rc') else 0
     if rc:

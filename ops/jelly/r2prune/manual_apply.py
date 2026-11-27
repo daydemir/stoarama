@@ -105,7 +105,9 @@ def pg_env(path, read_only):
     u = urllib.parse.urlsplit(e.pop('DATABASE_URL'))
     e.update(PGHOST=u.hostname or '', PGPORT=str(u.port or 5432), PGUSER=urllib.parse.unquote(u.username or ''),
              PGPASSWORD=urllib.parse.unquote(u.password or ''), PGDATABASE=u.path.lstrip('/'),
-             PGOPTIONS='-c default_transaction_read_only=' + ('on' if read_only else 'off'))
+             # A read-only statement runs under the capped read-only path's limits (sqlro.py): work_mem 32MB, 5 min.
+             PGOPTIONS='-c default_transaction_read_only=on -c work_mem=32MB -c statement_timeout=300000' if read_only
+             else '-c default_transaction_read_only=off')
     for k, v in urllib.parse.parse_qsl(u.query):
         if k == 'sslmode':
             e['PGSSLMODE'] = v
@@ -167,7 +169,7 @@ def receipt_ready(key, size, etag, source):
 
 # Exactly one catalog row per key, with the identity receipt-apply.sql verifies.
 SOURCES_SQL = """BEGIN READ ONLY;
-SET LOCAL statement_timeout='900s';
+SET LOCAL statement_timeout='300s';
 COPY (
  WITH k AS (SELECT DISTINCT key FROM jsonb_array_elements_text(:'keys'::jsonb) key)
  SELECT k.key, 'raw', c.id, r.stream_id, c.size_bytes, lower(c.sha256), btrim(c.etag,'"')
@@ -516,7 +518,7 @@ def load_coverage(path, manifest):
 # nonraw intent, and not a NAS restore left unverified; each raw's clip is in its source_clip_ids
 # and its catalog time span lies inside the output's.
 VERIFY_SQL = """BEGIN READ ONLY;
-SET LOCAL statement_timeout='900s';
+SET LOCAL statement_timeout='300s';
 COPY (
  WITH r AS (SELECT * FROM jsonb_to_recordset(:'raws'::jsonb) AS x(key text, clip bigint)),
       p AS (SELECT * FROM jsonb_to_recordset(:'pairs'::jsonb) AS x(raw text, clip bigint, output text)),
