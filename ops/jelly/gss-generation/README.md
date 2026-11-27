@@ -19,8 +19,8 @@ one-ID `swap` and `rollback` commands are intentionally no longer supported.
 ```text
 gss_gen.py stage DIR
 gss_gen.py verify GENERATION
-gss_gen.py swap EXPECTED_PARENT CANDIDATE
-gss_gen.py rollback EXPECTED_CANDIDATE PARENT
+gss_gen.py swap ATTEMPT_ID EXPECTED_PARENT CANDIDATE
+gss_gen.py rollback ATTEMPT_ID EXPECTED_CANDIDATE PARENT
 ```
 
 A forward swap requires both pointers to name the expected parent. A rollback
@@ -30,6 +30,18 @@ with the object bytes as `If-Match`; database writes use a generation-qualified
 UPDATE. Both exact pointers are read back before reporting success. On a
 failed forward write or uncertain response, the stager attempts conditional
 rollback while holding the same Jelly-local lock.
+
+The controller supplies a fresh UUID (32 lowercase hex characters) for each
+attempt. Under `generation.lock`, Jelly durably records the exact parent and
+candidate before a swap can write either pointer. A rollback first durably
+cancels that attempt, **even if both pointers still name the parent**. An
+original SSH command delayed behind the rollback cannot start later. The
+`generation-attempts/` records must be retained; IDs cannot be reused, and a
+cancelled ID cannot be rebound to a different pair. Mooney records each ID and
+pair in `gss-delivery/cadence/attempts/` before a remote swap is possible.
+Failure to persist the
+cancellation returns 8 rather than claiming rollback. Retrying recovery uses
+the original attempt ID, not a new one.
 
 The cycle also holds a Mooney-local lock across the build, swaps, gates, and
 ledger publication. It arms rollback before invoking the remote swap, so a

@@ -1,5 +1,6 @@
 """Offline tests: object storage and SQL are in-memory, shell commands are fakes."""
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import hashlib
 import importlib.util
@@ -10,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -17,7 +19,7 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('gss_gen', HERE / 'gss_gen.py')
 gss = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gss)
-PARENT, CANDIDATE, OTHER = ('a' * 32, 'b' * 32, 'c' * 32)
+PARENT, CANDIDATE, OTHER, ATTEMPT = ('a' * 32, 'b' * 32, 'c' * 32, 'd' * 32)
 
 
 def body(gen, parent=None):
@@ -86,8 +88,10 @@ def fail():
 class PointerTests(unittest.TestCase):
     def setUp(self):
         self.store = MockStore()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
         self.addCleanup(patch.stopall)
-        patch.multiple(gss, s3=self.store.s3, pg=self.store.pg, B='fake-bucket').start()
+        patch.multiple(gss, s3=self.store.s3, pg=self.store.pg, B='fake-bucket', H=directory.name).start()
         self.output = io.StringIO()
         for redirect in (contextlib.redirect_stdout, contextlib.redirect_stderr):
             context = redirect(self.output)
@@ -95,33 +99,33 @@ class PointerTests(unittest.TestCase):
             self.addCleanup(context.__exit__, None, None, None)
 
     def test_success_and_rollback(self):
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 0)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 0)
         self.assertEqual(self.store.state(), (CANDIDATE, CANDIDATE))
-        self.assertEqual(gss.rollback(CANDIDATE, PARENT), 0)
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
     def test_competing_parent(self):
         self.store.objects[gss.CURRENT] = body(OTHER, PARENT)
         self.store.pin = OTHER
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 3)
-        self.assertEqual(gss.rollback(CANDIDATE, PARENT), 8)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 3)
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
         self.assertEqual(self.store.state(), (OTHER, OTHER))
 
     def test_competing_object_at_cas(self):
         def competitor():
             self.store.objects[gss.CURRENT] = body(OTHER, PARENT)
         self.store.before_put = competitor
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 8)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
         self.assertEqual(self.store.state(), (OTHER, PARENT))
 
     def test_competing_pin_at_cas(self):
         self.store.before_pin = lambda: setattr(self.store, 'pin', OTHER)
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 8)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
         self.assertEqual(self.store.state(), (CANDIDATE, OTHER))
 
     def test_partial_swap(self):
         self.store.before_pin = fail
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 4)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 4)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
     def test_ambiguous_put(self):
@@ -129,7 +133,7 @@ class PointerTests(unittest.TestCase):
             self.store.after_put = lambda: None
             fail()
         self.store.after_put = once
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 4)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 4)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
     def test_ambiguous_pin(self):
@@ -137,31 +141,47 @@ class PointerTests(unittest.TestCase):
             self.store.after_pin = lambda: None
             fail()
         self.store.after_pin = once
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 4)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 4)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
     def test_failed_rollback(self):
         self.store.before_pin = fail
         self.store.after_put = lambda: setattr(self.store, 'before_put', fail)
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 8)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
         self.assertEqual(self.store.state(), (CANDIDATE, PARENT))
         self.assertIn('UNRESOLVED DIVERGENCE', self.output.getvalue())
 
     def test_pin_only_partial_rollback(self):
         self.store.pin = CANDIDATE
-        self.assertEqual(gss.rollback(CANDIDATE, PARENT), 0)
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
     def test_ambiguous_rollback_completed(self):
         self.store.pin = CANDIDATE
         self.store.after_pin = fail
-        self.assertEqual(gss.rollback(CANDIDATE, PARENT), 0)
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
     def test_current_body_must_match_staged(self):
         self.store.objects[gss.CURRENT] = body(PARENT, OTHER)
-        self.assertEqual(gss.swap(PARENT, CANDIDATE), 3)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 3)
         self.assertEqual(self.store.objects[gss.CURRENT], body(PARENT, OTHER))
+
+    def test_cancellation_failure_is_not_reported_as_rollback(self):
+        with patch.object(gss, 'record_attempt', side_effect=OSError('cannot sync attempt')):
+            self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
+        self.assertIn('attempt cancellation not durable', self.output.getvalue())
+
+    def test_attempt_id_cannot_be_reused_or_rebound(self):
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 0)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, OTHER), 8)
+        self.assertEqual(gss.rollback(ATTEMPT, OTHER, PARENT), 8)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
+        self.assertEqual(self.store.state(), (CANDIDATE, CANDIDATE))
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 3)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
 
 
 class CycleTests(unittest.TestCase):
@@ -202,6 +222,7 @@ case "$command" in
   *"gss_gen.py stage "*) echo staged ;;
   *"gss_gen.py swap "*)
     [ "$SCENARIO" != refused ] || exit 3
+    [ "$SCENARIO" != delayed ] || exit 255
     printf '%s' "${command##* }" > "$STATE"
     [ "$SCENARIO" != disconnected ] || exit 255 ;;
   *"gss_gen.py rollback "*)
@@ -247,6 +268,47 @@ esac
         self.assertEqual(p.returncode, 4, p.stderr)
         self.assertNotIn('gss_preview_check.py', self.calls.read_text())
         self.assertEqual(self.state.read_text(), PARENT)
+
+    def test_delayed_swap_after_recovery_keeps_parent_and_ledger(self):
+        # The fake transport loses the swap request before its remote worker
+        # acquires generation.lock. Capture the actual shell's commands, then
+        # execute their ordering against the real pointer and attempt code with
+        # in-memory storage and a file-backed lock/cancellation ledger.
+        p = self.run_cycle('delayed')
+        self.assertEqual(p.returncode, 4, p.stderr)
+        self.assertIn('ROLLBACK VERIFIED', p.stderr)
+        commands = self.calls.read_text().splitlines()
+        swap = next(x.split('gss_gen.py ')[1].split() for x in commands if 'gss_gen.py swap ' in x)
+        rollback = next(x.split('gss_gen.py ')[1].split() for x in commands if 'gss_gen.py rollback ' in x)
+        self.assertEqual(swap[1], rollback[1])
+        self.assertEqual(swap[2:], [PARENT, CANDIDATE])
+        self.assertEqual(rollback[2:], [CANDIDATE, PARENT])
+        self.assertEqual(json.loads((self.records / 'cadence/attempts' / (swap[1] + '.json')).read_text()),
+                         {'parent': PARENT, 'candidate': CANDIDATE})
+        store = MockStore()
+        ready, release = threading.Event(), threading.Event()
+
+        def delayed():
+            ready.set()
+            if not release.wait(5):
+                raise RuntimeError('test did not release delayed swap')
+            return gss.main(swap)
+
+        with patch.multiple(gss, s3=store.s3, pg=store.pg, H=str(self.home),
+                            r2env=lambda: {'R2_BUCKET': 'fake', 'R2_ACCOUNT_ID': 'fake'}):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(delayed)
+                try:
+                    self.assertTrue(ready.wait(5))
+                    self.assertEqual(gss.main(rollback), 0)
+                    self.assertEqual(store.state(), (PARENT, PARENT))
+                finally:
+                    release.set()
+                self.assertEqual(pending.result(timeout=5), 3)
+        self.assertEqual(store.state(), (PARENT, PARENT))
+        self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
+        self.assertEqual(json.loads((self.home / 'generation-attempts' / (swap[1] + '.json')).read_text()),
+                         {'parent': PARENT, 'candidate': CANDIDATE, 'cancelled': True})
 
     def test_failed_rollback_is_unresolved(self):
         p = self.run_cycle('rollback_failed')

@@ -26,7 +26,7 @@ finish() {
       [ ! -f "$OUT.$f.log" ] || tail -3 "$OUT.$f.log" >&2
     done
     echo "PUBLISH FAILED; attempting conditional rollback $GEN -> $PREV" >&2
-    if remote rollback "$GEN" "$PREV"; then
+    if remote rollback "$ATTEMPT" "$GEN" "$PREV"; then
       echo "ROLLBACK VERIFIED $PREV" >&2
       status=4
     else
@@ -77,6 +77,21 @@ print(gen, parent, int(s["availability"]["available"]), int(s["regressed_stream_
 read -r GEN PREV AV REG <<EOF
 $SUMMARY
 EOF
+ATTEMPT=$(python3 -I -c '
+import json, os, pathlib, sys, uuid
+directory = pathlib.Path(sys.argv[1])
+directory.mkdir(mode=0o700, exist_ok=True)
+attempt = uuid.uuid4().hex
+with (directory / (attempt + ".json")).open("x") as f:
+    json.dump({"parent": sys.argv[2], "candidate": sys.argv[3]}, f)
+    f.write("\n"); f.flush(); os.fsync(f.fileno())
+for path in (directory, directory.parent):
+    fd = os.open(path, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+print(attempt)
+' "$G/cadence/attempts" "$PREV" "$GEN")
+echo "Publication attempt $ATTEMPT: $PREV -> $GEN"
 live() {
   response=$(curl -sf "$API") || return 1
   printf '%s\n' "$response" | python3 -I -c "import json,sys; m=json.load(sys.stdin); print(sum(1 for x in (m.get('streams') or m) if x.get('availability')=='available'))"
@@ -93,7 +108,7 @@ rsync -a "$OUT/generation/" "jelly@jellys-mac-mini:stoarama-gss-freeze/$D8/"
 ssh -o BatchMode=yes jelly@jellys-mac-mini "cd ~/stoarama-gss-freeze && /usr/bin/python3 -I gss_gen.py stage $D8 > stage-$D8.log 2>&1 || { tail -3 stage-$D8.log; exit 1; }; tail -1 stage-$D8.log" || { echo "STAGE FAILED $GEN; nothing swapped"; exit 5; }
 # Arm BEFORE SSH: a disconnect may happen after a successful remote write.
 armed=1
-if remote swap "$PREV" "$GEN"; then
+if remote swap "$ATTEMPT" "$PREV" "$GEN"; then
   :
 else
   status=$?

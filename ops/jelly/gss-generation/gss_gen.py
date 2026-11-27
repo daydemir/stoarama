@@ -1,8 +1,8 @@
 # Stage / swap / roll back a GSS public generation built by build_generation.py.
 #   gss_gen.py stage  DIR          create-only asset uploads (sha+ETag checked), hold rows (checked against
 #                                  the live hold of each replaced asset), create-only generations/<id>.json
-#   gss_gen.py swap PARENT CANDIDATE       conditional forward move of both pointers
-#   gss_gen.py rollback CANDIDATE PARENT   conditional repair of either/both pointers
+#   gss_gen.py swap ATTEMPT PARENT CANDIDATE       conditional forward move of both pointers
+#   gss_gen.py rollback ATTEMPT CANDIDATE PARENT   cancel attempt, then repair either/both pointers
 #   gss_gen.py verify ID                   verify both pointers against the staged registry
 # Credentials only via env files; nothing secret is printed.
 import time, csv, gzip, hashlib, json, os, subprocess, sys, urllib.parse
@@ -145,7 +145,57 @@ def move(source, target, bodies, initial):
 FAILURES = (Exception, SystemExit, KeyboardInterrupt)
 
 
-def rollback(candidate, parent):
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def record_attempt(attempt, parent, candidate, *, cancel):
+    """Called under generation.lock. Reserve an ID once, or durably cancel it.
+
+    A rollback may arrive before the original swap acquires the lock. Its
+    cancellation must survive that delayed process (and a process restart).
+    Pending and cancelled IDs are never reusable, even for the same pair.
+    """
+    directory = Path(H) / 'generation-attempts'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    sync_directory(H)
+    path = directory / (generation_id(attempt) + '.json')
+    identity = {'parent': generation_id(parent), 'candidate': generation_id(candidate)}
+    if path.exists():
+        prior = json.loads(path.read_text())
+        if prior not in (dict(identity, cancelled=False), dict(identity, cancelled=True)):
+            raise RuntimeError('publication attempt belongs to a different pair or is invalid')
+        if not cancel:
+            if prior['cancelled']:
+                return False
+            raise RuntimeError('publication attempt already started')
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as f:
+            tmp = f.name
+            json.dump(dict(identity, cancelled=cancel), f, sort_keys=True)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        sync_directory(directory)
+    finally:
+        if tmp is not None:
+            os.unlink(tmp)
+    return True
+
+
+def rollback(attempt, candidate, parent):
+    try:
+        record_attempt(attempt, parent, candidate, cancel=True)
+    except FAILURES as error:
+        print('UNRESOLVED DIVERGENCE: attempt cancellation not durable:', error, file=sys.stderr)
+        return 8
     try:
         bodies = {candidate: staged(candidate), parent: staged(parent)}
         if registry(bodies[candidate]).get('parent_generation') != parent:
@@ -163,7 +213,14 @@ def rollback(candidate, parent):
     return 0
 
 
-def swap(parent, candidate):
+def swap(attempt, parent, candidate):
+    try:
+        if not record_attempt(attempt, parent, candidate, cancel=False):
+            print('REFUSED: publication attempt already cancelled', file=sys.stderr)
+            return 3
+    except FAILURES as error:
+        print('UNRESOLVED DIVERGENCE: attempt reservation failed:', error, file=sys.stderr)
+        return 8
     try:
         bodies = {parent: staged(parent), candidate: staged(candidate)}
         if registry(bodies[candidate]).get('parent_generation') != parent:
@@ -176,7 +233,7 @@ def swap(parent, candidate):
         move(parent, candidate, bodies, initial)
     except FAILURES as error:
         print('swap failed:', error, file=sys.stderr)
-        return 8 if rollback(candidate, parent) else 4
+        return 8 if rollback(attempt, candidate, parent) else 4
     return 0
 
 
@@ -234,14 +291,15 @@ def main(args):
         step, arg = args
         if step == 'verify':
             generation_id(arg)
-    elif len(args) == 3 and args[0] in ('swap', 'rollback'):
-        step, arg, target = args
+    elif len(args) == 4 and args[0] in ('swap', 'rollback'):
+        step, attempt, arg, target = args
+        generation_id(attempt)
         generation_id(arg)
         generation_id(target)
         if arg == target:
             raise ValueError('source and target generations must differ')
     else:
-        raise SystemExit('usage: gss_gen.py stage DIR | verify ID | swap PARENT CANDIDATE | rollback CANDIDATE PARENT')
+        raise SystemExit('usage: gss_gen.py stage DIR | verify ID | swap ATTEMPT PARENT CANDIDATE | rollback ATTEMPT CANDIDATE PARENT')
     E = r2env()
     B = E['R2_BUCKET']
     EP = 'https://%s.r2.cloudflarestorage.com' % E['R2_ACCOUNT_ID']
@@ -254,9 +312,9 @@ def main(args):
         elif step == 'verify':
             verify(arg)
         elif step == 'swap':
-            return swap(arg, target)
+            return swap(attempt, arg, target)
         else:
-            return rollback(arg, target)
+            return rollback(attempt, arg, target)
     return 0
 
 
