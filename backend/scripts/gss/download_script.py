@@ -61,6 +61,7 @@ def save_receipt(receipt,manifest):
 
 FRESH='Copy a fresh command from the page to continue.'
 RETIRED=object()
+MAX_SWITCHES=3  # generation switches allowed before another output completes
 DATASET_API=None
 API_TOKEN=None
 DELIVERY_GENERATION=None
@@ -134,7 +135,9 @@ def storage(t,o,start):
 def direct_request(base,o,start):return storage(ticket(base,o),o,start)
 
 def fetch(base,o,root):
- final=destination(root,o['path']);partial=final.with_name('.output_'+o['sha256']+'.partial')
+ final=destination(root,o['path'])
+ # Keyed by name and checksum: two outputs with the same bytes in one folder never share a partial.
+ partial=final.with_name('.output_'+o['sha256']+'.'+hashlib.sha256(final.name.encode('utf-8')).hexdigest()[:16]+'.partial')
  size=o['size_bytes'];sha=o['sha256']
  if final.exists() or final.is_symlink():
   if final.is_symlink() or not final.is_file() or final.stat().st_size!=size or digest(final)!=sha:raise ValueError('Existing file differs; left untouched: '+str(final))
@@ -228,7 +231,9 @@ def file_identity(o):
 
 def load_manifest(base,path,stream,week,generation):
  """A verified manifest (of generation, or the current one), its outputs limited to week; returns (stream, manifest)."""
- with urllib.request.urlopen(access_request(base,path,generation),timeout=90) as r:m=json.load(r)
+ with urllib.request.urlopen(access_request(base,path,generation),timeout=90) as r:
+  try:m=json.load(r)
+  except Exception as e:raise urllib.error.URLError('incomplete manifest ('+type(e).__name__+')') from None
  recording=validate_manifest(m,stream);published=m.get('generation')
  if published is not None and (not isinstance(published,str) or not re.fullmatch('[a-f0-9]{32}',published) or generation and published!=generation or any(o.get('delivery_generation',published)!=published for o in m['outputs'])):raise ValueError('Invalid published dataset generation')
  if week:m=dict(m,outputs=week_outputs(m,week),selected_week=week)
@@ -239,7 +244,7 @@ def follow(base,path,stream,week,outputs):
  retired=DELIVERY_GENERATION
  for attempt in range(4):
   try:m=load_manifest(base,path,stream,week,None)[1];break
-  except (urllib.error.URLError,TimeoutError,ConnectionError):
+  except OSError:
    if attempt==3:raise
    time.sleep(2**attempt)
  current=m.get('generation')
@@ -250,7 +255,7 @@ def follow(base,path,stream,week,outputs):
   lines=['Stopped: dataset generation %s was retired, and the current generation %s changes this download: %d files added, %d removed, %d changed.'%(retired,current,len(added),len(removed),len(changed))]
   for kind,paths in (('added',added),('removed',removed),('changed',changed)):
    lines+=['  %s: %s'%(kind,p) for p in paths[:5]]+(['  ...and %d more %s'%(len(paths)-5,kind)] if len(paths)>5 else [])
-  lines.append('Every file in this folder is from %s and verified; nothing from %s was downloaded. %s The fresh command keeps unchanged files and refuses any that differ.'%(retired,current,FRESH))
+  lines.append('No files were downloaded from %s. Completed outputs and any partial downloads have been kept. %s The fresh command keeps unchanged files and refuses any that differ.'%(current,FRESH))
   raise GenerationChanged('\n'.join(lines))
  return m
 
@@ -311,7 +316,7 @@ def main():
     print(str(e),file=sys.stderr);return o['id']
  # Bound pending work as well as active sockets for the 70k-file export. After a
  # 410, finish what is in flight, then switch generations once or stop.
- work=collections.deque(enumerate(outputs,1));pending={};retired=[];stopped=None
+ work=collections.deque(enumerate(outputs,1));pending={};retired=[];stopped=None;tried=[]
  with ThreadPoolExecutor(max_workers=a.jobs) as pool:
   while not stopped:
    while work and not retired and len(pending)<a.jobs:
@@ -319,13 +324,16 @@ def main():
    if pending:
     done=next(as_completed(pending));item=pending.pop(done);result=done.result()
     if result is RETIRED:retired.append(item)
-    elif result is not None:failures.append(result)
+    elif result is None:tried.clear()  # progress
+    else:failures.append(result)
     continue
    if not retired:break
-   old=DELIVERY_GENERATION
+   old=DELIVERY_GENERATION;tried.append(old)
+   if len(tried)>MAX_SWITCHES:
+    stopped='Stopped: dataset generations %s were each retired before another file finished. %s'%(', '.join(tried),FRESH);break
    try:m=follow(base,a.manifest,a.stream,a.week,outputs)
    except GenerationChanged as e:stopped=str(e)
-   except (urllib.error.URLError,TimeoutError,ConnectionError,ValueError) as e:stopped='Stopped: dataset generation '+old+' was retired and the current generation could not be checked ('+str(e)+'). '+FRESH
+   except (OSError,ValueError) as e:stopped='Stopped: dataset generation '+old+' was retired and the current generation could not be checked ('+str(e)+'). '+FRESH
    else:
     DELIVERY_GENERATION=m['generation'];save_receipt(receipt,m)
     print('Dataset generation %s was retired; generation %s lists the same %d files, so this download continues on it. Files already downloaded are kept.'%(old,DELIVERY_GENERATION,total),flush=True)
