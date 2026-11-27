@@ -78,6 +78,7 @@ MAX_ASSET_BYTES = 64 << 20
 READY_DAY_CODES = frozenset('R.')
 DAY_CODES = frozenset('RNSs.')
 NO_CAPTURE_STATES = frozenset({'gap_only', 'quarantine_only'})
+FULL_DELIVERY_STATES = frozenset({'all_scheduled_manifests_present', 'verified_original_outputs_quality_unassessed'})
 
 
 class Availability(str, enum.Enum):
@@ -269,13 +270,14 @@ def rebuild(store, recording_ids, present, gen_id, now, refresh_paths=False):
                     u = represented(sel)
                     th[n] = {'minimum_playback_minutes': int(n), 'represented_scheduled_union_seconds': u,
                              'pct_of_schedule': 100 * u / (R['scheduled_slots'] * 3600),
-                             'pct_of_captured_timeline': 100 * u / R['captured_scheduled_seconds'],
+                             'pct_of_captured_timeline': 100 * u / R['captured_scheduled_seconds'] if R['captured_scheduled_seconds'] else 0.0,
                              'pct_of_registered_represented_timeline': 100 * u / U if U else 0.0, 'parts': len(sel)}
                 R['length_thresholds'] = th
             else:
                 R['length_thresholds'] = {}
         if stream_changed:
-            state = 'awaiting_verified_outputs' if not parts else 'partial_registered_delivery' if s['registered_hours'] < R['scheduled_slots'] else R['delivery_state']
+            state = 'awaiting_verified_outputs' if not parts else 'partial_registered_delivery' if s['registered_hours'] < R['scheduled_slots'] \
+                else R['delivery_state'] if R['delivery_state'] in FULL_DELIVERY_STATES else 'all_scheduled_manifests_present'
             R['delivery_state'] = state
             if 'delivery_state' in s:
                 s['delivery_state'] = state
@@ -482,7 +484,7 @@ COLLATED_HOLD_KIND = 'video_collated'
 LEDGER_STALE_FIELDS = (
     'streams/<id>.json new-day hours: [1] captured and [2] represented are the sum of the hour\'s part spans, [3] excluded 0',
     'streams/<id>.json new-day parts: [6] source clips 0',
-    'streams/<id>.json new days: captured_scheduled_seconds is the sum of its hours\' [1]',
+    'streams/<id>.json new days: captured_scheduled_seconds is the sum of its hours\' [1], redone when a parent day built this way changes',
 )
 
 
@@ -604,9 +606,13 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
                 rec = h.record
                 day_hours.append([state, span, span, 0.0, rec.source_clips if rec else 0, rec.included_clips if rec else 0, 0,
                                   t0, t1, parts, [], h.delivery_hour])
+            # A parent day keeps its source accounting. A day whose accounting is its hours' [1]
+            # (built here, LEDGER_STALE_FIELDS) is redone from the new hours, so a stream
+            # published before its hours were registered gains their time.
+            day = dict(bd) if bd else {'date': date, 'grade': grades[(rid, date)]}
             captured = sum(x[1] for x in day_hours)
-            day = dict(bd) if bd else {'date': date, 'grade': grades[(rid, date)], 'captured_scheduled_seconds': captured,
-                                       'captured_scheduled_coverage_pct': 100 * captured / DAY_SCHEDULED_SECONDS}
+            if not bd or bd['captured_scheduled_seconds'] == sum(x[1] for x in bd['hours']) != captured:
+                day.update(captured_scheduled_seconds=captured, captured_scheduled_coverage_pct=100 * captured / DAY_SCHEDULED_SECONDS)
             days.append(dict(day, hours=day_hours))
         start, end = window[0], window[-1]
         man2 = dict(man, period=[start, end], outputs=outputs)
