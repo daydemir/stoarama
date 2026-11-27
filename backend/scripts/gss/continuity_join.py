@@ -7,8 +7,8 @@ time.. but otherwise do relaly want things as stitched as possible". The rule
 (project lead, binding) joins two adjacent served files of the same hour only when
 ALL of these hold:
   - the burned-in clock offset (clock reading minus seam-relative file time) agrees
-    within CLOCK_TOLERANCE_S across the seam, each side the median of at least
-    MIN_READS consistent reads;
+    within CLOCK_TOLERANCE_S across the seam, each side the median of the largest
+    agreeing subset (at least MIN_READS) of reads at READ_AT_S from the join;
   - codec, resolution, fps, timebase (and the codec extradata, which stream copy
     needs) match;
   - there is no PTS/duration discontinuity: the DB gap is within one frame, the
@@ -20,7 +20,9 @@ A seam collation split as frame_jump or packet_replay therefore joins only with 
 clock proof; every other seam stays split. A recording without a CLOCK_CROPS profile
 never joins. There is no class rule: an independent check found 10 of 199 within-lease
 0 s seams with matching media whose clock jumps -8.7 to +19.9 s
-(seam-audit-20261126/independent-verify/zero-gap-exceptions.tsv, the test fixtures). The audit behind it:
+(seam-audit-20261126/independent-verify/zero-gap-exceptions.tsv); that and the scaled audit's
+105 near-seam discontinuities are the test fixture testdata/clock_discontinuities.json, and the rule
+refuses all 115. The audit behind it:
 records/finish-plan-20261117/gss-delivery/seam-audit-20261126/README.md.
 
 Subcommands (all local files; `evidence` and `build` read R2 through presigned GETs
@@ -48,6 +50,7 @@ import enum
 import gzip
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import re
@@ -59,8 +62,10 @@ import urllib.parse
 
 CLOCK_TOLERANCE_S = 1.0
 MIN_READS = 2
-READ_SPREAD_S = 1.0  # consistent reads of one side agree within this
-READ_AT_S = (1.5, 2.5, 3.5)  # seconds before the seam (previous file) and after it (next file)
+READ_SPREAD_S = 1.0  # reads of one side that agree lie within this
+# Seconds before the seam (previous file) and after it (next file): the frames nearest the join, so a jump
+# or replay that resolves within ~1 s of it (seen on 437 and 442) still splits the reads.
+READ_AT_S = (0.2, 0.7, 1.2)
 FRAME_DIFF_VETO = 1.5
 FRAME_DIFF_HALF_S = 10.0
 TAIL_TOLERANCE_S = 0.2  # previous file's media end vs its DB span (the audit's content-vs-DB tolerance)
@@ -69,6 +74,7 @@ BATCH_PREFIX = 'clock-prestitch-'
 PASS_VERSION = 'continuity-join/1'
 FFMPEG = os.environ.get('FFMPEG_BIN', 'ffmpeg')
 FFPROBE = os.environ.get('FFPROBE_BIN', 'ffprobe')
+DECODE_THREADS = os.environ.get('FFMPEG_THREADS', '0')  # 0 = ffmpeg's choice
 
 # Per-recording clock crop (ffmpeg crop on the decoded frame), from the seam audit's
 # clockocr.py, where it read 433's clock on 64 seams.
@@ -122,13 +128,19 @@ class Seam:
 
 
 def side_offset(reads):
-    """(median offset, None) of at least MIN_READS consistent reads, else (None, KeepReason)."""
+    """(median offset, None) of the largest subset of at least MIN_READS reads that agree within
+    READ_SPREAD_S, so one OCR misread among three is outvoted; else (None, KeepReason). Two equally
+    large agreeing subsets with different medians are inconsistent."""
     got = [r for r in reads if r is not None]
     if len(got) < MIN_READS:
         return None, KeepReason.CLOCK_UNREADABLE
-    if max(got) - min(got) > READ_SPREAD_S:
-        return None, KeepReason.CLOCK_INCONSISTENT
-    return statistics.median(got), None
+    for n in range(len(got), MIN_READS - 1, -1):
+        meds = [statistics.median(c) for c in itertools.combinations(got, n) if max(c) - min(c) <= READ_SPREAD_S]
+        if meds:
+            if max(meds) - min(meds) > READ_SPREAD_S:
+                return None, KeepReason.CLOCK_INCONSISTENT
+            return meds[0], None
+    return None, KeepReason.CLOCK_INCONSISTENT
 
 
 def metadata_keep(seam):
@@ -373,6 +385,32 @@ def video_packet_times(path):
     return [(float(a), float(b)) for a, b in (line.split(',')[:2] for line in p.stdout.split() if line)]
 
 
+SEAM_STEP_TOLERANCE_S = 0.002  # timebase rounding only
+
+
+def seam_timing_problems(out_packets, inputs, frame_s):
+    """Problems with the video packet timing of a stream copy of inputs [(container seconds,
+    [(dts, duration)])]. Each input's packets appear unchanged and in order; at each seam the
+    next file starts at the previous file's container end, so the dts step must equal that end
+    minus the previous last packet's dts plus the next first dts. The previous file's audio may
+    outlast its video (AAC framing and priming) by at most OUTPUT_TOLERANCE_S: more is lost video."""
+    problems = []
+    if len(out_packets) != sum(len(pk) for _, pk in inputs):
+        return [f'{len(out_packets)} video packets vs {sum(len(pk) for _, pk in inputs)} in the inputs']
+    k = 0
+    for (dur, pk), (_, nxt) in zip(inputs, inputs[1:]):
+        k += len(pk)
+        last, last_d = pk[-1]
+        overhang = dur - (last + last_d)
+        if not -frame_s / 2 <= overhang <= OUTPUT_TOLERANCE_S:
+            problems.append(f'video ends {overhang:.4f} s before its file at packet {k}')
+        want = dur - last + nxt[0][0]
+        got = out_packets[k][0] - out_packets[k - 1][0]
+        if abs(got - want) > SEAM_STEP_TOLERANCE_S:
+            problems.append(f'video dts step {got:.4f} at packet {k}, expected {want:.4f}')
+    return problems
+
+
 def check_output(path, inputs, frame_s):
     """Problems with a joined file: duration vs inputs, packet timing at every seam, a clean decode."""
     problems = []
@@ -383,17 +421,10 @@ def check_output(path, inputs, frame_s):
     if got.video != media_of(inputs[0]['media']).video or got.audio != media_of(inputs[0]['media']).audio:
         problems.append('stream parameters differ from the inputs')
     pk = video_packet_times(path)
-    steps = [b[0] - a[0] for a, b in zip(pk, pk[1:])]
-    if any(s <= 0 for s in steps):
+    if any(b[0] <= a[0] for a, b in zip(pk, pk[1:])):
         problems.append('non-increasing video dts')
-    t = 0.0
-    for i in inputs[:-1]:
-        t += i['duration_s']
-        k = min(range(len(pk)), key=lambda j: abs(pk[j][0] - t))
-        step = pk[k][0] - pk[k - 1][0] if k else 0
-        if abs(step - frame_s) > frame_s / 2:
-            problems.append(f'video dts step {step:.4f} at seam {t:.3f}')
-    dec = subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-i', path, '-map', '0', '-f', 'null', '-'],
+    problems += seam_timing_problems(pk, [(i['duration_s'], video_packet_times(i['local'])) for i in inputs], frame_s)
+    dec = subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-threads', DECODE_THREADS, '-i', path, '-map', '0', '-f', 'null', '-'],
                          capture_output=True, text=True, timeout=3600)
     if dec.returncode or dec.stderr.strip():
         problems.append('decode: ' + dec.stderr.strip()[:200])
@@ -419,7 +450,7 @@ def build_run(run, verdicts, batch, out_dir, work, catalog_parts, fetch=download
             fetch(x['key'], path)
         local.append(path)
     probes = [probe(p) for p in local]
-    inputs = [dict(x, media=dataclasses.asdict(m), duration_s=m.duration_s, sha256=sha256_file(p), size_bytes=os.path.getsize(p))
+    inputs = [dict(x, local=p, media=dataclasses.asdict(m), duration_s=m.duration_s, sha256=sha256_file(p), size_bytes=os.path.getsize(p))
               for x, p, m in zip(run, local, probes)]
     lst = os.path.join(work, 'concat.txt')
     with open(lst, 'w', encoding='utf-8') as f:
