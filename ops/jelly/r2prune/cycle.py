@@ -26,13 +26,28 @@ RECENT = '2026-11-18T18:00:00Z'
 DELETE_CLASS = 'delete_window_20d_on_nas'
 KINDS = ('raw', 'collated')
 ROWS_PER_STATEMENT = 5000
+SHA256 = re.compile('[0-9a-f]{64}')
 
-# NAS evidence is name + size (Deniz, Nov 23: "yea we don tneed exreme intense
-# checkingm, if its the same size and same file name or whatever checks we have
-# already?"): a present NAS inventory row (raw) or ack (collated) at the same
-# canonical path with the same size. A sha is compared only where both are
-# already recorded; nothing is re-hashed. Only in-window, non-KE keys are fed,
-# and nothing with a NAS cleanup delete ever issued.
+# Redundancy gate. Deniz, 2026-11-27, verbatim: "yuea double check everything be 100%
+# sure redundancy before deleting". The inventory evidence above only plans a delete.
+# Before any R2 DELETE, the NAS client (the selected-verify lease of every r2-copy-v8
+# release) reads each chunk key's NAS copy live, at its canonical path, and hashes all
+# of its bytes; every key must come back `match` at the catalog size and sha256, in a
+# plan created by this cycle. Any other outcome stops the cycle before its DELETE. A
+# cycle deletes at most NAS_VERIFY_CHUNK keys; the rest are logged skipped_changed
+# absent_from_fresh_listing and planned again by a later cycle. A key without a catalog
+# sha256 is never deleted (receipt_ready) and is counted as no_hash.
+NAS_VERIFY_CHUNK = 1000
+NAS_VERIFY_WAIT_SEC = 2 * 3600
+NAS_VERIFY_POLL_SEC = 30
+NAS_VERIFY_CLOCK_SKEW_SEC = 300
+NAS_VERIFY_PENDING = ('pending', 'leased')
+
+# Planning evidence: a present NAS inventory row (raw) or ack (collated) at the same
+# canonical path with the same size, and the same sha where both are recorded. Only
+# in-window, non-KE keys are fed, and nothing with a NAS cleanup delete ever issued.
+# These rows can be weeks old, so they only plan: the redundancy gate (nas_verify)
+# re-proves every key live before its DELETE.
 RECEIPTS = r"""BEGIN READ ONLY;
 SET LOCAL lock_timeout='2s';
 SET LOCAL statement_timeout='115s';
@@ -166,7 +181,7 @@ def receipt_source(kind, sid, stream, size, digest, etag):
 
 def receipt_ready(key, size, etag, source):
     if (key != key.strip() or size <= 0 or source['size'] != size
-        or not re.fullmatch('[0-9a-f]{64}', source['sha256']) or not etag):
+        or not SHA256.fullmatch(source['sha256']) or not etag):
         return False
     if source['kind'] == 'raw':
         return key.startswith('managed/') and etag == source['etag']
@@ -230,6 +245,85 @@ def copy_field(value):
         return r'\N'
     return (str(value).replace('\\', '\\\\').replace('\t', r'\t')
             .replace('\n', r'\n').replace('\r', r'\r'))
+
+
+def pg_time(text):
+    """A timestamptz as psql's text output prints it in UTC (`2026-11-27 09:02:02.35+00`)."""
+    if not text.endswith('+00'):
+        raise ValueError(f'unexpected timestamp {text!r}')
+    fmt = '%Y-%m-%d %H:%M:%S.%f' if '.' in text else '%Y-%m-%d %H:%M:%S'
+    return datetime.datetime.strptime(text[:-3], fmt).replace(tzinfo=datetime.timezone.utc)
+
+
+def selected_verify(L, args):
+    """`stoaramactl nas-selected-verify ARGS --json`; the catalog URL stays in the env."""
+    e = env(DBENV)
+    res = subprocess.run([L + '/stoaramactl', 'nas-selected-verify'] + args + ['--json'],
+                         env=e, capture_output=True, text=True)
+    if res.returncode:
+        error = res.stderr
+        secret = urllib.parse.urlsplit(e['DATABASE_URL']).password
+        for value in filter(None, (e['DATABASE_URL'], secret, secret and urllib.parse.unquote(secret))):
+            error = error.replace(value, '[redacted]')
+        raise RuntimeError(f'nas-selected-verify {args[0]} failed: {error[-500:]}')
+    return json.loads(res.stdout)
+
+
+def nas_verify(L, W, label, chunk):
+    """Prove every chunk key's NAS copy live, or raise. chunk maps each R2 key to its
+    receipt source (kind, source_id, size, sha256). The NAS client hashes each NAS file
+    in full; the report must match every source exactly, in a plan this call created."""
+    started = datetime.datetime.now(datetime.timezone.utc)
+    ids = {kind: sorted(s['source_id'] for s in chunk.values() if s['kind'] == kind) for kind in KINDS}
+    flags = {'raw': '--clip-ids', 'collated': '--collated-ids'}
+    args = ['--label', label] + [a for kind in KINDS if ids[kind] for a in (flags[kind], ','.join(map(str, ids[kind])))]
+    plan = selected_verify(L, ['request'] + args + ['--dry-run'])
+    if plan['items'] != len(chunk):
+        raise RuntimeError(f'{label}: verify plan has {plan["items"]} items for {len(chunk)} keys')
+    selected_verify(L, ['request'] + args + ['--expected-plan-sha256', plan['plan_sha256']])
+    deadline = time.monotonic() + NAS_VERIFY_WAIT_SEC
+    while True:
+        report = selected_verify(L, ['report', '--label', label])
+        if report['plan_sha256'] != plan['plan_sha256']:
+            raise RuntimeError(f'{label}: report names another plan')
+        failed = [i for i in report['items'] if i['state'] not in NAS_VERIFY_PENDING + ('match',)]
+        if failed:
+            durable_write(W + '/nas-verify.json', json.dumps(report, sort_keys=True) + '\n')
+            f = failed[0]
+            raise RuntimeError(f'{label}: {len(failed)} NAS copies not verified, first {f["kind"]} '
+                               f'{f["source_id"]} {f["state"]}: {f["error"][:200]}')
+        if all(i['state'] == 'match' for i in report['items']):
+            break
+        if time.monotonic() > deadline:
+            raise RuntimeError(f'{label}: NAS verify not finished in {NAS_VERIFY_WAIT_SEC} s')
+        time.sleep(NAS_VERIFY_POLL_SEC)
+    durable_write(W + '/nas-verify.json', json.dumps(report, sort_keys=True) + '\n')
+    created = pg_time(report['created_at'])
+    if created < started - datetime.timedelta(seconds=NAS_VERIFY_CLOCK_SKEW_SEC):
+        raise RuntimeError(f'{label}: verify plan predates this chunk')
+    items = {(i['kind'], i['source_id']): i for i in report['items']}
+    if len(items) != len(report['items']) or len(items) != len(chunk):
+        raise RuntimeError(f'{label}: report items differ from the chunk')
+    for key, s in chunk.items():
+        i = items.get((s['kind'], s['source_id']))
+        if (i is None or i['state'] != 'match' or i['size_bytes'] != s['size'] or i['sha256'] != s['sha256']
+                or not SHA256.fullmatch(i['sha256']) or pg_time(i['completed_at']) < created):
+            raise RuntimeError(f'{label}: NAS copy of {key} is not a fresh exact match')
+    return len(items)
+
+
+def verified_chunk(L, W, stamp, planned, sources):
+    """Choose this cycle's chunk, prove its NAS copies live, and write the only listing
+    its r2prune delete may act on. Returns the chunk's keys."""
+    chunk = sorted(planned)[:NAS_VERIFY_CHUNK]
+    nas_verify(L, W, 'r2prune-lane-' + stamp.lower(), {k: sources[k] for k in chunk})
+    keep = set(chunk)
+    with open(W + '/snapshot.tsv') as snap:
+        rows = [line for line in snap if line.split('\t', 1)[0] in keep]
+    if len(rows) != len(chunk):
+        raise RuntimeError(f'{W}: chunk keys missing from the snapshot')
+    durable_write(W + '/delete-listing.tsv', ''.join(rows))
+    return chunk
 
 
 def receipt_tsv(W, intent):
@@ -354,7 +448,7 @@ def run(L, W, stamp, lock_fd):
     psql([], W + '/receipts.tsv', script=RECEIPTS)
     ev, nasm, sources = {}, {}, {}
     ambiguous = set()
-    skipped = {'durham_hold': 0, 'receipt_identity': 0, 'catalog_veto': 0}
+    skipped = {'durham_hold': 0, 'no_hash': 0, 'receipt_identity': 0, 'catalog_veto': 0}
     with open(W + '/receipts.tsv', newline='') as f:
         for k, seen, mtime, kind, sid, stream, size, digest, etag in csv.reader(f, delimiter='\t'):
             if k in hold:
@@ -384,7 +478,9 @@ def run(L, W, stamp, lock_fd):
             listed += 1
             key, size, etag, _mtime = line.rstrip('\n').split('\t')
             if key in sources:
-                if key not in ambiguous and receipt_ready(key, int(size), etag.strip('"'), sources[key]):
+                if not SHA256.fullmatch(sources[key]['sha256']):
+                    skipped['no_hash'] += 1
+                elif key not in ambiguous and receipt_ready(key, int(size), etag.strip('"'), sources[key]):
                     snap.write(line)
                 else:
                     skipped['receipt_identity'] += 1
@@ -417,6 +513,7 @@ def run(L, W, stamp, lock_fd):
     manifest = sha(W + '/plan/delete-manifest.jsonl')
     assert manifest == summ['manifest_sha256']
     dele = summ['delete']['objects']
+    chunk = []
     if dele:
         assert {c for c in summ['by_class'] if c.startswith('delete_')} == {DELETE_CLASS}, summ['by_class']
         planned = read_manifest(W, manifest)
@@ -428,6 +525,7 @@ def run(L, W, stamp, lock_fd):
         for key, row in planned.items():
             if not receipt_ready(key, row['size'], row['etag'].strip('"'), bound_sources[key]):
                 raise ValueError(f'{W}: manifest key lacks matching receipt source: {key}')
+        chunk = verified_chunk(L, W, stamp, planned, bound_sources)
         source_path = W + '/receipt-sources.json'
         durable_write(source_path, json.dumps(bound_sources, sort_keys=True) + '\n')
         with open(W + '/plan/delete-manifest.jsonl', 'rb') as f:
@@ -436,7 +534,7 @@ def run(L, W, stamp, lock_fd):
         durable_write(W + '/delete-intent.json', json.dumps({
             'manifest_sha256': manifest, 'sources_sha256': sha(source_path)}) + '\n')
         delete = subprocess.run([L + '/r2prune', 'delete', '--manifest', W + '/plan/delete-manifest.jsonl', '--summary', W + '/plan/summary.json',
-                        '--fresh-listing', W + '/snapshot.tsv', '--expected-sha256', manifest, '--ledger', W + '/ledger.jsonl',
+                        '--fresh-listing', W + '/delete-listing.tsv', '--expected-sha256', manifest, '--ledger', W + '/ledger.jsonl',
                         '--workers', '8'] + rules, env=r2, pass_fds=(lock_fd,))
         finish_receipts(W, lock_fd)
         delete.check_returncode()
@@ -454,11 +552,12 @@ def run(L, W, stamp, lock_fd):
                            env={**r2, 'AWS_ACCESS_KEY_ID': r2['R2_ACCESS_KEY_ID'], 'AWS_SECRET_ACCESS_KEY': r2['R2_SECRET_ACCESS_KEY'],
                                 'AWS_DEFAULT_REGION': 'auto'})
         e404 += r.returncode != 0 and '(404)' in r.stderr
-    for f in ('snapshot.tsv', 'protect-db-now.tsv', 'receipts.tsv', 'plan/classified.tsv', 'catalog-vetoes.tsv'):
+    for f in ('snapshot.tsv', 'delete-listing.tsv', 'protect-db-now.tsv', 'receipts.tsv', 'plan/classified.tsv', 'catalog-vetoes.tsv'):
         Path(W, f).unlink(missing_ok=True)
     log(L, {'cycle': stamp, 'receipts': len(ev), 'present': len(present), 'listed': listed, 'skipped': skipped,
          'plan': {c: v['objects'] for c, v in summ['by_class'].items()}, 'delete_bytes': summ['delete']['bytes'],
-         'manifest_sha256': manifest, 'outcomes': out, 'head_404': f'{e404}/{len(sample)}'})
+         'manifest_sha256': manifest, 'nas_verified': len(chunk), 'deferred': dele - len(chunk),
+         'outcomes': out, 'head_404': f'{e404}/{len(sample)}'})
     if e404 != len(sample):
         sys.exit('HEAD sample found deleted keys still present')
 

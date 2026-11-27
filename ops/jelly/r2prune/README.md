@@ -219,11 +219,46 @@ Tests (offline stubs for `psql` and `r2prune`, a local HTTP server for R2 HEAD):
 `cycle.py`, `preflight.sql`, `protect.sql` and `receipt-apply.sql` here are the
 installed copies in `~/stoarama-r2prune-lane/` (launchd `com.stoarama.r2prune-lane`,
 every 15 minutes). Install them by copying between cycles, while
-`~/stoarama-r2prune-lane/cycle.lock` is free.
+`~/stoarama-r2prune-lane/cycle.lock` is free. The lane also needs
+`~/stoarama-r2prune-lane/stoaramactl`, built on Jelly from the same commit:
+`/opt/homebrew/bin/go -C backend build -trimpath -o ~/stoarama-r2prune-lane/stoaramactl ./cmd/stoaramactl`.
+`go version -m` names the commit it was built from.
 
 While `~/stoarama-r2prune-lane/STOP` exists, each cycle logs
 `{"cycle": ..., "skipped": "STOP"}` to `runs.jsonl` and exits 0 before any replay, DB
 or R2 work. Remove the file to resume.
+
+### Redundancy gate
+
+Deniz, 2026-11-27, verbatim: "yuea double check everything be 100% sure redundancy
+before deleting". The NAS inventory rows and acks the cycle plans from can be weeks
+old, so they only plan. Before its one `r2prune delete`, each cycle takes a chunk (the
+first `NAS_VERIFY_CHUNK` = 1,000 planned keys, sorted) and proves each key's NAS copy
+live:
+
+1. `~/stoarama-r2prune-lane/stoaramactl nas-selected-verify request` queues a new
+   verify plan, label `r2prune-lane-<cycle stamp>`, for exactly the chunk's clip and
+   collated IDs. stoaramactl reads the canonical NAS path, size and sha256 from the
+   catalog. The catalog URL reaches it only through the environment.
+2. The NAS client leases each item (its `selected-verify` loop, in every r2-copy-v8
+   release), opens the file read-only at that path, checks the size and hashes every
+   byte.
+3. The cycle polls `report` every 30 s, for at most 2 h. It refuses on the first item
+   that comes back `missing`, `conflict` or `unverified`, or on a timeout. It also
+   refuses unless every chunk key has exactly one `match` at its receipt source's size
+   and sha256, completed after the plan was created, in a plan created during this
+   cycle (allowing 5 min of clock skew).
+
+A refusal raises before `delete-intent.json`, so no DELETE runs. The report is kept as
+`nas-verify.json`. The delete then gets `--fresh-listing delete-listing.tsv`, which
+holds only the chunk's snapshot rows. r2prune logs every other manifest key as
+`skipped_changed absent_from_fresh_listing` with no receipt, and a later cycle plans it
+again. Every deleted key's surviving copy was read and hashed in full, which covers
+the spec's 20-key restore sample.
+
+`runs.jsonl` reports `nas_verified` (chunk keys proven), `deferred` (planned keys left
+for a later cycle) and `skipped.no_hash` (listed keys without a catalog sha256). A key
+without a catalog sha256 is never deleted: `receipt_ready` refuses it.
 
 The catalog preflight sends at most 5,000 candidates per statement
 (`ROWS_PER_STATEMENT`), as two arrays, all in one `REPEATABLE READ READ ONLY`
