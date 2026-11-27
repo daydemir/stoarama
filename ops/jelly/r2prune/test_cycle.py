@@ -1,7 +1,8 @@
 # /usr/bin/python3 -I ops/jelly/r2prune/test_cycle.py -q
 # The lane preflight: chunked, one snapshot, fail closed. With STOARAMA_TEST_DATABASE_URL it
 # also runs preflight.sql on a stub catalog and checks the chunked vetoes equal the old
-# single JSON-literal statement's. Nothing reaches production.
+# single JSON-literal statement's, and that RECEIPTS reads live clips through migration
+# 0273's index with an unchanged result. Nothing reaches production.
 import importlib.util
 import json
 import os
@@ -136,8 +137,10 @@ INSERT INTO r2_object_retirements SELECT 'stoarama', 'elsewhere', 'raw', i FROM 
 """
 
 
-@unittest.skipUnless(os.environ.get('STOARAMA_TEST_DATABASE_URL'), 'needs STOARAMA_TEST_DATABASE_URL')
-class AgainstPostgres(Lane):
+needs_db = unittest.skipUnless(os.environ.get('STOARAMA_TEST_DATABASE_URL'), 'needs STOARAMA_TEST_DATABASE_URL')
+
+
+class PostgresLane(Lane):
     def setUp(self):
         super().setUp()
         self.psql = shutil.which('psql')
@@ -151,9 +154,17 @@ class AgainstPostgres(Lane):
         self.admin(f'CREATE DATABASE {name}')
         self.addCleanup(self.admin, f'DROP DATABASE {name} WITH (FORCE)')
         self.url = urllib.parse.urlunsplit(urllib.parse.urlsplit(admin)._replace(path='/' + name))
-        subprocess.run([self.psql, '-XqAt', '-v', 'ON_ERROR_STOP=1', self.url], input=SCHEMA,
-                       text=True, check=True, capture_output=True)
+        self.sql(self.schema)
         self.use_db(self.url)
+
+    def sql(self, script):
+        return subprocess.run([self.psql, '-XqAt', '-v', 'ON_ERROR_STOP=1', self.url], input=script,
+                              text=True, check=True, capture_output=True).stdout
+
+
+@needs_db
+class AgainstPostgres(PostgresLane):
+    schema = SCHEMA
 
     def test_chunked_vetoes_equal_one_json_statement(self):
         candidates = [(k, i) for i in range(1, 431) for k in cycle.KINDS]  # 401..430: no catalog row
@@ -187,6 +198,124 @@ class AgainstPostgres(Lane):
             self.assertEqual(cycle.preflight(str(self.dir), list(sources), sources), set())
         with unittest.mock.patch.object(cycle, 'ROWS_PER_STATEMENT', 1):
             self.assertEqual(cycle.preflight(str(self.dir), list(sources), sources), {('raw', 2)})
+
+
+# Stub catalog for RECEIPTS: the production clip index, and windows over recordings whose
+# history is mostly purged, as on production (2026-11-27: 1,002,151 clip rows read, 350,031 kept).
+RECEIPTS_SCHEMA = """
+CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY, manifest jsonb);
+CREATE TABLE nas_cleanup_items(plan_id bigint, ordinal int, item jsonb, delete_ever_issued boolean);
+CREATE TABLE nas_media_keep20_windows(stream_id bigint, start_at timestamptz, end_at timestamptz, keep_everything boolean);
+CREATE TABLE recordings(id bigint PRIMARY KEY, stream_id bigint, account_id bigint);
+CREATE INDEX ON recordings(stream_id);
+CREATE TABLE recording_clips(id bigint PRIMARY KEY, recording_id bigint, bucket text, object_key text,
+  display_path text, size_bytes bigint, sha256 text, etag text, purged_at timestamptz,
+  clip_start_at timestamptz, clip_end_at timestamptz, pad text);
+CREATE INDEX idx_recording_clips_recording_started ON recording_clips(recording_id, clip_start_at DESC);
+CREATE TABLE nas_inventory_files(connection_id bigint, clip_id bigint, state text, relative_path text,
+  size_bytes bigint, sha256 text, verified_at timestamptz, server_received_at timestamptz, file_mtime_ns bigint,
+  PRIMARY KEY (connection_id, clip_id));
+CREATE INDEX ON nas_inventory_files(clip_id);
+CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY, recording_id bigint);
+CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY, collation_hour_id bigint, object_key text,
+  nas_relative_path text, size_bytes bigint, sha256 text, start_at timestamptz, end_at timestamptz);
+CREATE TABLE recording_collation_output_acks(output_id bigint, connection_id bigint, nas_relative_path text,
+  size_bytes bigint, sha256 text, verified_at timestamptz);
+
+INSERT INTO recordings SELECT i, 100 + i, CASE WHEN i = 6 THEN 48 ELSE 47 END FROM generate_series(1, 6) i;
+INSERT INTO nas_media_keep20_windows SELECT 100 + i, timestamptz '2026-09-01' + i * interval '1 day',
+  timestamptz '2026-09-21' + i * interval '1 day', i = 5 FROM generate_series(1, 6) i;
+-- 120 days of five-minute clips per recording: purged before the window, two in three
+-- purged inside it, live after it; a few in another bucket.
+INSERT INTO recording_clips SELECT r * 100000 + n, r, CASE WHEN n % 97 = 0 THEN 'other' ELSE 'stoarama' END,
+  'managed/' || r || '/' || n, 'raw/' || r || '/' || n || '.mp4', 1000 + n, md5(n::text) || md5(r::text), 'e' || n,
+  CASE WHEN at < timestamptz '2026-09-01' + r * interval '1 day' OR (at < timestamptz '2026-09-21' + r * interval '1 day'
+    AND n % 3 <> 0) THEN timestamptz '2026-11-20' END,
+  at, at + interval '5 minutes', repeat('x', 300)
+  FROM generate_series(1, 6) r, generate_series(0, 34559) n,
+  LATERAL (SELECT timestamptz '2026-08-25' + n * interval '5 minutes' + interval '1 second' AS at) t;
+-- NAS evidence: missing, moved, resized, unhashed and wrong-hash rows, and clips with none.
+INSERT INTO nas_inventory_files SELECT 13, id, CASE WHEN id % 7 = 0 THEN 'missing' ELSE 'present' END,
+  CASE WHEN id % 11 = 0 THEN 'moved' ELSE display_path END, size_bytes + (id % 13 = 0)::int,
+  CASE WHEN id % 5 = 0 THEN '' WHEN id % 17 = 0 THEN md5('bad') ELSE upper(sha256) END,
+  clip_end_at, clip_end_at + interval '1 hour', 1700000000000000000 + id
+  FROM recording_clips WHERE id % 4 <> 0;
+INSERT INTO recording_collation_hours SELECT r * 1000 + h, r FROM generate_series(1, 6) r, generate_series(0, 959) h;
+INSERT INTO recording_collation_outputs SELECT id, id, 'joined/nightly-collation-v2/' || id, 'c/' || id, 10 + id,
+  md5(id::text), timestamptz '2026-08-25' + (id % 1000) * interval '1 hour',
+  timestamptz '2026-08-25' + (id % 1000 + 1) * interval '1 hour' FROM recording_collation_hours;
+INSERT INTO recording_collation_output_acks SELECT id, 13, nas_relative_path, size_bytes,
+  CASE WHEN id % 9 = 0 THEN '' ELSE sha256 END, timestamptz '2026-11-01' FROM recording_collation_outputs WHERE id % 6 <> 0;
+-- Issued NAS deletes veto otherwise eligible in-window raw clips in both formats: a legacy
+-- plan (item NULL, manifest ordinal) and item-bearing rows. Unissued rows are controls.
+INSERT INTO nas_cleanup_plans VALUES (1, '[{"kind": "raw", "source_id": 102598}, {"kind": "raw", "source_id": 102601},
+  {"kind": "raw", "source_id": 102607}, {"kind": "raw", "source_id": 102610}]');
+INSERT INTO nas_cleanup_items VALUES (1, 1, NULL, true), (1, 2, NULL, false), (1, 3, NULL, true), (1, 4, NULL, false);
+INSERT INTO nas_cleanup_items SELECT 2, n, jsonb_build_object('kind', 'raw', 'source_id', id), n <> 2
+  FROM (VALUES (1, 202883), (2, 202886), (3, 202889)) v(n, id);
+INSERT INTO nas_cleanup_items SELECT 2, 100000 + id, jsonb_build_object('kind', 'collated', 'source_id', id), id % 10 = 0
+  FROM recording_collation_outputs WHERE id % 5 = 0;
+ANALYZE;
+"""
+MIGRATION = HERE.parents[2] / 'infra/sql/migrations/0273_r2prune_receipts_live_clip_window.sql'
+
+
+@needs_db
+class Receipts(PostgresLane):
+    schema = RECEIPTS_SCHEMA
+
+    def receipts(self):
+        return sorted(self.sql(cycle.RECEIPTS).splitlines())
+
+    def clip_scan(self):
+        """The recording_clips node of RECEIPTS' own plan, run under its SET LOCALs."""
+        body = cycle.RECEIPTS.replace('COPY (\n', 'EXPLAIN (ANALYZE, FORMAT JSON)\n', 1)
+        body = body.replace(") TO STDOUT WITH (FORMAT csv, DELIMITER E'\\t');", ';', 1)
+        self.assertEqual(body.count('EXPLAIN'), 1)
+        self.assertNotIn('COPY', body)
+        def walk(node):
+            yield node
+            for child in node.get('Plans', []):
+                yield from walk(child)
+        plan = json.loads(self.sql(body))[0]['Plan']
+        [scan] = [n for n in walk(plan) if n.get('Relation Name') == 'recording_clips']
+        return scan
+
+    def assert_issued_deletes_veto(self, rows):
+        keys = {line.split('\t')[0] for line in rows}
+        for r, n in ((1, 2598), (1, 2607), (2, 2883), (2, 2889)):
+            self.assertNotIn(f'managed/{r}/{n}', keys)
+        for r, n in ((1, 2601), (1, 2610), (2, 2886)):
+            self.assertIn(f'managed/{r}/{n}', keys)
+
+    def test_issued_deletes_veto_eligible_clips(self):
+        self.assert_issued_deletes_veto(self.receipts())
+        # The vetoed clips are otherwise eligible: unissued, they are receipts.
+        self.sql('UPDATE nas_cleanup_items SET delete_ever_issued = false;')
+        keys = {line.split('\t')[0] for line in self.receipts()}
+        for r, n in ((1, 2598), (1, 2607), (2, 2883), (2, 2889)):
+            self.assertIn(f'managed/{r}/{n}', keys)
+
+    def test_live_clip_index_reads_only_kept_clips(self):
+        before = self.receipts()
+        self.assert_issued_deletes_veto(before)
+        self.assertNotEqual(self.clip_scan().get('Index Name'), 'r2prune_receipts_live_clip_window')
+        self.sql(MIGRATION.read_text() + 'ANALYZE recording_clips;\n')
+        scan = self.clip_scan()
+        self.assertEqual(scan['Index Name'], 'r2prune_receipts_live_clip_window')
+        self.assertEqual(scan.get('Rows Removed by Filter', 0), 0)
+        after = self.receipts()
+        self.assertEqual(after, before)
+        kinds = [line.split('\t')[3] for line in after]
+        self.assertGreater(kinds.count('raw'), 1000)
+        self.assertGreater(kinds.count('collated'), 100)
+        # A rerun keeps the index; another definition under its name refuses.
+        self.sql(MIGRATION.read_text())
+        self.sql('DROP INDEX r2prune_receipts_live_clip_window;'
+                 ' CREATE INDEX r2prune_receipts_live_clip_window ON recording_clips (recording_id, clip_start_at);')
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            self.sql(MIGRATION.read_text())
+        self.assertIn('not the valid exact index', caught.exception.stderr)
 
 
 if __name__ == '__main__':

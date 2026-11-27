@@ -166,6 +166,11 @@ transaction, so its vetoes equal one statement over every candidate: a single
 137k-row JSON literal preceded the 2026-11-26 production OOM. Any failed chunk
 fails the cycle before planning.
 
+The receipts read (`RECEIPTS`) finds each window's live raw clips through
+`r2prune_receipts_live_clip_window` (migration 0273), a partial index of live
+`stoarama` clips keyed by recording and both clip bounds, so the heap is read only
+for clips it keeps.
+
 ```sh
 STOARAMA_TEST_DATABASE_URL=... /usr/bin/python3 -I ops/jelly/r2prune/test_cycle.py -q
 ```
