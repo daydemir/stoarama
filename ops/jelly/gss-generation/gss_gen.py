@@ -153,6 +153,28 @@ def sync_directory(path):
         os.close(fd)
 
 
+def write_durable_json(path, value):
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as f:
+            tmp = f.name
+            json.dump(value, f, sort_keys=True)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        sync_directory(path.parent)
+    finally:
+        if tmp is not None:
+            os.unlink(tmp)
+
+
+def attempt_identity(attempt, parent, candidate):
+    return {'attempt': generation_id(attempt), 'parent': generation_id(parent),
+            'candidate': generation_id(candidate)}
+
+
 def record_attempt(attempt, parent, candidate, *, cancel):
     """Called under generation.lock. Reserve an ID once, or durably cancel it.
 
@@ -167,27 +189,28 @@ def record_attempt(attempt, parent, candidate, *, cancel):
     identity = {'parent': generation_id(parent), 'candidate': generation_id(candidate)}
     if path.exists():
         prior = json.loads(path.read_text())
-        if prior not in (dict(identity, cancelled=False), dict(identity, cancelled=True)):
+        if (not isinstance(prior, dict) or type(prior.get('cancelled')) is not bool
+                or prior not in (dict(identity, cancelled=False), dict(identity, cancelled=True))):
             raise RuntimeError('publication attempt belongs to a different pair or is invalid')
         if not cancel:
             if prior['cancelled']:
                 return False
             raise RuntimeError('publication attempt already started')
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as f:
-            tmp = f.name
-            json.dump(dict(identity, cancelled=cancel), f, sort_keys=True)
-            f.write('\n')
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        tmp = None
-        sync_directory(directory)
-    finally:
-        if tmp is not None:
-            os.unlink(tmp)
+    write_durable_json(path, dict(identity, cancelled=cancel))
     return True
+
+
+def claim_transition(attempt, parent, candidate):
+    # Only called after the exact-parent precondition, under generation.lock.
+    # The last forward attempt owns recovery until another validated attempt
+    # takes ownership. A stale rollback cannot undo a successor's publication.
+    write_durable_json(Path(H) / 'generation-transition.json',
+                       attempt_identity(attempt, parent, candidate))
+
+
+def owns_transition(attempt, parent, candidate):
+    path = Path(H) / 'generation-transition.json'
+    return path.exists() and json.loads(path.read_text()) == attempt_identity(attempt, parent, candidate)
 
 
 def rollback(attempt, candidate, parent):
@@ -200,6 +223,13 @@ def rollback(attempt, candidate, parent):
         bodies = {candidate: staged(candidate), parent: staged(parent)}
         if registry(bodies[candidate]).get('parent_generation') != parent:
             raise RuntimeError('candidate was not built from expected parent')
+        if not owns_transition(attempt, parent, candidate):
+            # Cancellation still fences a delayed original swap. Without
+            # ownership, however, only readback of an already-restored parent
+            # is allowed; never move a successor's pointers.
+            snapshot({parent: bodies[parent]})
+            print('verified both parent pointers without transition ownership', parent)
+            return 0
         move(candidate, parent, bodies, snapshot(bodies))
     except FAILURES as error:
         # An error response does not prove the last write failed. Only a fresh
@@ -230,6 +260,7 @@ def swap(attempt, parent, candidate):
         print('REFUSED: swap precondition failed:', error, file=sys.stderr)
         return 3
     try:
+        claim_transition(attempt, parent, candidate)
         move(parent, candidate, bodies, initial)
     except FAILURES as error:
         print('swap failed:', error, file=sys.stderr)

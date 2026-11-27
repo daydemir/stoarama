@@ -152,11 +152,15 @@ class PointerTests(unittest.TestCase):
         self.assertIn('UNRESOLVED DIVERGENCE', self.output.getvalue())
 
     def test_pin_only_partial_rollback(self):
+        gss.record_attempt(ATTEMPT, PARENT, CANDIDATE, cancel=False)
+        gss.claim_transition(ATTEMPT, PARENT, CANDIDATE)
         self.store.pin = CANDIDATE
         self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
     def test_ambiguous_rollback_completed(self):
+        gss.record_attempt(ATTEMPT, PARENT, CANDIDATE, cancel=False)
+        gss.claim_transition(ATTEMPT, PARENT, CANDIDATE)
         self.store.pin = CANDIDATE
         self.store.after_pin = fail
         self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
@@ -181,6 +185,31 @@ class PointerTests(unittest.TestCase):
         self.assertEqual(self.store.state(), (CANDIDATE, CANDIDATE))
         self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
         self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 3)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
+
+    def test_unowned_attempt_cannot_repair_partial_state(self):
+        self.store.pin = CANDIDATE
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        self.assertEqual(self.store.state(), (PARENT, CANDIDATE))
+
+    def test_stale_rollback_cannot_undo_verified_successor(self):
+        successor = 'e' * 32
+        with patch.object(gss, 'r2env', return_value={'R2_BUCKET': 'fake', 'R2_ACCOUNT_ID': 'fake'}):
+            self.assertEqual(gss.main(['swap', ATTEMPT, PARENT, CANDIDATE]), 0)
+            self.assertEqual(gss.main(['rollback', ATTEMPT, CANDIDATE, PARENT]), 0)
+            self.assertEqual(gss.main(['swap', successor, PARENT, CANDIDATE]), 0)
+            self.assertEqual(gss.main(['verify', CANDIDATE]), 0)
+            # A delayed duplicate rollback belonging to the first attempt
+            # must not reverse the second attempt's verified publication.
+            self.assertEqual(gss.main(['rollback', ATTEMPT, CANDIDATE, PARENT]), 8)
+            self.assertEqual(self.store.state(), (CANDIDATE, CANDIDATE))
+            self.assertEqual(gss.main(['verify', CANDIDATE]), 0)
+            self.assertEqual(gss.main(['rollback', successor, CANDIDATE, PARENT]), 0)
+            self.assertEqual(self.store.state(), (PARENT, PARENT))
+
+    def test_transition_owner_write_failure_does_not_move_pointers(self):
+        with patch.object(gss, 'claim_transition', side_effect=OSError('cannot sync owner')):
+            self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 4)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
 

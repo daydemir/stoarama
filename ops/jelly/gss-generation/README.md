@@ -41,7 +41,12 @@ cancelled ID cannot be rebound to a different pair. Mooney records each ID and
 pair in `gss-delivery/cadence/attempts/` before a remote swap is possible.
 Failure to persist the
 cancellation returns 8 rather than claiming rollback. Retrying recovery uses
-the original attempt ID, not a new one.
+the original attempt ID, not a new one. After the exact-parent check and
+before either pointer write, the forward attempt durably becomes the owner
+in `generation-transition.json`. A rollback can move the pointers only for
+that owner; a non-owner can verify an already-restored parent but cannot undo
+a newer attempt, even if it used the same candidate. Both the attempt records
+and the transition-owner file must be retained.
 
 The cycle also holds a Mooney-local lock across the build, swaps, gates, and
 ledger publication. It arms rollback before invoking the remote swap, so a
