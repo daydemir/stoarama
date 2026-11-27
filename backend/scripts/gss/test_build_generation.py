@@ -378,19 +378,26 @@ class LedgerWorld:
         for x in served:
             self.listing[x.key] = (x.size_bytes, x.etag)
 
-    def new_part(self, rid, date, dh, oid, short_s=0):
+    def new_part(self, rid, date, dh, oid, short_us=0):
         """A re-stitched one-part hour from a recovery batch, in place of the two originals and
-        spanning them (short_s seconds less)."""
+        spanning them (short_us microseconds less)."""
         ps = self.hours[(rid, date, dh)].record.parts
-        sha = hashlib.sha256(b'new%d' % oid).hexdigest()
-        end = iso(datetime.datetime.fromisoformat(ps[-1].end_at).timestamp() - short_s)
-        p = L.Part(oid, 1, 1, f'joined/recovery-x/objects/{sha}.mp4', 2000, sha, ps[0].start_at, end,
-                   f'{rid}_Folder/July/11-Saturday/{rid}_x_hour_09_080000-085000.mp4', L.Source.NEW_STITCH)
-        rec = L.Record(oid, f'r-{oid}', 'recovery-x', 'collated', 'r2', (p,), 3, 3)
+        end = (datetime.datetime.fromisoformat(ps[-1].end_at) - datetime.timedelta(microseconds=short_us)).isoformat()
+        return self.new_parts(rid, date, dh, oid, [(ps[0].start_at, end)])[0]
+
+    def new_parts(self, rid, date, dh, oid, spans):
+        """A re-stitched hour from a recovery batch, in place of the originals: one part per (start, end)."""
+        n = len(spans)
+        ps = tuple(L.Part(oid + k, k + 1, n, f'joined/recovery-x/objects/{hashlib.sha256(b"new%d" % (oid + k)).hexdigest()}.mp4', 2000,
+                          hashlib.sha256(b'new%d' % (oid + k)).hexdigest(), a, b_,
+                          f'{rid}_Folder/July/11-Saturday/{rid}_x_hour_09_080000-085000_{k}.mp4', L.Source.NEW_STITCH)
+                   for k, (a, b_) in enumerate(spans))
+        rec = L.Record(oid, f'r-{oid}', 'recovery-x', 'collated', 'r2', ps, 3, 3)
         live = self.records[(rid, date, dh)]
-        self.put(rid, date, dh, rec, (L.Served(str(oid), p.key, 2000, 'f' * 32, sha, p.nas_path, L.Source.NEW_STITCH, (str(oid),)),))
+        self.put(rid, date, dh, rec, tuple(L.Served(str(p.output_id), p.key, 2000, 'f' * 32, p.sha256, p.nas_path, L.Source.NEW_STITCH,
+                                                    (str(p.output_id),)) for p in ps))
         self.records[(rid, date, dh)] = live + [rec]  # the extract still holds the live record
-        return p
+        return ps
 
     def clock_join(self, rid, date, dh):
         """The hour's two parts served by one new clock-join assembly (not in the parent)."""
@@ -418,8 +425,7 @@ class LedgerWorld:
         best14 = {}
         for d in L.day_rows(hours):
             best14.setdefault(d['recording_id'], set()).add((d['local_date'], d['day_stitched']))
-        live = b.live_counts(self.inputs(), store)
-        lost = b.regressions(live, b.new_counts(hours), set(live) | {h.slot[:2] for h in hours})
+        lost = b.regressions(b.live_coverage(self.inputs(), store), b.new_coverage(hours, self.records))
         return b.OverlayStore(store, overlay), present, added, file_holds, best14, lost
 
 
@@ -523,18 +529,51 @@ class LedgerBuildTests(unittest.TestCase):
         rid = RIDS[6]
         w.hours[(rid, DAYS[3], 2)] = dataclasses.replace(w.hours[(rid, DAYS[3], 2)], in_r2=False)
         *_, lost = w.generation(self.store)
-        self.assertEqual(lost, {(rid, DAYS[3]): ([2, 6800.0], [1, 6800.0])})
+        self.assertEqual(lost, {(rid, DAYS[3], 2): ['no longer complete']})
 
-    def test_one_lost_second_of_coverage_is_a_regression(self):
-        w = LedgerWorld(self.fx)
+    def test_one_lost_microsecond_is_a_regression(self):
         rid = RIDS[6]
-        w.new_part(rid, DAYS[3], 2, 9_300_001, short_s=100 + 1)  # the originals cover 3400 of its 3500 s: 1 s short
-        *_, lost = w.generation(self.store)
-        self.assertEqual(lost, {(rid, DAYS[3]): ([2, 6800.0], [2, 6799.0])})
         w = LedgerWorld(self.fx)
-        w.new_part(rid, DAYS[3], 2, 9_300_002, short_s=100)  # exactly the originals' 3400 s
+        w.new_part(rid, DAYS[3], 2, 9_300_001, short_us=1)
+        *_, lost = w.generation(self.store)
+        self.assertEqual(lost, {(rid, DAYS[3], 2): ['loses served time']})
+        w = LedgerWorld(self.fx)
+        w.new_part(rid, DAYS[3], 2, 9_300_002)  # covers both originals and the 100 s between them
         *_, lost = w.generation(self.store)
         self.assertEqual(lost, {})
+
+    def test_a_dropped_date_is_a_regression(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[6]
+        for dh in (1, 2):
+            del w.hours[(rid, DAYS[5], dh)]
+        *_, lost = w.generation(self.store)
+        self.assertEqual(lost, {(rid, DAYS[5], dh): ['no longer complete', 'loses served time'] for dh in (1, 2)})
+
+    def test_an_equal_duration_hour_swap_is_a_regression(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[6]
+        h = w.hours.pop((rid, DAYS[5], 1))  # an hour of 3400 s served dropped ...
+        day = datetime.timedelta(days=1)
+        ps = tuple(dataclasses.replace(p, output_id=p.output_id + 50_000, key=p.key + '.swap',
+                                       start_at=(datetime.datetime.fromisoformat(p.start_at) + 9 * day).isoformat(),
+                                       end_at=(datetime.datetime.fromisoformat(p.end_at) + 9 * day).isoformat()) for p in h.record.parts)
+        rec = dataclasses.replace(h.record, row_id=99_999, hour_id='swap', parts=ps)
+        w.records[(rid, '2026-07-24', 1)] = [rec]  # ... for 3400 s of other footage on another slot
+        w.put(rid, '2026-07-24', 1, rec, tuple(L.Served(str(p.output_id), p.key, 1000, 'e', p.sha256, p.nas_path, L.Source.ORIGINAL,
+                                                        (str(p.output_id),)) for p in ps))
+        *_, lost = w.generation(self.store, {(rid, '2026-07-24'): 'A'})
+        self.assertEqual(lost, {(rid, DAYS[5], 1): ['no longer complete', 'loses served time']})
+
+    def test_overlapping_parts_under_new_ids_are_a_regression(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[6]
+        ps = w.hours[(rid, DAYS[3], 2)].record.parts  # live: [t0, t0+1700) and [t0+1800, t0+3500)
+        t0 = datetime.datetime.fromisoformat(ps[0].start_at)
+        at = lambda s: (t0 + datetime.timedelta(seconds=s)).isoformat()
+        w.new_parts(rid, DAYS[3], 2, 9_400_000, [(at(0), at(2000)), (at(1000), at(3400))])  # 4400 s in total, 100 s short at the end
+        *_, lost = w.generation(self.store)
+        self.assertEqual(lost, {(rid, DAYS[3], 2): ['loses served time']})
 
     def test_new_clock_join_assembly_is_published_with_its_hold(self):
         w = LedgerWorld(self.fx)
@@ -592,24 +631,12 @@ class LedgerBuildTests(unittest.TestCase):
             w.records[(rid, DAYS[0], dh)], w.records[(rid, new_day, dh)] = [live], [new]
             h = w.hours.pop((rid, DAYS[0], dh))
             w.put(rid, new_day, dh, h.record, h.served)
-        store, present, added, file_holds, best14, lost = w.generation(self.store, {(rid, new_day): 'B'})
-        self.assertEqual(sorted(lost), [(rid, DAYS[0]), (rid, DAYS[-1])])
-        stream = store.load(f'/public/streams/{rid}.json')
-        self.assertEqual([d['date'] for d in stream['days']], list(DAYS[1:-1]) + [new_day])
-        day = stream['days'][-1]
-        self.assertEqual((day['grade'], [h[0] for h in day['hours']]), ('B', ['collated', 'collated']))
-        t0, t1 = b.hour_bounds('Europe/Warsaw', new_day, 1)
-        self.assertEqual((day['hours'][0][7], day['hours'][0][8], day['hours'][0][11]), (t0, t1, 1))
-        md = {s['id']: s for s in store.load('/public/metadata.json')['streams']}
-        self.assertEqual((md[rid]['start'], md[rid]['end'], md[rid]['grades']), (DAYS[1], new_day, 'A' * 12 + 'B'))
-        self.assertEqual(store.load(f'/public/manifests/{rid}.json')['period'], [DAYS[1], new_day])
-        self.assertEqual((md[rid]['window'], md[rid]['best14_dates']), ('best14', [DAYS[0], DAYS[-1]]))
-
-        # Option (c): an incomplete best-14 window waits until it serves as much as the live window.
-        w.hours[(rid, DAYS[3], 1)] = dataclasses.replace(w.hours[(rid, DAYS[3], 1)], in_r2=False)
-        live_hours = LedgerWorld(self.fx).hour_list()
-        live = b.live_counts(w.inputs(), self.store)
-        windows = b.choose_windows(w.hour_list(), live_hours, live)
+        # A complete best-14 window that drops live days fails the gate on every dropped slot ...
+        *_, lost = w.generation(self.store, {(rid, new_day): 'B'})
+        self.assertEqual(sorted(lost), [(rid, DAYS[0], 1), (rid, DAYS[0], 2), (rid, DAYS[-1], 1), (rid, DAYS[-1], 2)])
+        # ... and the stream keeps its live window.
+        live = b.live_coverage(w.inputs(), self.store)
+        windows = b.choose_windows(w.hour_list(), live, w.records)
         self.assertEqual((windows[rid], windows[RIDS[0]]), (b.Window.ORIGINAL, b.Window.BEST14))
 
     def test_complete_best14_window_switches_with_fewer_assemblies(self):
@@ -619,11 +646,11 @@ class LedgerBuildTests(unittest.TestCase):
         h = w.hours[(rid, DAYS[0], 1)]
         w.put(rid, DAYS[0], 1, h.record, tuple(L.Served(str(p.output_id), p.key, 1000, 'e', p.sha256, p.nas_path, L.Source.ORIGINAL,
                                                         (str(p.output_id),)) for p in h.record.parts))
-        live = b.live_counts(w.inputs(), self.store)
-        self.assertEqual(b.choose_windows(w.hour_list(), live_world.hour_list(), live)[rid], b.Window.BEST14)
+        live = b.live_coverage(w.inputs(), self.store)
+        self.assertEqual(b.choose_windows(w.hour_list(), live, w.records)[rid], b.Window.BEST14)
         # One incomplete best-14 hour serves fewer complete hours than the live window.
         w.hours[(rid, DAYS[2], 2)] = dataclasses.replace(w.hours[(rid, DAYS[2], 2)], in_r2=False)
-        self.assertEqual(b.choose_windows(w.hour_list(), live_world.hour_list(), live)[rid], b.Window.ORIGINAL)
+        self.assertEqual(b.choose_windows(w.hour_list(), live, w.records)[rid], b.Window.ORIGINAL)
 
     def test_stream_published_empty_gains_its_hours(self):
         # Stream 420: published in its best-14 window before any hour was registered (every
@@ -654,7 +681,7 @@ class LedgerBuildTests(unittest.TestCase):
                 w.new_part(rid, date, dh, 9_300_000 + d * 2 + dh)
         out, reg, summary, lost = self.build_ledger(w, 'empty')
         self.assertEqual(lost, {})
-        span = 1700.0  # each new part's span
+        span = 3500.0  # each new part spans its hour's two originals and the gap between them
         md = {s['id']: s for s in self.object(out, reg, '/public/metadata.json')['streams']}
         R = self.object(out, reg, '/public/readiness.json')['by_recording_id'][str(rid)]
         days = self.object(out, reg, f'/public/streams/{rid}.json')['days']

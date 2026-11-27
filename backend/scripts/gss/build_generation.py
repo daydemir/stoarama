@@ -51,15 +51,22 @@ every ledger file in R2: complete hours whole, other hours with what R2 holds.
   identical hold exists (a differing hold fails).
 - Each stream's timeline, manifest, catalog weeks and metadata window become its
   best-14 days; an hour whose parts are unchanged keeps its live hour as is.
-- A clock-join assembly (best14_ledger.py --clock-proofs) the live generation
-  does not list is added: its file entry, a manifest output with its
-  replacement_inputs, a growth repair of kind modelclock-prestitched, and a
-  video_assembly delivery_keep_holds row. Any other new assembly fails.
-- Fails closed, before writing, when any stream-day of the live generation
-  would serve less than it does: see regressions(). A live assembly on
-  best14_ledger's veto list (assembly-veto.tsv) is not served; its parts serve in
-  its place. --dry-run builds everything in memory, writes nothing and prints the
-  counts, including those regressions.
+- A clock-join assembly (best14_ledger.py --clock-proofs with --clock-uploads,
+  which binds each listed video to its proof by a server-checked SHA-256) the
+  live generation does not list is added: its file entry, a manifest output with
+  its replacement_inputs, a growth repair of kind modelclock-prestitched, and a
+  video_assembly delivery_keep_holds row. Any other new assembly fails. A reused
+  parent file must match its parent entry's key, size, sha256, ETag and inputs.
+- Fails closed, before writing, when any slot (recording, date, delivery hour)
+  the live generation serves would lose anything: a complete slot no longer
+  complete, or any served time (integer microseconds, each part credited to its
+  own slot) the new intervals do not contain. A slot the new selection lacks is
+  empty, so a dropped day fails. Joining files into fewer loses nothing. Parts the
+  live generation served through a vetoed assembly count; a live assembly on
+  best14_ledger's veto list (assembly-veto.tsv) is not served and its parts serve
+  in its place. A stream keeps its live window unless its best-14 selection
+  loses nothing. --dry-run builds everything in memory, writes nothing and prints
+  the counts, including those regressions.
 - Every served day's grade is best14-grades.tsv's; a day it lacks fails.
 
 Every mode (--files, --days, --ledger) fails if a vetoed assembly would be published.
@@ -563,6 +570,7 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
     for h in hours:
         by_rid[h.recording_id].append(h)
     overlay, present, added, file_holds, renamed, published, periods, new_repairs = {}, set(), {}, [], {}, [], {}, []
+    parent_inputs = {'sha256:' + r['sha256']: [str(i) for i in r['input_ids']] for r in store.load('/public/growth.json')['repairs']}
     for rid in reg['recording_ids']:
         hs = sorted(by_rid[rid], key=lambda h: h.slot)
         tz = MS[rid]['timezone']
@@ -581,8 +589,10 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
             published.append((rid, h.local_date, x.path))
             if x.file_id in files:
                 f = files[x.file_id]
-                if (f['key'], f['size_bytes'], f['sha256']) != (x.key, x.size_bytes, x.sha256):
+                if (f['key'], f['size_bytes'], f['sha256'], f['etag'].strip('"')) != (x.key, x.size_bytes, x.sha256, x.etag):
                     raise SystemExit(f'ledger file {x.file_id} differs from its parent entry')
+                if is_assembly(x) and parent_inputs.get(x.file_id) != list(x.registry_ids):
+                    raise SystemExit(f'ledger assembly {x.file_id} has other inputs than its parent repair')
                 if x.file_id not in base_out:
                     raise SystemExit(f'parent file {x.file_id} is not in the manifest of recording {rid}')
                 if f['path'] != x.path:
@@ -720,73 +730,93 @@ def live_windows(registry, store, best14):
     return out
 
 
-def span(p):
-    return epoch(p.end_at) - epoch(p.start_at)
+EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 
-def live_counts(inputs, store):
-    """{(recording_id, local_date): [complete hours, covered seconds]} the live generation
-    serves. An hour is complete when one of its records has every part listed, directly or as
-    an assembly input; covered seconds are the catalogued spans of every part it serves."""
+def micros(ts):
+    """An extract timestamp (microsecond precision) as integer microseconds since the epoch."""
+    return (datetime.datetime.fromisoformat(ts) - EPOCH) // datetime.timedelta(microseconds=1)
+
+
+def merged(intervals):
+    out = []
+    for a, b in sorted(intervals):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def contains(outer, inner):
+    """Whether the merged intervals outer cover every point of the merged intervals inner."""
+    return all(any(a <= x and y <= b for a, b in outer) for x, y in inner)
+
+
+@dataclasses.dataclass(frozen=True)
+class Coverage:
+    """What a generation serves: the delivery slots (recording_id, local_date, delivery_hour)
+    it serves complete, and per slot the merged time intervals (integer microseconds) of the
+    parts it serves, each part credited to its own slot."""
+    complete: frozenset
+    intervals: dict
+
+
+def coverage_of(part_ids, records, complete):
+    slot_of = {str(p.output_id): (slot, p) for slot, rs in records.items() for r in rs for p in r.parts}
+    unknown = sorted(i for i in part_ids if i not in slot_of)
+    if unknown:
+        raise SystemExit(f'{len(unknown)} served parts are not in the extract, e.g. {unknown[:3]}')
+    iv = collections.defaultdict(list)
+    for i in part_ids:
+        slot, p = slot_of[i]
+        iv[slot].append((micros(p.start_at), micros(p.end_at)))
+    return Coverage(frozenset(complete), {slot: merged(v) for slot, v in iv.items()})
+
+
+def live_coverage(inputs, store):
+    """The live generation's Coverage. A slot is complete when one of its records has every
+    part served, directly or as an assembly input. Parts served through a vetoed assembly
+    count: they were delivered, so the new generation must keep them."""
     files = inputs.registry['files']
     inputs_of = {'sha256:' + r['sha256']: [str(i) for i in r['input_ids']] for r in store.load('/public/growth.json')['repairs']}
-    slot_of = {str(p.output_id): slot for slot, rs in inputs.records.items() for r in rs for p in r.parts}
     covered = {i for f in files for i in (inputs_of[f] if f.startswith('sha256:') else [f])}
-    unknown = sorted(i for i in covered if i not in slot_of)
-    if unknown:
-        raise SystemExit(f'{len(unknown)} live parts are not in the extract, e.g. {unknown[:3]}')
-    part_of = {str(p.output_id): p for rs in inputs.records.values() for r in rs for p in r.parts}
-    live = collections.defaultdict(lambda: [0, 0.0])
-    for slot, rs in inputs.records.items():
-        if any(r.complete() and all(str(p.output_id) in covered for p in r.parts) for r in rs):
-            live[slot[:2]][0] += 1
-    for i in covered:
-        live[slot_of[i][:2]][1] += span(part_of[i])
-    return live
+    complete = {slot for slot, rs in inputs.records.items()
+                if any(r.complete() and all(str(p.output_id) in covered for p in r.parts) for r in rs)}
+    return coverage_of(covered, inputs.records, complete)
 
 
-def new_counts(hours):
-    """{(recording_id, local_date): [complete hours, covered seconds]} a ledger selection serves."""
-    part_of = {str(p.output_id): p for h in hours if h.record for p in h.record.parts}
-    new = collections.defaultdict(lambda: [0, 0.0])
-    for h in hours:
-        new[h.slot[:2]][0] += h.ok
-    for h in hours:
-        for x in h.served:
-            if x.live:
-                for i in x.registry_ids:
-                    new[h.slot[:2]][1] += span(part_of[i])
-    return new
+def new_coverage(hours, records):
+    """A ledger selection's Coverage, from the files it would publish."""
+    served = {i for h in hours for x in h.served if x.live for i in x.registry_ids}
+    return coverage_of(served, records, {h.slot for h in hours if h.ok})
 
 
-COVERAGE_TOLERANCE_S = 1e-6  # float summation order only: any real lost coverage fails
+def regressions(live, new, recording_ids=None):
+    """{slot: what it loses} for every slot the live generation serves (an absent slot of the
+    new selection is empty): a complete slot that is no longer complete, or any served time
+    the new intervals do not contain. Joining files into fewer loses nothing."""
+    lost = {}
+    for slot in sorted(set(live.intervals) | live.complete):
+        if recording_ids is not None and slot[0] not in recording_ids:
+            continue
+        why = []
+        if slot in live.complete and slot not in new.complete:
+            why.append('no longer complete')
+        if not contains(new.intervals.get(slot, []), live.intervals.get(slot, [])):
+            why.append('loses served time')
+        if why:
+            lost[slot] = why
+    return lost
 
 
-def regressions(live, new, days):
-    """The days where the new generation serves fewer complete hours or less covered time than
-    live. Joining files (fewer assemblies or parts) is not a regression; losing any of their
-    time is."""
-    return {d: (live[d], new[d]) for d in sorted(days)
-            if new[d][0] < live[d][0] or new[d][1] < live[d][1] - COVERAGE_TOLERANCE_S}
-
-
-def choose_windows(best14_hours, live_hours, live):
-    """{recording_id: Window}: best-14 when every best-14 day is complete in R2, or when it
-    serves at least the live window's complete hours and covered seconds; else the live window."""
-    def totals(counts, hours):
-        out = collections.defaultdict(lambda: [0, 0.0])
-        for day in {h.slot[:2] for h in hours}:
-            out[day[0]][0] += counts[day][0]
-            out[day[0]][1] += counts[day][1]
-        return out
-    b14, old = totals(new_counts(best14_hours), best14_hours), totals(live, live_hours)
-    captured = collections.defaultdict(list)
-    for h in best14_hours:
-        if h.captured:
-            captured[h.recording_id].append(h.ok)
-    complete = {rid for rid, oks in captured.items() if all(oks)}
-    return {rid: Window.BEST14 if rid in complete or (b14[rid][0] >= old[rid][0] and b14[rid][1] >= old[rid][1]) else Window.ORIGINAL
-            for rid in sorted({h.recording_id for h in best14_hours})}
+def choose_windows(best14_hours, live, records):
+    """{recording_id: Window}: best-14 when the best-14 selection loses nothing the live
+    generation serves for that stream; else the live window."""
+    new = new_coverage(best14_hours, records)
+    rids = sorted({h.recording_id for h in best14_hours})
+    lost = {s[0] for s in regressions(live, new)}
+    return {rid: Window.ORIGINAL if rid in lost else Window.BEST14 for rid in rids}
 
 
 def main_ledger(a):
@@ -796,20 +826,20 @@ def main_ledger(a):
         inputs, store = best14_ledger.load(a)
         best14_hours = best14_ledger.select(inputs)
         live_hours = best14_ledger.select(dataclasses.replace(inputs, best14=live_windows(inputs.registry, store, inputs.best14)))
-        live = live_counts(inputs, store)
-        windows = choose_windows(best14_hours, live_hours, live)
+        live = live_coverage(inputs, store)
+        windows = choose_windows(best14_hours, live, inputs.records)
         chosen = [h for h in best14_hours if windows[h.recording_id] is Window.BEST14] + \
                  [h for h in live_hours if windows[h.recording_id] is Window.ORIGINAL]
         best14_ledger.check_rules(chosen, inputs.names)
     except best14_ledger.LedgerError as e:
         raise SystemExit(f'best14 ledger: {e}')
-    lost = regressions(live, new_counts(chosen), {h.slot[:2] for h in chosen})
+    lost = regressions(live, new_coverage(chosen, inputs.records))
     report = {'windows': {w.value: sum(v is w for v in windows.values()) for w in Window},
-              'regressed_stream_days': len(lost),
-              'regressions_live_vs_new_[complete_hours,covered_seconds]': {f'{r} {d}': v for (r, d), v in lost.items()}}
+              'regressed_slots': len(lost),
+              'regressions': {f'{r} {d} {h}': v for (r, d, h), v in lost.items()}}
     if lost and not a.dry_run:
         print(json.dumps(report, indent=1))
-        raise SystemExit(f'{len(lost)} stream-days would serve fewer complete hours or less covered time than the live generation')
+        raise SystemExit(f'{len(lost)} live slots would lose a complete hour or served time')
     overlay, present, added, file_holds = ledger_generation(inputs, chosen, store, read_grades(a.grades), is_assembly, windows)
     best14 = collections.defaultdict(set)
     for d in best14_ledger.day_rows(best14_hours):
@@ -907,6 +937,7 @@ def main(argv=None):
     led.add_argument('--holds')
     led.add_argument('--listing', nargs='+')
     led.add_argument('--clock-proofs')
+    led.add_argument('--clock-uploads')
     led.add_argument('--grades', help='best14-grades.tsv (recording_id, local_date, grade)')
     led.add_argument('--ledger-out', help='write the ledger of the new generation here (best14-ledger*.tsv, summary)')
     ap.add_argument('--note', required=True, help='publication_note of the new generation')
