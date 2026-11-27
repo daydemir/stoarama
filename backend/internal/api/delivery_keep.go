@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -201,50 +203,59 @@ type deliveryKeepQuerier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-// RequireDeliveryKeep checks all exact identities in one statement. Missing
-// schema/rows, or any identity drift, revoke every retirement class. It is
-// also the publication gate: links cannot be served before their holds exist.
+// boundedSetChunk bounds every set-based check statement over a caller list.
+// Keys travel as typed arrays joined on indexed keys, never as one multi-MB
+// JSON literal: a 33k-object registry parsed by jsonb_to_recordset held 9-13 s
+// and bloated the long-lived API backend until Postgres was OOM-killed
+// (2026-11-26).
+const boundedSetChunk = 5000
+
+// RequireDeliveryKeep checks every exact identity. Missing schema/rows, or any
+// identity drift, revoke every retirement class. It is also the publication
+// gate: links cannot be served before their holds exist. Object holds are
+// checked in bounded chunks, which cannot pass a torn view: no code path
+// deletes holds or changes a held etag/size, so a later chunk can only see
+// more holds. Assembly dependencies follow mutable output/hour rows, so they
+// are checked in one statement (one snapshot); their sets are small.
 func RequireDeliveryKeep(ctx context.Context, q deliveryKeepQuerier, s DeliveryKeepSnapshot) error {
 	if len(s.Objects) == 0 {
 		return errors.New("delivery keep snapshot missing")
 	}
-	rows := make([]DeliveryKeepIdentity, 0, len(s.Objects))
-	for _, o := range s.Objects {
-		rows = append(rows, o)
+	for key, o := range s.Objects {
+		if key != o.Key {
+			return errors.New("delivery keep snapshot key differs from its identity")
+		}
 	}
-	raw, err := json.Marshal(rows)
-	if err != nil {
-		return err
+	keys := slices.Sorted(maps.Keys(s.Objects))
+	for chunk := range slices.Chunk(keys, boundedSetChunk) {
+		etags, sizes := make([]string, len(chunk)), make([]int64, len(chunk))
+		for i, key := range chunk {
+			etags[i], sizes[i] = s.Objects[key].ETag, s.Objects[key].Size
+		}
+		var matches bool
+		if err := q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM unnest($1::text[],$2::text[],$3::bigint[]) x(key,etag,size)
+ LEFT JOIN delivery_keep_holds h ON h.bucket=$4 AND h.object_key=x.key
+ WHERE h.object_key IS NULL OR h.etag<>x.etag OR h.size_bytes<>x.size)`, chunk, etags, sizes, "stoarama").Scan(&matches); err != nil {
+			return errors.New("delivery keep holds unavailable (migration 0188 required)")
+		}
+		if !matches {
+			return errors.New("live delivery and durable keep holds disagree; retirement/publication refused")
+		}
+	}
+	if len(s.OutputDependencies) == 0 {
+		return nil
+	}
+	ids := slices.Sorted(maps.Keys(s.OutputDependencies))
+	recordings := make([]int64, len(ids))
+	for i, id := range ids {
+		recordings[i] = s.OutputDependencies[id]
 	}
 	var matches bool
-	err = q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM jsonb_to_recordset($1::jsonb) x(key text,etag text,size bigint)
- LEFT JOIN delivery_keep_holds h ON h.bucket=$2 AND h.object_key=x.key
- WHERE h.object_key IS NULL OR h.etag<>x.etag OR h.size_bytes<>x.size)`, string(raw), "stoarama").Scan(&matches)
-	if err != nil {
-		return errors.New("delivery keep holds unavailable (migration 0188 required)")
-	}
-	if !matches {
-		return errors.New("live delivery and durable keep holds disagree; retirement/publication refused")
-	}
-	if len(s.OutputDependencies) > 0 {
-		type dep struct {
-			ID        int64 `json:"id"`
-			Recording int64 `json:"recording"`
-		}
-		deps := make([]dep, 0, len(s.OutputDependencies))
-		for id, recording := range s.OutputDependencies {
-			deps = append(deps, dep{id, recording})
-		}
-		raw, err := json.Marshal(deps)
-		if err != nil {
-			return err
-		}
-		if err := q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM jsonb_to_recordset($1::jsonb) x(id bigint,recording bigint)
+	if err := q.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM unnest($1::bigint[],$2::bigint[]) x(id,recording)
  LEFT JOIN delivery_keep_output_dependencies d ON d.output_id=x.id AND d.recording_id=x.recording
  LEFT JOIN recording_collation_outputs o ON o.id=d.output_id LEFT JOIN recording_collation_hours h ON h.id=o.collation_hour_id
- WHERE d.output_id IS NULL OR h.recording_id IS DISTINCT FROM x.recording)`, string(raw)).Scan(&matches); err != nil || !matches {
-			return errors.New("delivery assembly dependency holds disagree/unavailable")
-		}
+ WHERE d.output_id IS NULL OR h.recording_id IS DISTINCT FROM x.recording)`, ids, recordings).Scan(&matches); err != nil || !matches {
+		return errors.New("delivery assembly dependency holds disagree/unavailable")
 	}
 	return nil
 }

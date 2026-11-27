@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1608,18 +1609,24 @@ func persistNASCleanupPlan(ctx context.Context, tx pgx.Tx, label string, items [
 	// Same-label retries still return the immutable original plan. A different
 	// label must never admit an issued file, even from an old policy or retired
 	// plan. Missing legacy item rows reserve the identity conservatively.
-	manifest, _ := json.Marshal(items)
-	var reserved bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+	for chunk := range slices.Chunk(items, boundedSetChunk) {
+		kinds, sources := make([]string, len(chunk)), make([]int64, len(chunk))
+		for i, item := range chunk {
+			kinds[i], sources[i] = item.Kind, item.SourceID
+		}
+		var reserved bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(
  SELECT 1 FROM nas_cleanup_reserved_files f
- JOIN jsonb_to_recordset($1::jsonb) AS requested(kind text,source_id bigint)
+ JOIN unnest($1::text[],$2::bigint[]) AS requested(kind,source_id)
  ON f.kind=requested.kind AND f.source_id=requested.source_id
- WHERE f.account_id=47 AND f.connection_id=13 AND f.label<>$2)`, string(manifest), label).Scan(&reserved); err != nil {
-		return 0, "", &cleanupPersistFailure{stage: "file_reservation", err: err}
+ WHERE f.account_id=47 AND f.connection_id=13 AND f.label<>$3)`, kinds, sources, label).Scan(&reserved); err != nil {
+			return 0, "", &cleanupPersistFailure{stage: "file_reservation", err: err}
+		}
+		if reserved {
+			return 0, "", &cleanupPersistFailure{stage: "file_reservation", err: errors.New("cleanup file already reserved or deletion ever issued")}
+		}
 	}
-	if reserved {
-		return 0, "", &cleanupPersistFailure{stage: "file_reservation", err: errors.New("cleanup file already reserved or deletion ever issued")}
-	}
+	manifest, _ := json.Marshal(items)
 	stage = "plan_insert"
 	sha := cleanupSHA(manifest)
 	var id int64

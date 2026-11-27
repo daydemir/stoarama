@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/jackc/pgx/v5"
 	"io"
 	"os"
 	"strings"
@@ -267,6 +268,40 @@ func TestDeliveryKeepLiveAgreementFailsClosed(t *testing.T) {
 	if err := RequireDeliveryKeep(ctx, pool, snapshot); err == nil {
 		t.Fatal("new linked object without hold accepted")
 	}
+	// A production-sized roster spans several bounded chunks; drift in the
+	// last chunk alone must still refuse.
+	if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind)
+ SELECT 'stoarama',format('test/roster/%s',lpad(n::text,6,'0')),'etag',n,'asset' FROM generate_series(1,$1::int) n`, 2*boundedSetChunk+1); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := pool.Query(ctx, `SELECT object_key,etag,size_bytes FROM delivery_keep_holds WHERE bucket='stoarama'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Objects = map[string]DeliveryKeepIdentity{}
+	last := ""
+	for rows.Next() {
+		var x DeliveryKeepIdentity
+		if err := rows.Scan(&x.Key, &x.ETag, &x.Size); err != nil {
+			t.Fatal(err)
+		}
+		snapshot.Objects[x.Key] = x
+		if x.Key > last {
+			last = x.Key
+		}
+	}
+	if rows.Err() != nil || len(snapshot.Objects) <= 2*boundedSetChunk {
+		t.Fatal("roster does not span chunks", len(snapshot.Objects), rows.Err())
+	}
+	if err := RequireDeliveryKeep(ctx, pool, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	o = snapshot.Objects[last]
+	o.ETag = "drifted"
+	snapshot.Objects[last] = o
+	if err := RequireDeliveryKeep(ctx, pool, snapshot); err == nil {
+		t.Fatal("drift in the last chunk accepted")
+	}
 }
 
 func TestDeliveryKeepAssemblyDependenciesAreExactAndComplete(t *testing.T) {
@@ -283,5 +318,121 @@ func TestDeliveryKeepAssemblyDependenciesAreExactAndComplete(t *testing.T) {
 	store.current = append(repair, ' ')
 	if err := keep.readAssemblyDependencies(context.Background(), store); err == nil {
 		t.Fatal("changed assembly metadata accepted")
+	}
+}
+
+// swapAfterFirstDependencyCheck commits a concurrent swap on another
+// connection right after the first dependency statement reads its answer.
+type swapAfterFirstDependencyCheck struct {
+	q    deliveryKeepQuerier
+	swap func()
+	done bool
+}
+type afterScanRow struct {
+	pgx.Row
+	after func()
+}
+
+func (r afterScanRow) Scan(dest ...any) error {
+	err := r.Row.Scan(dest...)
+	r.after()
+	return err
+}
+func (w *swapAfterFirstDependencyCheck) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	row := w.q.QueryRow(ctx, sql, args...)
+	if w.done || !strings.Contains(sql, "delivery_keep_output_dependencies") {
+		return row
+	}
+	w.done = true
+	return afterScanRow{row, w.swap}
+}
+
+func TestDeliveryKeepDependencySwapAcrossBatchRefuses(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx := context.Background()
+	// Output 1 sits in the first object-sized batch, output last in the next.
+	// Each relationship is individually true in one state and false in the
+	// other, so only a single snapshot over all pairs refuses both states.
+	last := int64(boundedSetChunk + 1)
+	for _, sql := range []string{
+		`INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama','test/keep','etag',1,'asset')`,
+		`INSERT INTO recording_collation_hours(id,recording_id) VALUES(1001,1),(1002,2),(1003,3)`,
+		`INSERT INTO recording_collation_outputs(id,collation_hour_id) SELECT n,CASE WHEN n=$1 THEN 1003 ELSE 1001 END FROM generate_series(1,$1::bigint) n`,
+		`INSERT INTO delivery_keep_output_dependencies(output_id,recording_id) SELECT n,CASE WHEN n=$1 THEN 2 ELSE 1 END FROM generate_series(1,$1::bigint) n`,
+	} {
+		args := []any{last}
+		if !strings.Contains(sql, "$1") {
+			args = nil
+		}
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot := DeliveryKeepSnapshot{
+		Objects:            map[string]DeliveryKeepIdentity{"test/keep": {Key: "test/keep", ETag: "etag", Size: 1}},
+		OutputDependencies: map[int64]int64{},
+	}
+	for id := int64(1); id <= last; id++ {
+		snapshot.OutputDependencies[id] = 1
+	}
+	snapshot.OutputDependencies[last] = 2
+	checker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer checker.Release()
+	q := &swapAfterFirstDependencyCheck{q: checker, swap: func() {
+		if _, err := pool.Exec(ctx, `UPDATE recording_collation_outputs SET collation_hour_id=CASE id WHEN 1 THEN 1003 ELSE 1002 END WHERE id IN (1,$1)`, last); err != nil {
+			t.Error(err)
+		}
+	}}
+	if err := RequireDeliveryKeep(ctx, q, snapshot); err == nil {
+		t.Fatal("dependency pairs passed across a concurrent swap")
+	}
+	if !q.done {
+		t.Fatal("dependency check never ran")
+	}
+	if err := RequireDeliveryKeep(ctx, checker, snapshot); err == nil {
+		t.Fatal("swapped dependency state accepted")
+	}
+}
+
+func TestDeliveryKeepMapKeyMustMatchIdentity(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO delivery_keep_holds(bucket,object_key,etag,size_bytes,kind) VALUES('stoarama','test/keep','etag',1,'asset')`); err != nil {
+		t.Fatal(err)
+	}
+	// The held map key must not vouch for an unheld identity.
+	snapshot := DeliveryKeepSnapshot{Objects: map[string]DeliveryKeepIdentity{"test/keep": {Key: "unheld/key", ETag: "etag", Size: 1}}}
+	if err := RequireDeliveryKeep(ctx, pool, snapshot); err == nil {
+		t.Fatal("map key vouched for a different identity")
+	}
+}
+
+func TestNASCleanupReservationInLastChunkRefusesPlan(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode) VALUES
+ (1,47,13,'legacy',repeat('a',64),'[{"kind":"raw","source_id":1}]',repeat('b',64),'retired');
+ INSERT INTO nas_cleanup_items(plan_id,ordinal,state,delete_ever_issued) VALUES(1,1,'unverified',true); SELECT setval('nas_cleanup_plans_id_seq',1)`); err != nil {
+		t.Fatal(err)
+	}
+	items := make([]nasCleanupItem, 0, boundedSetChunk+1)
+	for i := range boundedSetChunk {
+		items = append(items, nasCleanupItem{Kind: "raw", SourceID: int64(100000 + i)})
+	}
+	items = append(items, nasCleanupItem{Kind: "raw", SourceID: 1})
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, _, err = persistNASCleanupPlan(ctx, tx, "reserved-in-last-chunk", items); err == nil || !strings.Contains(err.Error(), "already reserved") {
+		t.Fatal("reservation in the last chunk admitted", err)
+	}
+	var plans int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_plans WHERE label='reserved-in-last-chunk'`).Scan(&plans); err != nil || plans != 0 {
+		t.Fatal("refused plan inserted a row", plans, err)
 	}
 }
