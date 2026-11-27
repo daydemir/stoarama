@@ -2,7 +2,7 @@ databases:
   - name: stoarama-db
     databaseName: stoarama
     user: stoarama
-    plan: basic-1gb
+    plan: 1c-4g
     storageAutoscalingEnabled: true
 
 services:
