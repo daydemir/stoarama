@@ -147,6 +147,22 @@ covered raw: being such a source is what the coverage row proves. Tests:
 go -C backend test ./cmd/r2prune
 ```
 
+### Served-generation gate
+
+Before every `r2prune` call (both modes, every chunk) the wrapper reads the
+generation `gss_public_generation_pin` names now, GETs its registry
+`public/generations/<id>.json` and fails closed unless no key that generation
+serves (files and assets) is in the keys about to be deleted, every one has a
+`page_link` row in the plan's `--db-protect` file, and every one the plan's
+`classified.tsv` (beside `--summary`) lists is `protect_live_site`. Re-deriving it
+per chunk catches a generation swap mid-run. `manual_apply.py gate PLAN_DIR
+--db-protect FILE` runs the same check on a plan.
+
+`manual_apply.py protect-served` unions the pinned generation's served keys into
+`~/stoarama-gss-freeze/gss-protect.tsv` under `cycle.lock`. It never removes a row,
+backs up `gss-protect.tsv` and the lane's `cycle.py`, and raises `cycle.py`'s
+short-list threshold to the new count. Run it after every publish.
+
 ## Other commands
 
 ```sh

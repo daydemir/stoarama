@@ -14,6 +14,7 @@ import datetime
 import email.utils
 import enum
 import fcntl
+import gzip
 import hashlib
 import hmac
 import json
@@ -36,6 +37,8 @@ DEFAULTS = {
     'psql': '/opt/homebrew/opt/libpq/bin/psql',
     'db_env': str(Path.home() / 'Build/stoarama/local/recording-supervisor.env'),
     'r2_env': str(Path.home() / 'Build/stoarama/local/render.env'),
+    'gss_protect': str(Path.home() / 'stoarama-gss-freeze/gss-protect.tsv'),
+    'cycle': str(LANE / 'cycle.py'),
 }
 BUCKET = 'stoarama'
 COLLATED = ('joined/goodplus-', 'joined/nightly-collation-v2/', 'joined/best14-20261021/')
@@ -466,8 +469,8 @@ def r2_store(path):
             'bucket': e['R2_BUCKET']}
 
 
-def r2_head(store, key):
-    """(size, etag, mtime) of a live R2 object, or None when absent. SigV4, region auto, path style."""
+def r2_request(store, method, key):
+    """(headers, body) of one signed R2 request, or None when the key is absent. SigV4, region auto, path style."""
     path = urllib.parse.quote(f'/{store["bucket"]}/{key}', safe='/')
     for attempt in range(8):
         at = now_utc()
@@ -475,7 +478,7 @@ def r2_head(store, key):
         payload = hashlib.sha256(b'').hexdigest()
         headers = {'host': urllib.parse.urlsplit(store['endpoint']).netloc, 'x-amz-content-sha256': payload, 'x-amz-date': amz}
         signed = ';'.join(sorted(headers))
-        canonical = '\n'.join(['HEAD', path, ''] + [f'{k}:{headers[k]}' for k in sorted(headers)] + ['', signed, payload])
+        canonical = '\n'.join([method, path, ''] + [f'{k}:{headers[k]}' for k in sorted(headers)] + ['', signed, payload])
         scope = f'{day}/auto/s3/aws4_request'
         k = ('AWS4' + store['secret']).encode()
         for part in (day, 'auto', 's3', 'aws4_request'):
@@ -484,18 +487,79 @@ def r2_head(store, key):
                        hashlib.sha256).hexdigest()
         headers['authorization'] = f'AWS4-HMAC-SHA256 Credential={store["access"]}/{scope}, SignedHeaders={signed}, Signature={sig}'
         try:
-            with urllib.request.urlopen(urllib.request.Request(store['endpoint'] + path, method='HEAD', headers=headers), timeout=60) as r:
-                return (int(r.headers['Content-Length']), r.headers['ETag'].strip('"'),
-                        int(email.utils.parsedate_to_datetime(r.headers['Last-Modified']).timestamp()))
+            with urllib.request.urlopen(urllib.request.Request(store['endpoint'] + path, method=method, headers=headers), timeout=60) as r:
+                return r.headers, r.read() if method == 'GET' else b''
         except urllib.error.HTTPError as err:
             if err.code == 404:
                 return None
             if err.code not in (429, 500, 502, 503, 504) or attempt == 7:
-                raise SystemExit(f'R2 HEAD {key}: HTTP {err.code}')
+                raise SystemExit(f'R2 {method} {key}: HTTP {err.code}')
         except (urllib.error.URLError, OSError) as err:
             if attempt == 7:
-                raise SystemExit(f'R2 HEAD {key}: {type(err).__name__}')
+                raise SystemExit(f'R2 {method} {key}: {type(err).__name__}')
         time.sleep(2 ** attempt)
+
+
+def r2_head(store, key):
+    """(size, etag, mtime) of a live R2 object, or None when absent."""
+    got = r2_request(store, 'HEAD', key)
+    if got is None:
+        return None
+    h = got[0]
+    return int(h['Content-Length']), h['ETag'].strip('"'), int(email.utils.parsedate_to_datetime(h['Last-Modified']).timestamp())
+
+
+# ---- served-generation gate: before the plan is used and before every delete chunk ----
+
+GSS_PREFIX = 'datasets/global-street-scores-delivery/47/'
+PIN_SQL = """BEGIN READ ONLY;
+COPY (SELECT generation FROM gss_public_generation_pin) TO STDOUT;
+ROLLBACK;
+"""
+
+
+def served_keys(cfg, store):
+    """(generation, every R2 key it serves): the generation gss_public_generation_pin names now, read
+    from its registry public/generations/<id>.json (gzip), its files and assets."""
+    rows = read_only_copy(cfg, PIN_SQL)
+    if [len(r) for r in rows] != [1] or not re.fullmatch('[0-9a-f]{32}', rows[0][0]):
+        raise SystemExit(f'gate: gss_public_generation_pin reads {rows}, want one generation')
+    gen = rows[0][0]
+    got = r2_request(store, 'GET', f'{GSS_PREFIX}public/generations/{gen}.json')
+    if got is None:
+        raise SystemExit(f'gate: the registry of pinned generation {gen} is not in R2')
+    body = got[1]
+    registry = json.loads(gzip.decompress(body) if body[:2] == b'\x1f\x8b' else body)
+    if registry.get('generation') != gen or not registry.get('files'):
+        raise SystemExit(f'gate: registry of {gen} names generation {registry.get("generation")} with {len(registry.get("files") or {})} files')
+    return gen, {f['key'] for f in registry['files'].values()} | {a['key'] for a in registry['assets'].values()}
+
+
+def gate(cfg, store, delete_keys, protect_path, classified_path):
+    """Fails closed unless no key the pinned generation serves is about to be deleted, every one has a
+    page_link row in the plan's protect input, and every one the plan classified is protect_live_site."""
+    gen, served = served_keys(cfg, store)
+    hit = served & set(delete_keys)
+    if hit:
+        raise SystemExit(f'gate: {len(hit)} keys served by {gen} are in this delete, e.g. {sorted(hit)[0]}')
+    page = set()
+    with open(protect_path, encoding='utf-8') as f:
+        for line in f:
+            reason, _, key = line.rstrip('\n').partition('\t')
+            if reason == 'page_link':
+                page.add(key)
+    unprotected = served - page
+    if unprotected:
+        raise SystemExit(f'gate: {len(unprotected)} keys served by {gen} have no page_link row in {protect_path}, e.g. {sorted(unprotected)[0]}')
+    wrong = []
+    with open(classified_path, encoding='utf-8') as f:
+        for line in f:
+            key, _, cls, _ = line.rstrip('\n').split('\t', 3)
+            if key in served and cls != 'protect_live_site':
+                wrong.append((key, cls))
+    if wrong:
+        raise SystemExit(f'gate: {len(wrong)} keys served by {gen} are not classified protect_live_site, e.g. {wrong[0]}')
+    return gen, len(served)
 
 
 def load_coverage(path, manifest):
@@ -653,8 +717,13 @@ def delete(cfg, W, args, lock_fd):
         intent = {'mode': mode.value, 'manifest': manifest_path, 'manifest_sha256': expected,
                   'sources_sha256': sha(Path(W, 'receipt-sources.json')), 'fresh_listing_sha256': listing_sha}
 
+    store = r2_store(cfg.r2_env)
+    protect_path = one_option(args, 'db-protect')
+    classified_path = str(Path(one_option(args, 'summary')).parent / 'classified.tsv')
+
     def call(keys, listing):
-        """Preflight, bind the intent, one r2prune call, then its receipts."""
+        """Served-generation gate, preflight, bind the intent, one r2prune call, then its receipts."""
+        gate(cfg, store, keys, protect_path, classified_path)
         preflight(cfg, W, keys, manifest, sources, expected)
         if not intent_path.exists():
             durable_write(intent_path, json.dumps(intent) + '\n')
@@ -673,7 +742,6 @@ def delete(cfg, W, args, lock_fd):
                              'rerun the same command with the same --fresh-listing')
         return
 
-    store = r2_store(cfg.r2_env)
     cover = load_coverage(one_option(args, COVERAGE[next(iter(classes))]), manifest)
     held = set()
     for other, path in open_intents({Path(W).parent, Path(cfg.lane_cycles)}):
@@ -739,6 +807,54 @@ def backfill(cfg, W, manifest_path, ledger_path, defer_blocked):
                          'they may or may not be gone from R2 and need their own reconciliation')
 
 
+def protect_served(cfg):
+    """Unions every key the pinned generation serves into gss-protect.tsv as page_link, under
+    cycle.lock (waits up to 20 min). Never removes a row: refuses a result with fewer rows. Backs up
+    gss-protect.tsv and cycle.py, replaces both atomically, and raises cycle.py's short-list threshold
+    to the new row count."""
+    with open(cfg.lock, 'a') as lock:
+        for _ in range(120):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(10)
+        else:
+            raise SystemExit(f'{cfg.lock} busy for 20 min')
+        gen, served = served_keys(cfg, r2_store(cfg.r2_env))
+        text = Path(cfg.gss_protect).read_text(encoding='utf-8')
+        rows = text.splitlines()
+        have = set()
+        for line in rows:
+            reason, _, key = line.partition('\t')
+            if reason != 'page_link' or not key:
+                raise SystemExit(f'{cfg.gss_protect}: unexpected row {line!r}')
+            have.add(key)
+        add = sorted(served - have)
+        if not add:
+            print(json.dumps({'generation': gen, 'served_keys': len(served), 'added': 0, 'rows': len(rows)}))
+            return
+        new = text + ''.join(f'page_link\t{k}\n' for k in add)
+        n = new.count('\n')
+        if n < len(rows) or not text.endswith('\n'):
+            raise SystemExit('refusing a gss-protect.tsv with fewer rows')
+        src = Path(cfg.cycle).read_text(encoding='utf-8')
+        found = re.findall(r'if rows\.count\("\\n"\) < (\d+):', src)
+        if len(found) != 1 or int(found[0]) > n:
+            raise SystemExit(f'{cfg.cycle}: want one short-list threshold at most {n}, found {found}')
+        stamp = now_utc().strftime('%Y%m%dT%H%M%SZ')
+        for path in (cfg.gss_protect, cfg.cycle):
+            backup = f'{path}.pre-served-{gen[:8]}-{stamp}'
+            Path(backup).write_bytes(Path(path).read_bytes())
+            os.chmod(backup, os.stat(path).st_mode & 0o777)
+        for path, body in ((cfg.gss_protect, new), (cfg.cycle, src.replace(f'< {found[0]}:', f'< {n}:'))):
+            mode = os.stat(path).st_mode & 0o777
+            durable_write(path, body)
+            os.chmod(path, mode)
+        print(json.dumps({'generation': gen, 'served_keys': len(served), 'added': len(add), 'rows': n,
+                          'gss_protect_sha256': sha(cfg.gss_protect)}))
+
+
 def status(roots):
     n = 0
     for W, _ in open_intents(roots):
@@ -771,11 +887,22 @@ def main(argv):
     b.add_argument('--ledger', required=True)
     b.add_argument('--defer-blocked', action='store_true',
                    help='apply every receipt the dry run admits; record held keys in deferred-blocked.tsv and keep the intent open')
+    sub.add_parser('protect-served', help='union the pinned generation\'s served keys into gss-protect.tsv (after a publish)')
+    g = sub.add_parser('gate', help='the served-generation gate on a plan, read-only; exits non-zero on failure')
+    g.add_argument('plan', help='r2prune plan --out directory (delete-manifest.jsonl, classified.tsv)')
+    g.add_argument('--db-protect', required=True)
     s = sub.add_parser('status', help='list open delete intents under each root; exits non-zero if any')
     s.add_argument('roots', nargs='+')
     cfg = p.parse_args(argv)
     if cfg.cmd == 'status':
         return status(cfg.roots)
+    if cfg.cmd == 'protect-served':
+        return protect_served(cfg)
+    if cfg.cmd == 'gate':
+        gen, n = gate(cfg, r2_store(cfg.r2_env), read_manifest(Path(cfg.plan, 'delete-manifest.jsonl')), cfg.db_protect,
+                      Path(cfg.plan, 'classified.tsv'))
+        print(json.dumps({'gate': 'pass', 'generation': gen, 'served_keys': n}))
+        return
     W = str(Path(cfg.workdir).resolve())
     with open(cfg.lock, 'a') as lock:
         try:
