@@ -246,12 +246,13 @@ INSERT INTO recording_collation_outputs SELECT id, id, 'joined/nightly-collation
   timestamptz '2026-08-25' + (id % 1000 + 1) * interval '1 hour' FROM recording_collation_hours;
 INSERT INTO recording_collation_output_acks SELECT id, 13, nas_relative_path, size_bytes,
   CASE WHEN id % 9 = 0 THEN '' ELSE sha256 END, timestamptz '2026-11-01' FROM recording_collation_outputs WHERE id % 6 <> 0;
--- Issued NAS deletes, item-bearing and legacy (manifest ordinal), veto both kinds.
-INSERT INTO nas_cleanup_plans VALUES (1, (SELECT jsonb_agg(jsonb_build_object('kind', 'raw', 'source_id', 100000 + n * 3)
-  ORDER BY n) FROM generate_series(10000, 10200) n));
-INSERT INTO nas_cleanup_items SELECT 1, n - 9999, NULL, n % 2 = 0 FROM generate_series(10000, 10200) n;
-INSERT INTO nas_cleanup_items SELECT 2, n, jsonb_build_object('kind', 'raw', 'source_id', 200000 + n * 3), true
-  FROM generate_series(10000, 10300) n;
+-- Issued NAS deletes veto otherwise eligible in-window raw clips in both formats: a legacy
+-- plan (item NULL, manifest ordinal) and item-bearing rows. Unissued rows are controls.
+INSERT INTO nas_cleanup_plans VALUES (1, '[{"kind": "raw", "source_id": 102598}, {"kind": "raw", "source_id": 102601},
+  {"kind": "raw", "source_id": 102607}, {"kind": "raw", "source_id": 102610}]');
+INSERT INTO nas_cleanup_items VALUES (1, 1, NULL, true), (1, 2, NULL, false), (1, 3, NULL, true), (1, 4, NULL, false);
+INSERT INTO nas_cleanup_items SELECT 2, n, jsonb_build_object('kind', 'raw', 'source_id', id), n <> 2
+  FROM (VALUES (1, 202883), (2, 202886), (3, 202889)) v(n, id);
 INSERT INTO nas_cleanup_items SELECT 2, 100000 + id, jsonb_build_object('kind', 'collated', 'source_id', id), id % 10 = 0
   FROM recording_collation_outputs WHERE id % 5 = 0;
 ANALYZE;
@@ -280,8 +281,24 @@ class Receipts(PostgresLane):
         [scan] = [n for n in walk(plan) if n.get('Relation Name') == 'recording_clips']
         return scan
 
+    def assert_issued_deletes_veto(self, rows):
+        keys = {line.split('\t')[0] for line in rows}
+        for r, n in ((1, 2598), (1, 2607), (2, 2883), (2, 2889)):
+            self.assertNotIn(f'managed/{r}/{n}', keys)
+        for r, n in ((1, 2601), (1, 2610), (2, 2886)):
+            self.assertIn(f'managed/{r}/{n}', keys)
+
+    def test_issued_deletes_veto_eligible_clips(self):
+        self.assert_issued_deletes_veto(self.receipts())
+        # The vetoed clips are otherwise eligible: unissued, they are receipts.
+        self.sql('UPDATE nas_cleanup_items SET delete_ever_issued = false;')
+        keys = {line.split('\t')[0] for line in self.receipts()}
+        for r, n in ((1, 2598), (1, 2607), (2, 2883), (2, 2889)):
+            self.assertIn(f'managed/{r}/{n}', keys)
+
     def test_live_clip_index_reads_only_kept_clips(self):
         before = self.receipts()
+        self.assert_issued_deletes_veto(before)
         self.assertNotEqual(self.clip_scan().get('Index Name'), 'r2prune_receipts_live_clip_window')
         self.sql(MIGRATION.read_text() + 'ANALYZE recording_clips;\n')
         scan = self.clip_scan()
