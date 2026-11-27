@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -159,6 +160,14 @@ class SyntheticBuildTests(unittest.TestCase):
         local = os.path.join(out, 'objects', o['key'])
         body = Path(local).read_bytes() if os.path.exists(local) else Path(os.path.join(self.fx.assets_dir, o['key'])).read_bytes()
         return json.loads(gzip.decompress(body) if path.endswith('.gz') else body)
+
+    def test_a_vetoed_assembly_is_never_published(self):
+        rid = RIDS[0]
+        present = b.select_files(self.fx.parent, list(self.fx.parent['files']))
+        with mock.patch.object(L, 'VETOED', frozenset({assembly_id(rid)})), \
+                self.assertRaisesRegex(SystemExit, 'vetoed assemblies would be published'):
+            self.fx.build(present, self.out('gen'))
+        self.assertFalse(os.path.exists(self.out('gen')))
 
     def test_present_file_selection(self):
         gone, empty = RIDS[0], RIDS[1]
@@ -392,7 +401,9 @@ class LedgerWorld:
         isa = lambda x: x.source in L.ASSEMBLY_SOURCES
         hours = self.hour_list()
         windows = {rid: b.Window.BEST14 for rid in RIDS}
-        overlay, present, added, file_holds = b.ledger_generation(self.inputs(), hours, store, grades or {}, isa, windows)
+        # best14-grades.tsv grades every day; default to the parent's grades, overridden per test.
+        parent = {(rid, d['date']): d['grade'] for rid in RIDS for d in store.load(f'/public/streams/{rid}.json')['days']}
+        overlay, present, added, file_holds = b.ledger_generation(self.inputs(), hours, store, {**parent, **(grades or {})}, isa, windows)
         best14 = {}
         for d in L.day_rows(hours):
             best14.setdefault(d['recording_id'], set()).add((d['local_date'], d['day_stitched']))
@@ -410,6 +421,20 @@ class LedgerBuildTests(unittest.TestCase):
         summary = b.build(self.fx.parent, store, present, self.fx.holds, GEN, NOW, 'note', out, best14, added, file_holds,
                           refresh_paths=True)
         return out, b.read_registry(os.path.join(out, 'registry.json.gz')), summary, lost
+
+    def test_corrected_grade_replaces_the_parents(self):
+        rid = RIDS[0]
+        store, *_ = LedgerWorld(self.fx).generation(self.store, {(rid, DAYS[0]): 'E'})
+        self.assertEqual(store.load(f'/public/streams/{rid}.json')['days'][0]['grade'], 'E')
+        self.assertEqual({s['id']: s for s in store.load('/public/metadata.json')['streams']}[rid]['grades'], 'E' + 'A' * 13)
+
+    def test_a_day_without_a_grade_fails(self):
+        w = LedgerWorld(self.fx)
+        parent = {(rid, d): 'A' for rid in RIDS for d in DAYS}
+        del parent[(RIDS[0], DAYS[3])]
+        with self.assertRaises(KeyError):
+            b.ledger_generation(w.inputs(), w.hour_list(), self.store, parent, lambda x: x.source in L.ASSEMBLY_SOURCES,
+                                {rid: b.Window.BEST14 for rid in RIDS})
 
     def test_same_selection_republishes_the_parent(self):
         out, reg, summary, lost = self.build_ledger(LedgerWorld(self.fx), 'same')
@@ -468,6 +493,19 @@ class LedgerBuildTests(unittest.TestCase):
                                                         (str(p.output_id),)) for p in h.record.parts))
         *_, lost = w.generation(self.store)
         self.assertEqual(lost, {(rid, DAYS[0]): ([2, 1], [2, 0])})
+
+    def test_serving_a_vetoed_assemblys_parts_is_no_regression(self):
+        w = LedgerWorld(self.fx)
+        rid = RIDS[5]
+        h = w.hours[(rid, DAYS[0], 1)]
+        w.put(rid, DAYS[0], 1, h.record, tuple(L.Served(str(p.output_id), p.key, 1000, 'e', p.sha256, p.nas_path, L.Source.ORIGINAL,
+                                                        (str(p.output_id),)) for p in h.record.parts))
+        with mock.patch.object(L, 'VETOED', frozenset({assembly_id(rid)})):
+            store, present, *_, lost = w.generation(self.store)
+        self.assertEqual(lost, {})
+        self.assertNotIn(assembly_id(rid), present)
+        self.assertEqual([o['path'] for o in store.load(f'/public/manifests/{rid}.json')['outputs'][:2]],
+                         [N.delivery_path(FX_NAMES, rid, DAYS[0], 1, k, 2) for k in (1, 2)])
 
     def test_fewer_complete_hours_is_a_regression(self):
         w = LedgerWorld(self.fx)

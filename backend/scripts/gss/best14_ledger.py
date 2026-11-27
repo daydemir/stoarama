@@ -27,7 +27,9 @@ An assembly serves in place of the consecutive parts it was built from (across
 an hour boundary, from the end of one hour into the start of the next): a live
 generation assembly when its key is in the listing at the registry's size and
 ETag and holds a matching keep hold, a clock-join assembly when its key is in
-the listing. It is listed on the hour of its first part. Per hour the serving
+the listing. It is listed on the hour of its first part. An assembly on the veto list
+(assembly-veto.tsv: a reviewed time skip at one of its joins) never serves: its parts
+serve in its place, under their own delivery names. Per hour the serving
 set is one hour record with its assemblies. Among an hour's records the one
 complete in R2 serves, preferring a non-recovery record, then the earliest
 registered; `alternates` counts the other complete-in-R2 ones.
@@ -56,7 +58,7 @@ Rules, each a hard failure: no hour is served by two sets (one record per hour,
 every file from a serving record); an assembly replaces its parts and never
 duplicates them (no part is served twice, directly or by two assemblies, and an
 assembly's parts are all in serving records); no two served files share a
-delivery path. A delivery path is the live generation's path for a file it
+delivery path; no vetoed assembly is served. A delivery path is the live generation's path for a file it
 lists, else the catalogued NAS collated path; a clock-join assembly takes its
 parts' own name format.
 
@@ -114,6 +116,31 @@ ASSEMBLY_SOURCES = frozenset(REPAIR_KINDS.values())
 
 class LedgerError(Exception):
     pass
+
+
+# Deniz, Nov 27: "safety is important not to stitch things that are actually skips in time".
+# Each row is an assembly whose burned-in clock skips at a join between its parts, with
+# the evidence. It is reviewed and versioned here, and read once at import.
+VETO_FILE = Path(__file__).with_name('assembly-veto.tsv')
+VETO_COLUMNS = ('file_id', 'recording_id', 'kind', 'local_date', 'delivery_hour', 'join_output_ids', 'skip_seconds',
+                'evidence', 'reason')
+
+
+def read_veto(path):
+    """The vetoed assembly file ids (sha256:<64 hex>), each with its evidence and reason."""
+    with open(path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        rows = list(reader)
+    if tuple(reader.fieldnames or ()) != VETO_COLUMNS:
+        raise LedgerError(f'{path}: header must be {", ".join(VETO_COLUMNS)}')
+    ids = [r['file_id'] for r in rows]
+    bad = [r for r in rows if not re.fullmatch('sha256:[0-9a-f]{64}', r['file_id']) or not r['evidence'] or not r['reason']]
+    if bad or len(set(ids)) != len(ids):
+        raise LedgerError(f'{path}: every row needs a unique sha256 file_id, evidence and a reason: {bad[:1] or ids}')
+    return frozenset(ids)
+
+
+VETOED = read_veto(VETO_FILE)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -465,6 +492,8 @@ def assembly_index(inputs):
     slot_of = {p.output_id: slot for slot, rs in inputs.records.items() for r in rs for p in r.parts}
     by_input = {}
     for a in inputs.assemblies:
+        if a.file_id in VETOED:
+            continue  # its parts serve in its place
         inside = [i in slot_of and slot_of[i] in window for i in a.input_ids]
         if not any(inside):
             continue
@@ -511,7 +540,10 @@ def select(inputs):
 # ---- rules -----------------------------------------------------------------
 
 def check_rules(hours, names):
-    """Fail on an hour served by two sets, an assembly duplicating its parts, or a duplicate delivery path."""
+    """Fail on a vetoed assembly, an hour served by two sets, an assembly duplicating its parts, or a duplicate delivery path."""
+    vetoed = sorted({s.file_id for h in hours for s in h.served if s.file_id in VETOED})
+    if vetoed:
+        raise LedgerError(f'vetoed assemblies are served: {vetoed}')
     record_slot = {}
     for h in hours:
         if h.record is not None and record_slot.setdefault(h.record.row_id, h.slot) != h.slot:
@@ -691,7 +723,8 @@ def write(out_dir, page_hours, hours, unheld, pub, published):
 
 def live_check(out_dir, src):
     """Problems unless the ledger in out_dir describes the generation the live page serves,
-    with the same windows and availability. With none, marks the ledger published."""
+    with the same windows and availability, and neither serves a vetoed assembly. With none,
+    marks the ledger published."""
     rows = read_tsv(os.path.join(out_dir, 'best14-ledger-streams.tsv'), STREAM_COLUMNS)
     gens = {r['generation'] for r in rows}
     live = src.get('/public/growth.json')['generation']
@@ -711,6 +744,7 @@ def live_check(out_dir, src):
         if s:
             man = src.get(f'/api/coverage-delivery/manifest?stream={rid}&scope=available', live)
             files = {str(o['id']) for o in man['outputs'] if o.get('available')}
+            problems += [f'recording {rid}: serves vetoed assembly {f}' for f in sorted((files | served[rid]) & VETOED)]
             if served[rid] != files or int(r['served_files']) != len(files):
                 problems.append(f'recording {rid}: ledger serves {len(served[rid])} files, live {len(files)} '
                                 f'({len(served[rid] - files)} only in the ledger, {len(files - served[rid])} only live)')

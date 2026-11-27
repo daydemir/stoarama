@@ -53,8 +53,13 @@ every ledger file in R2: complete hours whole, other hours with what R2 holds.
   best-14 days; an hour whose parts are unchanged keeps its live hour as is.
 - Fails closed, before writing, when any stream-day of the live generation
   would serve fewer complete hours or fewer assemblies (days outside the new
-  window serve none). --dry-run builds everything in memory, writes nothing and
-  prints the counts, including those regressions.
+  window serve none). A live assembly on best14_ledger's veto list
+  (assembly-veto.tsv) does not count: its parts serve in its place. --dry-run
+  builds everything in memory, writes nothing and prints the counts, including
+  those regressions.
+- Every served day's grade is best14-grades.tsv's; a day it lacks fails.
+
+Every mode (--files, --days, --ledger) fails if a vetoed assembly would be published.
 """
 import argparse
 import collections
@@ -71,6 +76,8 @@ import secrets
 import statistics
 import sys
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # best14_ledger, imported where used (it imports this)
 
 ASSET_PREFIX = 'datasets/global-street-scores-delivery/47/assets/'
 BUCKET = 'stoarama'
@@ -423,6 +430,10 @@ def build(parent, store, present, holds, gen_id, now, note, out_dir, best14=None
     files.update(added or {})
     if set(files) != set(present):
         raise SystemExit(f'selected files missing from the parent and the additions: {sorted(set(present) - set(files))[:3]}')
+    from best14_ledger import VETOED
+    vetoed = sorted(set(files) & VETOED)
+    if vetoed:
+        raise SystemExit(f'vetoed assemblies would be published: {vetoed}')
     dup = sorted(p for p, n in collections.Counter(v['path'] for v in files.values()).items() if n > 1)
     if dup:
         raise SystemExit(f'{len(dup)} delivery paths are listed by more than one file, e.g. {dup[:3]}')
@@ -620,7 +631,8 @@ def ledger_generation(inputs, hours, store, grades, is_assembly, windows):
             # A parent day keeps its source accounting. A day whose accounting is its hours' [1]
             # (built here, LEDGER_STALE_FIELDS) is redone from the new hours, so a stream
             # published before its hours were registered gains their time.
-            day = dict(bd) if bd else {'date': date, 'grade': grades[(rid, date)]}
+            # best14-grades.tsv owns every day's grade, so a corrected grade replaces the parent's.
+            day = dict(bd or {'date': date}, grade=grades[(rid, date)])
             captured = sum(x[1] for x in day_hours)
             if not bd or bd['captured_scheduled_seconds'] == sum(x[1] for x in bd['hours']) != captured:
                 day.update(captured_scheduled_seconds=captured, captured_scheduled_coverage_pct=100 * captured / DAY_SCHEDULED_SECONDS)
@@ -691,7 +703,8 @@ def live_windows(registry, store, best14):
 def live_counts(inputs, store):
     """{(recording_id, local_date): [complete hours, assemblies]} the live generation serves.
     An hour is complete when one of its records has every part listed, directly or as an
-    assembly input."""
+    assembly input. A vetoed assembly is not counted: the new generation serves its parts."""
+    from best14_ledger import VETOED
     files = inputs.registry['files']
     inputs_of = {'sha256:' + r['sha256']: [str(i) for i in r['input_ids']] for r in store.load('/public/growth.json')['repairs']}
     slot_of = {str(p.output_id): slot for slot, rs in inputs.records.items() for r in rs for p in r.parts}
@@ -704,7 +717,7 @@ def live_counts(inputs, store):
         if any(r.complete() and all(str(p.output_id) in covered for p in r.parts) for r in rs):
             live[slot[:2]][0] += 1
     for f in files:
-        if f.startswith('sha256:'):
+        if f.startswith('sha256:') and f not in VETOED:
             live[slot_of[inputs_of[f][0]][:2]][1] += 1
     return live
 
@@ -742,7 +755,6 @@ def choose_windows(best14_hours, live_hours, live, is_assembly):
 
 
 def main_ledger(a):
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import best14_ledger
     is_assembly = lambda x: x.source in best14_ledger.ASSEMBLY_SOURCES
     try:

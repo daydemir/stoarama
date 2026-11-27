@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -214,6 +215,26 @@ class AssemblyTests(unittest.TestCase):
         self.assertEqual(([s.file_id for s in h6.served], h6.covered_by), ([str(nxt.parts[1].output_id)], (a.file_id,)))
         self.assertTrue(h5.ok and h6.ok)
 
+    def test_vetoed_assembly_serves_its_parts_under_their_part_names(self):
+        a = self.w.assembly(self.rec, [1, 2, 3, 4], source=L.Source.V85_ASSEMBLY, path='live/name_v85.mp4')
+        with mock.patch.object(L, 'VETOED', frozenset({a.file_id})):
+            hours = self.w.select()
+        h = self.w.hour(hours, DAYS[3], 5)
+        self.assertEqual([(s.file_id, s.path) for s in h.served],
+                         [(str(p.output_id), path(DAYS[3], 5, p.part, 4)) for p in self.rec.parts])
+        self.assertTrue(h.ok)
+        self.assertIn('v85_assembly=0', summary(hours))
+
+    def test_vetoed_assembly_across_an_hour_boundary_serves_both_hours_as_parts(self):
+        nxt = self.w.records[(RID, DAYS[3], 6)][0]
+        a = self.w.assembly([self.rec.parts[3].output_id, nxt.parts[0].output_id], source=L.Source.V79_ASSEMBLY, path='cross.mp4')
+        with mock.patch.object(L, 'VETOED', frozenset({a.file_id})):
+            hours = self.w.select()
+        h5, h6 = self.w.hour(hours, DAYS[3], 5), self.w.hour(hours, DAYS[3], 6)
+        self.assertEqual([s.file_id for s in h5.served], [str(p.output_id) for p in self.rec.parts])
+        self.assertEqual(([s.file_id for s in h6.served], h6.covered_by), ([str(p.output_id) for p in nxt.parts], ()))
+        self.assertTrue(h5.ok and h6.ok)
+
     def test_parts_taken_twice_fail(self):
         self.w.assembly(self.rec, [1, 2], 'aa')
         self.w.assembly(self.rec, [2, 3], 'bb')
@@ -306,6 +327,15 @@ class RuleTests(unittest.TestCase):
         h = self.hours[0]
         hours = [dataclasses.replace(h, served=h.served[:1])] + self.hours[1:]
         with self.assertRaisesRegex(L.LedgerError, 'served by no file'):
+            L.check_rules(hours, NAMES)
+
+    def test_served_vetoed_assembly_fails(self):
+        h = self.hours[0]
+        asm = L.Served('sha256:' + 'cd' * 32, 'experimental/x/cd.mp4', 1, ETAG, 'cd' * 32, path(DAYS[0], 1),
+                       L.Source.V79_ASSEMBLY, tuple(s.file_id for s in h.served))
+        hours = [dataclasses.replace(h, served=(asm,))] + self.hours[1:]
+        L.check_rules(hours, NAMES)
+        with mock.patch.object(L, 'VETOED', frozenset({asm.file_id})), self.assertRaisesRegex(L.LedgerError, 'vetoed assemblies are served'):
             L.check_rules(hours, NAMES)
 
     def test_paths_breaking_the_naming_fail(self):
@@ -418,6 +448,9 @@ class LiveCheckTests(unittest.TestCase):
             rolled = [dict(live[0], window='original', availability='partial')]
             self.assertEqual(len(L.live_check(d, FakeLive('ab' * 16, rolled, files))), 1)
             self.assertEqual(len(L.live_check(d, FakeLive('ab' * 16, live, set(list(files)[1:])))), 1)
+            vetoed = sorted(files)[0]  # as if the ledger and the live page both served a vetoed assembly
+            with mock.patch.object(L, 'VETOED', frozenset({vetoed})):
+                self.assertEqual(L.live_check(d, FakeLive('ab' * 16, live, files)), [f'recording {RID}: serves vetoed assembly {vetoed}'])
             self.assertIn('published=n', Path(d, L.SUMMARY_FILE).read_text())
             self.assertEqual(L.live_check(d, FakeLive('ab' * 16, live, files)), [])
             self.assertIn(f'generation={"ab" * 16} published=y', Path(d, L.SUMMARY_FILE).read_text())
@@ -468,6 +501,28 @@ class ExtractSqlTests(unittest.TestCase):
         self.assertEqual(closed, {1: ['retired_collated'], 2: [], 3: ['retired_collated'], 4: ['retired_collated'],
                                   5: ['retired_collated'], 6: ['retired_collated'], 7: ['reserved_collated'],
                                   8: ['reserved_raw_source'], 9: ['nonraw_intent_collated']})
+
+
+
+class VetoTests(unittest.TestCase):
+    def test_committed_veto_list(self):
+        self.assertEqual(L.VETOED, {'sha256:68e17a34141c2ff8f950d1f61011c375d79fb8d7647f933b6e452ccb14ebe412',
+                                    'sha256:9f0189a8e885353ff0a72f5b9c298a641bb8f9a3b6c70dddcec842b55b97682d',
+                                    'sha256:676b0f19d65bcc33818bda41ca2a43ddffad62689aaafdb9fa83d7f2d361a6a4'})
+
+    def test_rows_need_a_sha_evidence_and_reason(self):
+        good = ['sha256:' + 'ab' * 32, '1', 'v79', '2026-08-10', '1', '1>2', '1.0', 'evidence/x.png', 'clock skips']
+        cases = {'ok': [good], 'bad sha': [['ab' * 32] + good[1:]], 'no reason': [good[:-1] + ['']],
+                 'no evidence': [good[:7] + ['', good[8]]], 'duplicate': [good, good]}
+        with tempfile.TemporaryDirectory() as d:
+            for name, rows in cases.items():
+                p = os.path.join(d, name + '.tsv')
+                Path(p).write_text('\n'.join('\t'.join(r) for r in [L.VETO_COLUMNS] + rows) + '\n', encoding='utf-8')
+                if name == 'ok':
+                    self.assertEqual(L.read_veto(p), {good[0]})
+                else:
+                    with self.assertRaises(L.LedgerError, msg=name):
+                        L.read_veto(p)
 
 
 if __name__ == '__main__':
