@@ -52,6 +52,25 @@ func TestValidateNASHostFacts(t *testing.T) {
 	}
 }
 
+func TestInstalledArtifactReceiptValidation(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	for _, x := range []struct {
+		release nasReleaseHealth
+		valid   bool
+	}{
+		{nasReleaseHealth{Stable: true, ArtifactSHA256: digest}, true},
+		{nasReleaseHealth{Stable: true}, true},
+		{nasReleaseHealth{Stable: true, ArtifactSHA256: strings.Repeat("A", 64)}, false},
+		{nasReleaseHealth{Stable: true, ArtifactSHA256: "bad"}, false},
+		{nasReleaseHealth{ArtifactSHA256: digest}, false},
+		{nasReleaseHealth{Stable: true, Candidate: true, ArtifactSHA256: digest}, false},
+	} {
+		if got := validateNASHostFacts(&nasHostFacts{Release: &x.release}) == nil; got != x.valid {
+			t.Fatalf("release=%+v valid=%t got=%t", x.release, x.valid, got)
+		}
+	}
+}
+
 // An invalid host fact must cost the NAS neither its heartbeat nor the rest of
 // the telemetry it carried: the handler drops only the host facts.
 func TestHeartbeatDropsInvalidHostFactsKeepsTelemetry(t *testing.T) {
@@ -103,6 +122,13 @@ func TestHeartbeatDropsInvalidHostFactsKeepsTelemetry(t *testing.T) {
 	var facts nasHostFacts
 	if json.Unmarshal(host, &facts) != nil || facts.Release == nil || facts.Release.Candidate || !facts.Release.Stable {
 		t.Fatalf("release stability telemetry not persisted: %s", host)
+	}
+	receipt := strings.Repeat("b", 64)
+	call(fmt.Sprintf(`{"client_version":%q,"client_phase":"idle","client_previous_exit":"self_update","host":{"machine":"x86_64","release":{"candidate":false,"stable":true,"artifact_sha256":%q}}}`, nasInstalledReceiptClientVersion, receipt))
+	_, _, host = read()
+	facts = nasHostFacts{}
+	if err := json.Unmarshal(host, &facts); err != nil || facts.Release == nil || facts.Release.ArtifactSHA256 != receipt {
+		t.Fatalf("installed digest receipt not persisted: %s err=%v", host, err)
 	}
 	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":175},"host":{"machine":"x86_64","memory_diagnostics":{"meminfo_bytes":{"Cached":1024,"Dirty":"bad"},"proc_stat":{"procs_blocked":7},"vmstat":{"pgmajfault":25}}}}`)
 	_, free, host = read()

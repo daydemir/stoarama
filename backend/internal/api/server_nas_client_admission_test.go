@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -69,6 +70,8 @@ func TestNASClientAdmissionExactVersions(t *testing.T) {
 		{nasOutputRestoreClientVersion, true, true, false},
 		{nasOutputRestoreClientVersion + "-extra", false, false, false},
 		{nasDayInventoryClientVersion, true, true, false},
+		{nasInstalledReceiptClientVersion, false, true, false},
+		{nasInstalledReceiptClientVersion + "-extra", false, false, false},
 		{nasDayInventoryClientVersion + "-extra", false, false, false},
 		{nasKeep20CleanupClientVersion + "-extra", false, false, false},
 		{"r2-copy-v5-extra", false, false, false},
@@ -527,5 +530,15 @@ func TestNASClientAdmissionModernNativeIdentity(t *testing.T) {
 	gets, heads := f.bucket.counts()
 	if !authenticated || attempts != 0 || nonpending != 0 || gets != 0 || heads != 0 {
 		t.Fatalf("proof admission affected work: auth=%t attempts=%d states=%d get=%d head=%d", authenticated, attempts, nonpending, gets, heads)
+	}
+}
+
+func TestInstalledReceiptVersionReadOnlyAdmission(t *testing.T) {
+	v := nasInstalledReceiptClientVersion
+	if nasCleanupSupportsExecution(v) || nasCleanupSupportsGroupedExecution(v) || nasClientSupportsStitchProof(v) || nasFastCopyLine(v) || SupportsNASStorageBudget(v) || slices.Contains(nasCleanupDayVersions, v) || slices.Contains(nasCleanupDayModeVersions, v) || slices.Contains(nasCleanupDayKEVersions, v) {
+		t.Fatal("receipt release gained cleanup or stitch capability")
+	}
+	if !nasR2FastCopyLine(v) || !nasLowMemoryRawCopyOnly(v) || !nasCopySupportsVersion(v) || nasStorageBudgetVersion(v) != v || !slices.Contains(nasDayInventoryVersions, v) {
+		t.Fatal("receipt release lost existing read-only/copy eligibility")
 	}
 }

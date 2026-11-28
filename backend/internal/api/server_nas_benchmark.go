@@ -40,13 +40,15 @@ const (
 var nasBenchmarkStatuses = map[string]bool{"ok": true, "partial": true, "error": true, "unsupported_arch": true}
 
 var nasHostToken = regexp.MustCompile(`^[A-Za-z0-9_.+-]{1,64}$`)
+var nasInstalledArtifactDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // nasHostFacts is what the NAS client can observe about its own container.
 // Pointers are "not observable" (for example no cgroup limit file), which is
 // different from zero.
 type nasReleaseHealth struct {
-	Candidate bool `json:"candidate"`
-	Stable    bool `json:"stable"`
+	Candidate      bool   `json:"candidate"`
+	Stable         bool   `json:"stable"`
+	ArtifactSHA256 string `json:"artifact_sha256,omitempty"`
 }
 
 type nasHostFacts struct {
@@ -72,6 +74,9 @@ type nasHostFacts struct {
 func validateNASHostFacts(h *nasHostFacts) error {
 	if h == nil {
 		return nil
+	}
+	if release := h.Release; release != nil && release.ArtifactSHA256 != "" && (!release.Stable || release.Candidate || !nasInstalledArtifactDigest.MatchString(release.ArtifactSHA256)) {
+		return errors.New("invalid installed NAS artifact receipt")
 	}
 	for _, token := range []string{h.Machine, h.System, h.PythonVersion} {
 		if token != "" && !nasHostToken.MatchString(token) {

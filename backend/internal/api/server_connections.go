@@ -1212,7 +1212,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	// Legacy joined/proof readers reject unknown control fields. V5/V6 consume
 	// this private token before passing the response to that unchanged reader.
 	responseNonce := ""
-	if SupportsNASStorageBudget(req.ClientVersion) {
+	if nasStorageBudgetVersion(req.ClientVersion) != "" {
 		responseNonce = storageNonce
 	}
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{

@@ -117,6 +117,19 @@ func TestNASR2CopyV8FastBatchLeaseCapAndExactGET(t *testing.T) {
 	}
 }
 
+func TestNASInstalledReceiptFastCopyLeaseCap(t *testing.T) {
+	f, item := copyTestFixture(t)
+	queueCopySources(t, f, item)
+	useFastCopyFixture(t, f)
+	applyMigrations(t, f, "0275_nas_installed_receipt_copy_cap.sql")
+	f.useClientVersion(nasInstalledReceiptClientVersion)
+	f.s.cfg.NASR2FastCopyBatchSize = 5
+	batch := fastCopyLease(t, f)
+	if len(batch.Tasks) != 5 {
+		t.Fatalf("receipt version did not preserve 64-lease class: %d tasks", len(batch.Tasks))
+	}
+}
+
 func TestNASR2CopyV8FastResultRequiresFreshInventoryAndToken(t *testing.T) {
 	f, item := copyTestFixture(t)
 	useFastCopyFixture(t, f)
@@ -301,7 +314,7 @@ finally:
 func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 	s, pool := storageHeartbeatFixture(t)
 	ctx := context.Background()
-	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql", "0239_nas_storage_v8_fast_copy_binding.sql", "0246_nas_storage_v8_tunable_copy_binding.sql", "0250_nas_storage_v8_tunable_day_binding.sql", "0254_nas_storage_v8_tunable_modes_binding.sql", "0257_nas_storage_v8_ke_day_binding.sql", "0264_nas_storage_v8_output_restore_binding.sql", "0270_nas_storage_v8_inventory_binding.sql"} {
+	for _, name := range []string{"0237_nas_storage_v8_cleanup_binding.sql", "0238_nas_storage_v8_keep20_cleanup_binding.sql", "0239_nas_storage_v8_fast_copy_binding.sql", "0246_nas_storage_v8_tunable_copy_binding.sql", "0250_nas_storage_v8_tunable_day_binding.sql", "0254_nas_storage_v8_tunable_modes_binding.sql", "0257_nas_storage_v8_ke_day_binding.sql", "0264_nas_storage_v8_output_restore_binding.sql", "0270_nas_storage_v8_inventory_binding.sql", "0274_nas_installed_receipt_copy_binding.sql"} {
 		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -311,22 +324,24 @@ func TestNASStorageBindingV8FastCopyMigration(t *testing.T) {
 		}
 	}
 	for _, version := range []string{"r2-copy-v5", NASR2CopyPagedClientVersion, nasCleanupCertifiedStitchVersion,
-		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion, nasDayInventoryClientVersion} {
+		nasLowMemoryCopyClientVersion, nasLowMemoryCleanupClientVersion, nasKeep20CleanupClientVersion, nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion, nasDayInventoryClientVersion, nasInstalledReceiptClientVersion} {
 		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1,nas_storage_budget_at=now() WHERE id=13`, version); err != nil {
 			t.Fatalf("binding refused %q: %v", version, err)
 		}
 	}
-	for _, unreviewed := range []string{nasTunableDayClientVersion + "-extra", nasOutputRestoreClientVersion + "-extra", nasDayInventoryClientVersion + "-extra"} {
+	for _, unreviewed := range []string{nasTunableDayClientVersion + "-extra", nasOutputRestoreClientVersion + "-extra", nasDayInventoryClientVersion + "-extra", nasInstalledReceiptClientVersion + "-extra"} {
 		if _, err := pool.Exec(ctx, `UPDATE connections SET nas_storage_client_version=$1 WHERE id=13`, unreviewed); err == nil {
 			t.Fatalf("binding accepted an unreviewed literal %q", unreviewed)
 		}
 	}
-	nonce := storageHeartbeat(t, s, nasTunableDayClientVersion, storageSample(""))
-	issued := storageObservation(t, pool).issued
-	storageHeartbeat(t, s, nasTunableDayClientVersion, storageSample(nonce))
-	obs := storageObservation(t, pool)
-	if issued == nil || obs.version != nasTunableDayClientVersion || obs.budget == nil || !obs.budget.Equal(*issued) {
-		t.Fatalf("fast copy did not persist the exact storage binding: %+v", obs)
+	for _, version := range []string{nasTunableDayClientVersion, nasInstalledReceiptClientVersion} {
+		nonce := storageHeartbeat(t, s, version, storageSample(""))
+		issued := storageObservation(t, pool).issued
+		storageHeartbeat(t, s, version, storageSample(nonce))
+		obs := storageObservation(t, pool)
+		if issued == nil || obs.version != version || obs.budget == nil || !obs.budget.Equal(*issued) {
+			t.Fatalf("fast copy did not persist the exact storage binding: %+v", obs)
+		}
 	}
 }
 

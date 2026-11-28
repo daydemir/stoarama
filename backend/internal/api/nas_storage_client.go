@@ -22,7 +22,7 @@ func SupportsNASStorageBudget(version string) bool {
 	}
 }
 func nasStorageBudgetVersion(version string) string {
-	if SupportsNASStorageBudget(version) {
+	if SupportsNASStorageBudget(version) || version == nasInstalledReceiptClientVersion {
 		return version
 	}
 	return ""

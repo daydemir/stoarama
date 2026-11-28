@@ -62,7 +62,7 @@ func storageHeartbeat(t *testing.T, s *Server, version string, sample *connectio
 		t.Fatal(err)
 	}
 	nonce := response.StorageChallengeNonce
-	if SupportsNASStorageBudget(version) {
+	if nasStorageBudgetVersion(version) != "" {
 		if decoded, err := hex.DecodeString(nonce); err != nil || len(decoded) != 32 {
 			t.Fatal("invalid v5 challenge shape")
 		}
