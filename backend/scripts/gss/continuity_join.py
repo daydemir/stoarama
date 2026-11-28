@@ -288,21 +288,21 @@ def probe(src, etag=None):
 
 def read_clock(src, t, crop, tmp, etag=None):
     """Burned-in clock seconds-of-day at file time t, or None."""
-    raw = os.path.join(tmp, f'{t:.3f}.png')
-    subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src, '-frames:v', '1',
-                    '-vf', f'scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray', '-y', raw],
-                   capture_output=True, timeout=300, check=True)
-    if not os.path.exists(raw):
+    with tempfile.TemporaryDirectory(dir=tmp, prefix="clock-read-") as fresh:
+        raw = os.path.join(fresh, "frame.png")
+        subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src, '-frames:v', '1',
+                        '-vf', f'scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray', '-y', raw],
+                       capture_output=True, timeout=300, check=True)
+        if not os.path.exists(raw):
+            return None
+        for th in CLOCK_THRESHOLDS:
+            png = f'{raw}.{th}.png'
+            subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-i', raw, '-vf', f'lutyuv=y=if(gt(val\\,{th})\\,0\\,255)', '-y', png],
+                           capture_output=True, timeout=60, check=True)
+            c = parse_clock(subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True, text=True, timeout=60, check=True).stdout)
+            if c is not None:
+                return c
         return None
-    for th in CLOCK_THRESHOLDS:
-        png = f'{raw}.{th}.png'
-        subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-i', raw, '-vf', f'lutyuv=y=if(gt(val\\,{th})\\,0\\,255)', '-y', png],
-                       capture_output=True, timeout=60, check=True)
-        c = parse_clock(subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True, text=True, timeout=60, check=True).stdout)
-        if c is not None:
-            return c
-    return None
-
 
 def parse_clock(txt):
     """Seconds of day of the last H:MM:SS or HH:MM:SS (12-hour with AM/PM, or 24-hour) in OCR text, or None."""

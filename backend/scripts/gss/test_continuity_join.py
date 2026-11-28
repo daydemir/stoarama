@@ -196,6 +196,20 @@ class ExactPlanTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which(C.FFMPEG) and shutil.which(C.FFPROBE), 'needs ffmpeg and ffprobe')
 class BuildTests(unittest.TestCase):
+    def test_zero_frame_seek_cannot_read_previous_side_png(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, seconds in (('long',2), ('short',.4)):
+                subprocess.run([C.FFMPEG,'-v','error','-f','lavfi','-i',f'color=c=red:s=320x240:r=25:d={seconds}',
+                                '-c:v','libx264',os.path.join(d,name+'.mp4')],check=True)
+            actual_run = subprocess.run
+            def with_ocr(args, **kwargs):
+                if args[0] == 'tesseract':
+                    return subprocess.CompletedProcess(args, 0, stdout='12:34:56', stderr='')
+                return actual_run(args, **kwargs)
+            with mock.patch.object(C.subprocess,'run',side_effect=with_ocr):
+                self.assertEqual(C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d),45296)
+                self.assertIsNone(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d))
+
     def test_join_keeps_audio_and_duration_and_the_ledger_reads_its_proof(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, 'src')
