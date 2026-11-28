@@ -1698,6 +1698,9 @@ func loadInverseApplyProtection(ctx context.Context, q r2RetireQuerier, bucket s
 	if p.KEFolders, err = loadInverseKEFolders(ctx, q, bucket, picks); err != nil {
 		return p, err
 	}
-	p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket)
+	if p.OwnerKeepPrefixes, err = loadInverseOwnerKeepPrefixes(ctx, q, bucket); err != nil {
+		return p, err
+	}
+	p.OwnerKeepStreams, err = loadInverseOwnerKeepStreams(ctx, q, bucket, p.OwnerKeepPrefixes)
 	return p, err
 }

@@ -1362,14 +1362,13 @@ func TestR2NonrawExemptionRefusesPageContentMismatch(t *testing.T) {
 func TestR2NonrawExemptionRefusesAmbiguousPageWindow(t *testing.T) {
 	f := newNonrawFixture(t, "exempt_page_window")
 	f.withPageKeys()
-	// Stream 94's pinned window (2026-10-11..2026-11-08) is DISJOINT from stream
-	// 3's, so moving the output inside 94's window keeps it outside stream 3's,
-	// and 94 is not one of the owner's thesis keep streams (854/537/78/415).
-	const pageStream = 94
+	// The end of stream 158's window is past stream 3's, so the last hour
+	// of stream 158's window isolates the page's interval check.
+	const pageStream = 158
 	f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
- VALUES(94,'test','94','pageside','pageside','https://test.invalid','off','America/Los_Angeles','hls','video_manifest','video_live','continuous_video',30)`)
+ VALUES(158,'test','158','pageside','pageside','https://test.invalid','off','Asia/Seoul','hls','video_manifest','video_live','continuous_video',30)`)
 	f.fixture(`INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,cron_expr,cron_timezone,status,stream_id,paused_at)
- VALUES(31,47,1,'pageside','https://test.invalid','* * * * *','America/Los_Angeles','paused',94,now())`)
+ VALUES(31,47,1,'pageside','https://test.invalid','* * * * *','Asia/Seoul','paused',158,now())`)
 	f.fixture(`UPDATE delivery_keep_holds SET recording_id=31 WHERE bucket='stoarama' AND object_key=$1`, f.key)
 	pageWindow, ok := f.windows[pageStream]
 	if !ok || pageWindow.Start.Equal(f.windows[3].Start) {
@@ -1380,7 +1379,10 @@ func TestR2NonrawExemptionRefusesAmbiguousPageWindow(t *testing.T) {
 	}
 	// Move the output INSIDE the page stream's window but still OUTSIDE stream 3's
 	// window, so the catalog-stream classifier still calls it outside_window.
-	inside := pageWindow.Start.Add(time.Hour)
+	inside := pageWindow.End.Add(-time.Hour)
+	if inside.Before(f.windows[3].End) {
+		t.Fatal("page fixture overlaps the catalog stream window")
+	}
 	f.fixture(`UPDATE recording_collation_outputs SET start_at=$1,end_at=$2 WHERE id=$3`,
 		inside.Format(time.RFC3339), inside.Add(time.Minute).Format(time.RFC3339), f.outputID)
 	data, _ := json.Marshal(map[string]any{"choices": map[string]any{"3": decided(f.windows[3]), fmt.Sprint(pageStream): decided(pageWindow)}})
@@ -1451,7 +1453,7 @@ func TestR2NonrawPageAuthorityRefusedAtReserve(t *testing.T) {
 		start, end, drift, driftEnd string
 	}{
 		// Seeded outside stream 3's window, then the page recording is reassigned
-		// to stream 94, whose window (2026-10-11..2026-11-08) contains the output:
+		// to stream 158, whose window (2026-09-30..2026-10-28) contains the output:
 		// same ETag, same size, same interval.
 		{"page_reassigned_to_decided_stream", 3, "2026-10-20T00:00:00Z", "2026-10-20T00:01:00Z", "", ""},
 		// Page stream is 158 from the start; the seed's interval is outside its
@@ -1470,11 +1472,14 @@ func TestR2NonrawPageAuthorityRefusedAtReserve(t *testing.T) {
 			if tc.drift != "" {
 				f.fixture(`UPDATE recording_collation_outputs SET start_at=$1,end_at=$2 WHERE id=$3`, tc.drift, tc.driftEnd, f.outputID)
 			} else {
-				// Reassign the page recording to stream 94, whose pinned window
+				// Reassign the page recording to stream 158, whose pinned window
 				// contains the seeded interval. The listing identity never moves.
-				f.fixture(`INSERT INTO streams(id,provider,external_id,name,slug,source_url,recording_state,local_timezone,capture_type,source_family,execution_class,capture_family,expected_fps)
-  VALUES(94,'test','94','reassign','reassign','https://test.invalid','off','America/Los_Angeles','hls','video_manifest','video_live','continuous_video',30)`)
-				f.exec(`UPDATE recordings SET stream_id=94 WHERE id=31`)
+				w := f.windows[158]
+				if err := os.WriteFile(f.picks, mustPickJSON(t, f.windows[3], map[string]r2RetirePick{"158": {
+					Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}), 0600); err != nil {
+					t.Fatal(err)
+				}
+				f.exec(`UPDATE recordings SET stream_id=158 WHERE id=31`)
 			}
 			a := f.applier(t, "reserve")
 			defer a.ledger.close()
