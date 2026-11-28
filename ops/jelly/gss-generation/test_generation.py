@@ -9,6 +9,7 @@ import io
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -404,10 +405,10 @@ case "$command" in
     test "$(cat "$STATE")" = "${command##* }" ;;
   *"gss_gen.py stage "*)
     case "$SCENARIO" in
-      stage_unresolved|stage_failed)
+      stage_unresolved|stage_failed|stage_shell_success)
         # Run the actual remote shell status handling, substituting only
         # its external Python command with a disposable fixture executable.
-        printf '%s\n' "$4" | sed 's#/usr/bin/python3#remote-stage-python3#g' | sh ;;
+        printf '%s\n' "$4" | sed 's#/usr/bin/python3#remote-stage-python3#g' | "$REMOTE_SHELL" ;;
       stage_disconnected) exit 255 ;;
       *) echo staged ;;
     esac ;;
@@ -427,6 +428,10 @@ esac
 if [ "$SCENARIO" = stage_unresolved ]; then
   echo 'UNRESOLVED DIVERGENCE: publication lock unavailable'
   exit 8
+fi
+if [ "$SCENARIO" = stage_shell_success ]; then
+  echo 'fixture stage succeeded'
+  exit 0
 fi
 echo 'fixture stage failed before swap'
 exit 2
@@ -448,9 +453,10 @@ esac
         p.write_text('#!/bin/sh\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$CALLS"\n' + script)
         p.chmod(0o755)
 
-    def run_cycle(self, scenario):
+    def run_cycle(self, scenario, remote_shell='sh'):
         env = dict(HOME=str(self.home), PATH=str(self.bin) + ':/usr/bin:/bin',
-                   STATE=str(self.state), CALLS=str(self.calls), SCENARIO=scenario)
+                   STATE=str(self.state), CALLS=str(self.calls), SCENARIO=scenario,
+                   REMOTE_SHELL=remote_shell)
         return subprocess.run(['sh', str(HERE / 'republish-cycle.sh'), str(self.home), str(self.out)],
                               env=env, capture_output=True, text=True)
 
@@ -548,6 +554,19 @@ esac
                 if expected == 8:
                     self.assertTrue((self.home / '.stoarama-gss-cycle.lock').is_dir())
                     (self.home / '.stoarama-gss-cycle.lock').rmdir()
+
+    @unittest.skipUnless(shutil.which('zsh'), 'Jelly login-shell regression requires zsh')
+    def test_stage_status_in_jelly_login_shell(self):
+        # zsh makes `status` a read-only special variable. Run the exact
+        # remote command in that shell, including the successful stage path.
+        for scenario, expected in (('stage_unresolved', 8), ('stage_failed', 5), ('stage_shell_success', 0)):
+            with self.subTest(scenario=scenario):
+                p = self.run_cycle(scenario, remote_shell=shutil.which('zsh'))
+                self.assertEqual(p.returncode, expected, p.stderr)
+                if expected == 8:
+                    self.assertTrue((self.home / '.stoarama-gss-cycle.lock').is_dir())
+                    (self.home / '.stoarama-gss-cycle.lock').rmdir()
+                self.assertEqual(self.state.read_text(), CANDIDATE if expected == 0 else PARENT)
 
     def test_success_publishes_ledger(self):
         p = self.run_cycle('success')
