@@ -287,11 +287,11 @@ def plaza(date, hhmmss='103000', folder='99991_asia_japan_tokyo_shinjuku9'):
 
 
 def clip(date, size=10, held=False, hhmmss='103000', folder='99991_asia_japan_tokyo_shinjuku9', cid=0, catalogued=None, raw_key=None,
-         zone='Asia/Tokyo', seen='2026-11-01T00:00:00+00:00'):
+         zone='Asia/Tokyo', seen='2026-11-01T00:00:00+00:00', cat_sha='c' * 64, nas_sha='c' * 64):
     start = k.datetime.datetime.combine(date, k.datetime.time(10, 30), k.zoneinfo.ZoneInfo(zone))
     end = start + k.datetime.timedelta(minutes=1)
     return [plaza(date, hhmmss, folder), start.isoformat(), end.isoformat(), held, size, cid,
-            size if catalogued is None else catalogued, raw_key, seen]
+            size if catalogued is None else catalogued, raw_key, seen, cat_sha, nas_sha]
 
 
 SEOUL = '04_Asia_South_Korea_Seoul_Daechi_Station_Intersection'  # Stream 78, Keep Everything: Seoul [2026-08-24, 2026-09-13).
@@ -307,9 +307,8 @@ class DayPlanTests(unittest.TestCase):
         self.folders = k.load_folders()
         self.d = k.datetime.date
 
-    def facts(self, *clips, claimed=(), held_dirs=(), outputs=()):
-        return dict(clips=list(clips), outputs=[list(x) for x in outputs], claimed=[list(x) for x in claimed],
-                    held_dirs=list(held_dirs), keep20_active=True)
+    def facts(self, *clips, claimed=(), held_dirs=()):
+        return dict(clips=list(clips), claimed=[list(x) for x in claimed], held_dirs=list(held_dirs), keep20_active=True)
 
     def units(self, w, facts, listed=None):
         return k.day_units(w, self.folders, facts, listed)[0]
@@ -332,36 +331,38 @@ class DayPlanTests(unittest.TestCase):
         facts = self.facts(clip(self.d(2026, 10, 10), folder=SEOUL))
         self.assertEqual(self.units(self.policy[3], facts), [])
 
-    def test_keep_everything_units_name_only_media_with_a_listed_r2_counterpart(self):
+    def test_keep_everything_units_name_only_media_with_a_listed_raw_copy_of_the_same_content(self):
         ke = self.policy[78]
         self.assertTrue(ke['keep_everything'])
         out = self.d(2026, 9, 20)
         facts = self.facts(
-            ke_clip(out, 1, raw_key='managed/a/1.mp4'),                         # raw listed, same size: named
-            ke_clip(out, 2, hhmmss='113000'),                                   # no counterpart: stays
+            ke_clip(out, 1, raw_key='managed/a/1.mp4'),                         # raw listed, same size and sha: named
+            ke_clip(out, 2, hhmmss='113000'),                                   # no raw (a stitched output is not a copy): stays
             ke_clip(out, 3, hhmmss='123000', raw_key='managed/a/3.mp4'),        # raw listed with another size: stays
-            ke_clip(out, 4, hhmmss='133000', raw_key='managed/a/4.mp4'),        # raw not listed: stays
-            ke_clip(out, 5, hhmmss='143000'),                                   # stitched output listed: named
+            ke_clip(out, 4, hhmmss='133000', raw_key='managed/a/4.mp4', nas_sha=None),  # raw not listed and hashless: stays
+            ke_clip(out, 5, hhmmss='143000', raw_key='managed/a/5.mp4', nas_sha=None),   # no NAS hash: stays, counted hashless
             ke_clip(out, 6, hhmmss='153000', raw_key='managed/a/6.mp4', catalogued=11),  # NAS size differs from the clip
             ke_clip(out, 7, hhmmss='163000', size=-1, raw_key='managed/a/7.mp4'),        # not on the NAS
-            outputs=[('joined/goodplus-x/objects/' + 'a' * 64 + '.mp4', 900, [5, 8]),
-                     ('joined/goodplus-x/objects/' + 'b' * 64 + '.mp4', 800, [3])])
-        listing = {'managed/a/1.mp4': 10, 'managed/a/3.mp4': 99, 'managed/a/6.mp4': 11,
-                   'joined/goodplus-x/objects/' + 'a' * 64 + '.mp4': 900, 'joined/goodplus-x/objects/' + 'b' * 64 + '.mp4': 1}
+            ke_clip(out, 8, hhmmss='173000', raw_key='managed/a/8.mp4', nas_sha='d' * 64),  # NAS sha differs: stays
+            ke_clip(out, 9, hhmmss='183000', raw_key='managed/a/9.mp4', cat_sha=None))      # no catalogue hash: stays, hashless
+        listing = {'managed/a/1.mp4': 10, 'managed/a/3.mp4': 99, 'managed/a/5.mp4': 10, 'managed/a/6.mp4': 11,
+                   'managed/a/8.mp4': 10, 'managed/a/9.mp4': 10}
         asked = []
         units, excluded = k.day_units(ke, self.folders, facts, lambda keys: asked.append(keys) or {x: listing[x] for x in keys if x in listing})
         [unit] = units
-        self.assertEqual([n['name'] for n in unit['names']], [plaza(out, h, SEOUL).rsplit('/', 1)[1] for h in ('103000', '143000')])
-        self.assertEqual((unit['files'], unit['bytes'], unit['names'][0]['size_bytes']), (2, 20, 10))
-        self.assertEqual(excluded, {'files': 4, 'bytes': 40})
+        self.assertEqual([n['name'] for n in unit['names']], [plaza(out, h, SEOUL).rsplit('/', 1)[1] for h in ('103000',)])
+        self.assertEqual((unit['files'], unit['bytes'], unit['names'][0]['size_bytes']), (1, 10, 10))
+        self.assertEqual(excluded, {'files': 4, 'bytes': 40, 'hash_mismatch_files': 1, 'hash_mismatch_bytes': 10,
+                                    'hashless_files': 2, 'hashless_bytes': 20, 'observed_hashless_files': 3,
+                                    'observed_hashless_bytes': 30})
         self.assertEqual(len(asked), 1)
-        self.assertNotIn('managed/a/7.mp4', asked[0])
+        self.assertEqual(asked[0], {'managed/a/%d.mp4' % n for n in (1, 3, 4, 5, 6, 8, 9)})
         # A deleted KE unit's name stays out until the NAS reports the file again after the deletion
         # (a kept size mismatch); its other names are planned again.
         lister = lambda keys: {x: listing[x] for x in keys if x in listing}
         deleted = lambda at: dict(facts, claimed=[[unit['relative_dir'], '2026-09-20', 'deleted', unit['names'][:1], at]])
         again = self.units(ke, deleted('2026-11-02T00:00:00Z'), lister)
-        self.assertEqual([n['name'] for n in again[0]['names']], [unit['names'][1]['name']])
+        self.assertEqual(again, [])
         self.assertEqual(self.units(ke, deleted('2026-10-31T00:00:00Z'), lister), units)
         self.assertEqual(self.units(ke, dict(facts, claimed=[[unit['relative_dir'], '2026-09-20', 'pending', unit['names'][:1],
                                                              '2026-11-02T00:00:00Z']]), lister), [])
@@ -460,32 +461,38 @@ class DayAdmissionReconcileTests(unittest.TestCase):
         detail = dict(id=11, label=self.plan['label'], plan_sha256=self.plan['plan_sha256'], mode='dry_run', policy_sha256=k.POLICY_SHA,
                       files=2, bytes=300, units=[dict(u, state='pending', receipts=[]) for u in self.plan['units']])
         a = SimpleNamespace(max_units=1000, out=None, stream=[293], psql='psql', summary_only=False, max_plans=1,
-                            label_prefix='kday-x', submit=True, api='https://example.invalid', r2prune=None, bucket='stoarama')
+                            label_prefix='kday-x', submit=True, api='https://example.invalid', r2prune='/bin/false', bucket='stoarama')
         with tempfile.TemporaryDirectory() as out, patch.object(k, 'load_folders', return_value={}), \
              patch.object(k, 'day_stream_rows', return_value={}), \
              patch.object(k, 'day_units', return_value=(self.plan['units'], {'files': 0, 'bytes': 0})), \
              patch.object(k, 'service', side_effect=[self.err(502), detail]), \
              patch.object(k, 'query', return_value=[[11, self.plan['plan_sha256']]]), patch('builtins.print'):
             a.out = out
-            self.assertEqual(k.day_main(a, {293: {'keep_everything': False}}), 0)
+            self.assertEqual(k.day_main(a, {293: {'keep_everything': True}}), 0)
             summary = json.loads((Path(out) / 'summary.json').read_text())
         self.assertEqual([x['id'] for x in summary['receipts']], [11])
 
-    def test_day_main_lists_keep_everything_last_and_needs_a_lister(self):
+    def test_day_main_prepares_only_keep_everything_streams_with_a_lister(self):
         a = SimpleNamespace(max_units=1000, out=None, stream=[], psql='psql', summary_only=True, max_plans=0,
                             label_prefix='kday-x', submit=False, r2prune=None, bucket='stoarama')
-        policy = {5: {'keep_everything': True}, 9: {'keep_everything': False}, 7: {'keep_everything': False}}
+        policy = {5: {'keep_everything': True}, 9: {'keep_everything': False}, 6: {'keep_everything': True}}
         seen = []
         with tempfile.TemporaryDirectory() as out, patch.object(k, 'load_folders', return_value={}), \
-             patch.object(k, 'day_stream_rows', return_value={}), patch('builtins.print'), \
-             patch.object(k, 'day_units', side_effect=lambda w, f, facts, listed: seen.append(listed) or ([], {'files': 0, 'bytes': 0})):
+             patch.object(k, 'day_stream_rows', side_effect=lambda w, psql, bucket: w), patch('builtins.print'), \
+             patch.object(k, 'day_units', side_effect=lambda w, f, facts, listed: seen.append((facts, listed)) or ([], {'files': 0, 'bytes': 0})):
             a.out = out
-            with self.assertRaises(SystemExit):
+            with self.assertRaisesRegex(SystemExit, 'need --r2prune'):
                 k.day_main(a, policy)
-            self.assertEqual(seen, [None, None])  # 7 and 9 ran before Keep Everything stream 5 refused.
+            self.assertEqual(seen, [])
             a.r2prune = '/bin/false'
             self.assertEqual(k.day_main(a, policy), 0)
-            self.assertTrue(callable(seen[-1]))
+            self.assertEqual([facts for facts, _ in seen], [policy[5], policy[6]])  # Stream 9 is never read.
+            self.assertTrue(all(callable(listed) for _, listed in seen))
+            summary = json.loads((Path(out) / 'summary.json').read_text())
+            self.assertEqual((summary['streams'], summary['excluded_hashless_files']), ([5, 6], 0))
+            a.stream = [9]
+            with self.assertRaisesRegex(SystemExit, 'non-Keep-Everything day plans are disabled'):
+                k.day_main(a, policy)
 
     def test_r2_listing_lists_only_the_wanted_roots(self):
         with tempfile.TemporaryDirectory() as out:

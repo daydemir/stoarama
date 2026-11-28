@@ -51,12 +51,22 @@ RECOVERY = {'r2_sha_verified', 'r2_md5_etag_matched', 'r2_name_size_matched'}
 # if its in the keep 20? otherwise it can be deleted right?"; "lift nas cleanup
 # dialy limit please".
 # Keep Everything (verbatim: "nas shoul dnot have any of the keep everything
-# (except the keep 20)"): KE streams come after the others, and a KE unit names
-# only media whose R2 counterpart is live and listed with the same size.
-DAY_REASON = ('Deniz approval (verbatim: "yes, delete"; "nas shoul dnot have any of the keep everything (except the keep 20)"): '
-              'NAS raw day directories outside the pinned 20-day window; server and independent folder/window/hold check PASS; '
-              'Keep Everything days name only media with a live same-size R2 counterpart; no daily cap; one owned plan.')
+# (except the keep 20)"): a KE unit names only media whose own raw R2 object is
+# live and listed with the same size.
+# Redundancy gate (Deniz, 2026-11-27, verbatim: "yuea double check everything be
+# 100% sure redundancy before deleting"): a NAS file leaves only against another
+# verified copy of the same content. A KE name's raw R2 object is that copy: live
+# at the same size, the same valid sha256 in both the catalogue and present NAS inventory,
+# and before any activation RESTORE_SAMPLE random hashed names are
+# fetched from R2 and hash-matched. A stitched output is not the same content.
+# Non-KE day units prove no second copy: they are never planned, enabled or left
+# running.
 R2PRUNE = Path.home() / 'stoarama-r2prune-lane' / 'r2prune'
+AWS = Path.home() / 'aws-cli' / 'aws'
+RESTORE_SAMPLE = 20
+# Bound the entire sample, not just reads which produce output.
+RESTORE_TIMEOUT_SEC = 900
+DAY_INTEGRATION_BLOCK = 'day cleanup blocked: no shared persistent survivor reservation at the R2 wire boundary'
 FOLDERS = 'backend/internal/api/nas_cleanup_folder_streams.json'
 FOLDERS_SHA = '94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88bc33c4c90cae0e7ab8'
 DAY_MAX_UNITS = 1000
@@ -65,6 +75,18 @@ DAY_MAX_UNITS = 1000
 FILE_EXCLUSIONS, DAY_EXCLUSIONS = 'excluded_streams', 'day_excluded_streams'
 EXCLUSIONS = (FILE_EXCLUSIONS, DAY_EXCLUSIONS)
 DAY_TERMINAL = {'deleted', 'refused', 'client_refused', 'retired'}
+# SQL CTEs over u (dir, d, sid, names): n, one row per Keep Everything name; k, each name's catalogued clips of
+# that path and size, whether the clip's own raw R2 object is live (the preparer's r2_live_raw on alias rc), and
+# the catalogued and present NAS inventory sha256 (null when unrecorded).
+KE_NAME_COPIES = """n AS (SELECT u.dir,u.d,u.sid,x->>'name' name,(x->>'size_bytes')::bigint size
+            FROM u CROSS JOIN jsonb_array_elements(u.names) x),
+          k AS (SELECT n.dir,n.d,n.name,rc.object_key,rc.size_bytes,trim(both '"' from rc.etag) etag,
+              (__RAW_LIVE__ AND f.size_bytes=n.size AND rc.etag<>'') live,
+              lower(nullif(rc.sha256,'')) cat_sha,lower(nullif(f.sha256,'')) nas_sha
+            FROM n JOIN recordings r ON r.account_id=47 AND r.stream_id=n.sid
+            JOIN recording_clips rc ON rc.recording_id=r.id AND rc.display_path=n.dir||'/'||n.name AND rc.size_bytes=n.size
+            LEFT JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=rc.id AND f.state='present'
+              AND f.relative_path=rc.display_path)"""
 _MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
            'August', 'September', 'October', 'November', 'December')
 _WEEKDAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
@@ -299,6 +321,7 @@ def day_verify(plan, windows, timezones, keep_everything, folders, catalog):
         require(u['state'] == 'pending' and u['attempt'] == 0 and u['receipts'] == [], 'day unit already started')
         sid, directory = u['stream_id'], u['relative_dir']
         require(sid in windows, 'day unit stream is unpinned')
+        require(sid in keep_everything, 'a non-Keep-Everything day unit has no proven second copy')
         names = u.get('names') or []
         require((sid in keep_everything) == bool(names), 'a Keep Everything unit names its media; any other unit names none')
         require(all(type(n['size_bytes']) is int and n['size_bytes'] > 0 for n in names)
@@ -315,7 +338,9 @@ def day_verify(plan, windows, timezones, keep_everything, folders, catalog):
         row = rows.get((directory, u['local_date']))
         require(row is not None and row['held'] == 0 and row['overlap'] == 0 and row['dir_held'] is False,
                 'directory-day has a held or in-window catalogued clip')
-        require(row['unlive'] == 0, 'a Keep Everything name lacks a live same-size R2 counterpart in the catalogue')
+        require(row['unlive'] == 0, 'a Keep Everything name lacks its live same-size raw R2 object in the catalogue')
+        require(row['mismatch'] == 0, 'a Keep Everything name differs in sha256 from its raw R2 object')
+        require(row['hashless'] == 0, 'a Keep Everything name lacks both valid sha256 hashes')
     require(len({u['stream_id'] for u in units}) == 1, 'day plan must be one stream')
     return plan['bytes']
 
@@ -837,6 +862,7 @@ class Runner:
         return self.admission
 
     def enable(self, plan, day=False):
+        require(not day, DAY_INTEGRATION_BLOCK)
         # D's existing gate orders attempt journals with lane-lock ownership.
         # Acquire the tick lock only after proving no abandoned attempt. Keep
         # the gate through the POST so a new D tick cannot mistake our lock for
@@ -854,13 +880,9 @@ class Runner:
                         require('tick' not in record['active'], 'interrupted finish tick requires reconciliation')
                         if self.stopped():
                             return False
-                        if day:
-                            self.day_control(plan['id'], 'control', {'mode': 'enabled',
-                                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24, 'reason': DAY_REASON}, 'enabled')
-                        else:
-                            self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
-                                'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
-                                'allow_long_approval': True, 'reason': REASON})
+                        self.api('POST', 'plans/' + str(plan['id']) + '/control', {'mode': 'enabled',
+                            'plan_sha256': plan['plan_sha256'], 'approval_hours': 24,
+                            'allow_long_approval': True, 'reason': REASON})
                         return True
             # Wait outside the gate and snapshot lock, then revalidate before
             # acquiring it again. No active cleanup is waiting here.
@@ -1520,31 +1542,132 @@ class Runner:
                  'ws': self.windows[u['stream_id']][0].isoformat(), 'we': self.windows[u['stream_id']][1].isoformat(),
                  'names': u.get('names') or [], 'ke': u['stream_id'] in self.keep_everything} for u in plan['units']]
         encoded = base64.b64encode(json.dumps(rows).encode()).decode()
-        prepare = self.preparer()
-        # unlive: Keep Everything names whose catalogued clip of the stream is missing, has another size,
-        # or has no live R2 counterpart (the preparer's and server's rule).
+        # Per Keep Everything name, against the stream's catalogued clips of that path and size (the preparer's
+        # rule): unlive, none whose own raw R2 object is live (a stitched output is not the same content);
+        # mismatch, one whose catalogued and present NAS inventory sha256 differ; hashless, none with both.
         return self.query("""WITH u AS (SELECT x->>'dir' dir,(x->>'d')::date d,(x->>'sid')::bigint sid,x->>'tz' tz,
             (x->>'ws')::timestamptz ws,(x->>'we')::timestamptz we,x->'names' names,(x->>'ke')::boolean ke
           FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
           c AS (SELECT u.dir,u.d,c.id,(c.clip_start_at<u.we AND c.clip_end_at>u.ws) inside FROM u
             JOIN recordings r ON r.account_id=47 AND r.stream_id=u.sid JOIN recording_clips c ON c.recording_id=r.id
             WHERE c.clip_start_at>=u.d::timestamp AT TIME ZONE u.tz AND c.clip_start_at<(u.d+1)::timestamp AT TIME ZONE u.tz
-              AND left(c.display_path,length(u.dir)+1)=u.dir||'/' AND strpos(substr(c.display_path,length(u.dir)+2),'/')=0)
+              AND left(c.display_path,length(u.dir)+1)=u.dir||'/' AND strpos(substr(c.display_path,length(u.dir)+2),'/')=0),
+          """ + self.ke_name_copies() + """,
+          s AS (SELECT n.dir,n.d,n.name,(count(k.object_key)=1 AND coalesce(bool_and(k.live),false)) live,
+              coalesce(bool_or(k.cat_sha<>k.nas_sha),false) mismatch,
+              (count(k.object_key)=1 AND coalesce(bool_and(k.cat_sha ~ '^[0-9a-f]{64}$' AND k.nas_sha ~ '^[0-9a-f]{64}$'),false)) hashed
+            FROM n LEFT JOIN k ON k.dir=n.dir AND k.d=n.d AND k.name=n.name GROUP BY n.dir,n.d,n.name)
           SELECT coalesce(json_agg(json_build_object('relative_dir',u.dir,'local_date',u.d::text,
             'held',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND nas_cleanup_day_clip_held(c.id,u.ke)),
             'overlap',(SELECT count(*) FROM c WHERE c.dir=u.dir AND c.d=u.d AND c.inside),
             'dir_held',nas_cleanup_day_dir_held(u.dir,u.ke),
-            'unlive',(SELECT count(*) FROM jsonb_array_elements(u.names) n WHERE NOT EXISTS(SELECT 1 FROM recording_clips c
-              JOIN recordings r ON r.id=c.recording_id AND r.account_id=47 AND r.stream_id=u.sid
-              WHERE c.display_path=u.dir||'/'||(n->>'name') AND c.size_bytes=(n->>'size_bytes')::bigint AND (""" + prepare.r2_live_raw('c', prepare.R2_BUCKET) + """
-               OR EXISTS(SELECT 1 FROM recording_collation_outputs o WHERE o.source_clip_ids @> ARRAY[c.id] AND """ + prepare.R2_LIVE_OUTPUT + """)))))),'[]') FROM u""", 'day catalog query')
+            'unlive',(SELECT count(*) FROM s WHERE s.dir=u.dir AND s.d=u.d AND NOT s.live),
+            'mismatch',(SELECT count(*) FROM s WHERE s.dir=u.dir AND s.d=u.d AND s.mismatch),
+            'hashless',(SELECT count(*) FROM s WHERE s.dir=u.dir AND s.d=u.d AND NOT s.hashed))),'[]') FROM u""", 'day catalog query')
+
+    def ke_name_copies(self):
+        prepare = self.preparer()
+        return KE_NAME_COPIES.replace('__RAW_LIVE__', prepare.r2_live_raw('rc', prepare.R2_BUCKET))
+
+    def day_sample(self, p):
+        """Random, full readback of >=20 distinct raw survivors (all if fewer).
+
+        Keep the evidence bound to the immutable plan and one monotonic deadline.
+        This is a readback, not authority to execute: the persistent cross-lane
+        reservation is a separate prerequisite.
+        """
+        require(p['mode'] == 'dry_run' and day_digest(p['units']) == p['plan_sha256'], 'restore sample plan differs')
+        names = sum(len(u.get('names') or ()) for u in p['units'])
+        require(names > 0, 'restore sample has no names')
+        deadline = time.monotonic() + RESTORE_TIMEOUT_SEC
+        verified_until = utcnow() + timedelta(seconds=RESTORE_TIMEOUT_SEC)
+        rows = [{'dir': u['relative_dir'], 'd': u['local_date'], 'sid': u['stream_id'], 'names': u.get('names') or []}
+                for u in p['units']]
+        encoded = base64.b64encode(json.dumps(rows).encode()).decode()
+        sample = self.query("""WITH u AS (SELECT x->>'dir' dir,(x->>'d')::date d,(x->>'sid')::bigint sid,x->'names' names
+          FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x),
+          """ + self.ke_name_copies() + """
+          SELECT coalesce(json_agg(json_build_array(object_key,size_bytes,cat_sha,nas_sha,etag)),'[]')
+          FROM (SELECT * FROM (SELECT DISTINCT ON (object_key) * FROM k WHERE live AND cat_sha=nas_sha
+            AND cat_sha ~ '^[0-9a-f]{64}$') h ORDER BY random() LIMIT """ + str(RESTORE_SAMPLE) + ') s', 'restore sample query')
+        require(len(sample) == min(RESTORE_SAMPLE, names) and len({row[0] for row in sample}) == len(sample),
+                'too few distinct hashed names for the R2 restore sample')
+        evidence = []
+        for key, size, cat_sha, nas_sha, etag in sample:
+            require(cat_sha == nas_sha and re.fullmatch('[0-9a-f]{64}', cat_sha or '') and size > 0 and etag,
+                    'R2 restore sample lacks exact identity')
+            got = self.r2_sha256(key, etag, size, deadline)
+            require(got[:2] == (size, cat_sha), 'R2 restore sample differs from the catalogue or the NAS inventory')
+            evidence.append(dict(key=key, etag=etag, version_id=got[2], size_bytes=size, sha256=cat_sha))
+        require(time.monotonic() < deadline, 'R2 restore sample deadline exceeded')
+        # Re-read the plan after I/O, not before it, so a stale sample cannot be
+        # attached to another plan or a started/changed one.
+        require(self.day_plan(p['id']) == p, 'day plan changed during restore sample')
+        require(time.monotonic() < deadline, 'R2 restore sample deadline exceeded')
+        with (self.root / 'runner.jsonl').open('a') as output:
+            output.write(json.dumps(dict(at=utcnow().isoformat(), phase='day_restore_sample', day_plan=p['id'],
+                                         plan_sha256=p['plan_sha256'], names=names, sampled=len(sample),
+                                         minimum_met=len(sample) >= RESTORE_SAMPLE, verification_only=True,
+                                         verify_until=verified_until.isoformat(), survivors=evidence)) + '\n')
+            output.flush(); os.fsync(output.fileno())
+
+    def r2_sha256(self, key, etag, expected_size, deadline):
+        """Read the exact current survivor generation using a conditional GET.
+
+        R2 may not expose a VersionId; the ETag is still mandatory. Never accept
+        a replacement, short body, error, or a read that runs past the deadline.
+        """
+        env = dict(os.environ, AWS_ACCESS_KEY_ID=os.environ['R2_ACCESS_KEY_ID'],
+                   AWS_SECRET_ACCESS_KEY=os.environ['R2_SECRET_ACCESS_KEY'], AWS_DEFAULT_REGION='auto')
+        endpoint = 'https://%s.r2.cloudflarestorage.com' % os.environ['R2_ACCOUNT_ID']
+        base = [str(AWS), 's3api']
+        args = ['--bucket', os.environ.get('R2_BUCKET', 'stoarama'), '--key', key, '--if-match', '"' + etag + '"',
+                '--endpoint-url', endpoint, '--output', 'json', '--no-cli-pager']
+        def request(operation, extra=()):
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, 'R2 restore sample deadline exceeded')
+            try:
+                result = subprocess.run(base + [operation] + args + list(extra), env=env,
+                                        capture_output=True, timeout=remaining, check=True)
+                metadata = json.loads(result.stdout)
+            except (subprocess.SubprocessError, ValueError, OSError):
+                raise Halt('R2 restore sample fetch failed or timed out') from None
+            require(metadata.get('ETag') == '"' + etag + '"' and metadata.get('ContentLength') == expected_size,
+                    'R2 restore sample version or size differs')
+            return metadata.get('VersionId') or ''
+        version = request('head-object')
+        with tempfile.TemporaryDirectory() as scratch:
+            body = Path(scratch) / 'object'
+            require(request('get-object', (['--version-id', version] if version else []) + [str(body)]) == version,
+                    'R2 restore sample version differs')
+            digest, size = hashlib.sha256(), 0
+            with body.open('rb') as f:
+                for block in iter(lambda: f.read(1 << 20), b''):
+                    require(time.monotonic() < deadline, 'R2 restore sample deadline exceeded')
+                    digest.update(block)
+                    size += len(block)
+                    require(size <= expected_size, 'R2 restore sample size differs')
+            require(size == expected_size and request('head-object') == version, 'R2 restore sample version or size differs')
+        return size, digest.hexdigest(), version
+
+    def unproven(self, p):
+        """The plan has a unit no second copy is proven for: any non-Keep-Everything unit."""
+        return any(u['stream_id'] not in self.keep_everything for u in p['units'])
 
     def ke_plan_held(self, p):
         return self.ke_held() and any(u['stream_id'] in self.keep_everything for u in p['units'])
 
     def day_checked(self, p):
         """day_verify's bytes, or None after closing a never-started plan whose Keep Everything name
-        lost its live R2 counterpart, or that the Keep Everything hold covers; its directory-days are replanned."""
+        lost its live raw R2 copy, that the Keep Everything hold covers, or that proves no second copy (a
+        non-Keep-Everything unit); its directory-days are replanned. A plan that passes is also restore-sampled."""
+        if p['mode'] == 'dry_run' and self.unproven(p):
+            require(not self.dry_run, 'a plan without a proven second copy cannot be closed by a dry run')
+            closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
+                                      'reason': 'No second copy proven: non-Keep-Everything day cleanup is disabled.'}, 'retired')
+            require(closed['id'] == p['id'] and closed['mode'] == 'retired', 'day close was not confirmed')
+            self.save('day_replan', current_day_plan=None)
+            return None
         if p['mode'] == 'dry_run' and self.ke_plan_held(p):
             require(not self.dry_run, 'a held Keep Everything plan cannot be closed by a dry run')
             closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
@@ -1553,38 +1676,40 @@ class Runner:
             self.save('day_replan', current_day_plan=None)
             return None
         catalog = self.day_catalog(p)
+        self.save(self.status.get('phase', 'day_dry_run'), day_hashless_names=sum(c['hashless'] for c in catalog))
         if not self.dry_run and p['mode'] == 'dry_run' and any(c.get('unlive') for c in catalog):
             closed = self.day_control(p['id'], 'close', {'plan_sha256': p['plan_sha256'],
                                       'reason': 'Keep Everything name lost its live R2 counterpart; replanning.'}, 'retired')
             require(closed['id'] == p['id'] and closed['mode'] == 'retired', 'day close was not confirmed')
             self.save('day_replan', current_day_plan=None)
             return None
-        return day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
+        size = day_verify(p, self.windows, self.timezones, self.keep_everything, self.folders, catalog)
+        self.day_sample(p)
+        return size
 
     def ke_held(self):
         # Owner hold (2026-11-26): Keep Everything day cleanup waits until permits verify R2 live.
         return (self.root / 'KE_HOLD').exists()
 
     def day_pick(self):
-        held = self.ke_held() and self.keep_everything
-        skip_ke = (" AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id IN (%s))"
-                   % ','.join(str(int(sid)) for sid in sorted(self.keep_everything))) if held else ''
+        # Only Keep Everything plans prove a second copy; while KE_HOLD exists there is nothing to pick.
+        if self.ke_held() or not self.keep_everything:
+            return None
+        ke = ','.join(str(int(sid)) for sid in sorted(self.keep_everything))
         ids = self.query("SELECT coalesce(json_agg(p.id ORDER BY p.id),'[]') FROM nas_cleanup_day_plans p WHERE p.account_id=47 "
-                         "AND p.connection_id=13 AND p.mode='dry_run' AND p.policy_sha256='" + POLICY_SHA + "'" + skip_ke,
+                         "AND p.connection_id=13 AND p.mode='dry_run' AND p.policy_sha256='" + POLICY_SHA + "'"
+                         " AND NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id NOT IN (" + ke + "))",
                          'day plan query')
         if ids:
             return ids[0]
-        for sid in sorted(self.windows, key=lambda sid: (sid in self.keep_everything, sid)):
+        for sid in sorted(self.keep_everything & set(self.windows)):
             if self.stopped():
                 return None
-            if held and sid in self.keep_everything:
-                continue
             if not self.stream_ready(sid, DAY_EXCLUSIONS):
                 continue
             prefix = 'kday-' + utcnow().strftime('%Y%m%d-%H%M%S')
             out = self.root / 'day-plans' / (prefix + '-s' + str(sid))
-            lister = ['--r2prune', str(R2PRUNE)] if sid in self.keep_everything else []
-            if not self.prepare_stream(sid, ['--day-plans', '--max-plans', '1', '--label-prefix', prefix, *lister,
+            if not self.prepare_stream(sid, ['--day-plans', '--max-plans', '1', '--label-prefix', prefix, '--r2prune', str(R2PRUNE),
                                              '--out', str(out), '--api', API, '--submit', '--atomic-admission'],
                                      DAY_EXCLUSIONS):
                 continue
@@ -1600,7 +1725,7 @@ class Runner:
                     'live ownership failure requires shutdown')
             self.finish_health()
             p = self.day_plan(pid)
-            if day_state(p, utcnow()) != 'running' or self.ke_plan_held(p):
+            if day_state(p, utcnow()) != 'running' or self.ke_plan_held(p) or self.unproven(p):
                 self.day_finish(p)
                 return
             require(p['master_deletion_enabled'] is True, 'master switch mismatch during execution')
@@ -1636,7 +1761,7 @@ class Runner:
                   day_deleted_files=final['deleted_media_files'], day_deleted_bytes=final['deleted_media_bytes'])
 
     def run_day(self):
-        """One owned day plan at a time: admit, verify independently, enable, monitor, close."""
+        """Verify a day plan without enabling; pause/drain any legacy active plan."""
         self.check_restart()
         if not self.owner_validated:
             self.validate_owner()
@@ -1653,7 +1778,8 @@ class Runner:
             p = self.day_plan(pid)
             require(self.status.get('started_day_plan_sha256') == p['plan_sha256'] and p['master_deletion_enabled'] is True,
                     'saved enabled day plan is unhealthy; owner review required')
-            self.day_monitor(pid)
+            self.day_finish(p)
+            raise Halt(DAY_INTEGRATION_BLOCK)
         elif pid and self.day_plan(pid)['mode'] == 'paused':
             self.day_finish(self.day_plan(pid))
         self.check_delivery()
@@ -1668,20 +1794,11 @@ class Runner:
             if size is None:
                 continue
             if self.dry_run:
-                self.save('day_dry_run_pass', proposed_bytes=size)
+                names = sum(len(u.get('names') or ()) for u in p['units'])
+                self.save('day_dry_run_pass', proposed_bytes=size, verification_only=True,
+                          restore_sampled=min(RESTORE_SAMPLE, names), restore_sample_minimum_met=names >= RESTORE_SAMPLE)
                 return
-            self.idle()
-            require(p['master_deletion_enabled'] is True, 'controller must enable the runtime master before activation')
-            if self.stopped():
-                break
-            p = self.day_plan(pid)
-            if self.day_checked(p) is None:
-                continue
-            self.idle()
-            self.save('day_enabling', started_day_plan_sha256=p['plan_sha256'])
-            if self.stopped() or not self.enable(p, day=True):
-                break
-            self.day_monitor(pid)
+            raise Halt(DAY_INTEGRATION_BLOCK)
         self.save('stopped')
 
     def fail(self, error):

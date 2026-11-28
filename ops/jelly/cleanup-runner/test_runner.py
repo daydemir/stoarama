@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import errno
 import io
 from datetime import timedelta
@@ -6,6 +7,7 @@ import importlib.util
 import json
 import sys
 import os
+import random
 import shutil
 import subprocess
 from types import SimpleNamespace
@@ -1867,8 +1869,12 @@ def day_fixture(*days, folder='f', stream=3, names=None):
     plan = dict(id=77, label='kday-s3-day-0001', policy_sha256=r.POLICY_SHA, plan_sha256=r.day_digest(units), mode='dry_run',
                 approval_reason='', approved_until=None, files=2 * len(units), bytes=200 * len(units), units=units,
                 deleted_media_files=0, deleted_media_bytes=0, master_deletion_enabled=True)
-    catalog = [dict(relative_dir=u['relative_dir'], local_date=u['local_date'], held=0, overlap=0, dir_held=False, unlive=0) for u in units]
+    catalog = [dict(relative_dir=u['relative_dir'], local_date=u['local_date'], held=0, overlap=0, dir_held=False, unlive=0,
+                    mismatch=0, hashless=0) for u in units]
     return plan, catalog
+
+
+KE_NAMES = [dict(name='a.mp4', size_bytes=150), dict(name='b.mp4', size_bytes=50)]
 
 
 class DayVerifyTests(unittest.TestCase):
@@ -1885,10 +1891,11 @@ class DayVerifyTests(unittest.TestCase):
         j = self.job
         return r.day_verify(plan, j.windows, j.timezones, j.keep_everything, j.folders, catalog)
 
-    def test_outside_directory_days_pass_with_checkable_totals(self):
-        # Stream 3 keeps Tokyo [2026-09-16, 2026-10-06).
+    def test_non_keep_everything_days_prove_no_second_copy_and_stop(self):
+        # Stream 3 keeps Tokyo [2026-09-16, 2026-10-06); these days are outside it, but no copy is proven.
         plan, catalog = day_fixture(self.d(2026, 9, 14), self.d(2026, 10, 7), folder='99991_asia_japan_tokyo_shinjuku9')
-        self.assertEqual(self.verify(plan, catalog), 400)
+        with self.assertRaisesRegex(r.Halt, 'no proven second copy'):
+            self.verify(plan, catalog)
         unit = dict(relative_dir='a/September/12-Saturday', local_date='2026-09-12', stream_id=3, files=2, bytes=300)
         self.assertEqual(r.day_digest([unit]), '9116c84bd7061b32fa4560b4d0eeafafb47928ed9482772d4ae6d6e2cca5feb3')
         self.assertEqual(r.day_digest([dict(relative_dir='a/September/12-Saturday', local_date='2026-09-12', stream_id=78, files=2, bytes=300, names=[dict(name='a.mp4', size_bytes=100), dict(name='b.mp4', size_bytes=200)])]), 'e49626b3909930c3726bae74feccaae438249f9a49dc43c9ada3a2877e8e98f9')
@@ -1914,6 +1921,8 @@ class DayVerifyTests(unittest.TestCase):
         self.assertNotEqual(r.day_digest(plan['units']), r.day_digest([dict(plan['units'][0], names=None)]))
         for name, mutate in {
             'unlive name': lambda p, c: c[0].update(unlive=1),
+            'sha256 differs from R2': lambda p, c: c[0].update(mismatch=1),
+            'hashless': lambda p, c: c[0].update(hashless=1),
             'totals differ': lambda p, c: p['units'][0].update(names=names[:1]),
             'unsorted names': lambda p, c: p['units'][0].update(names=names[::-1]),
             'boundary day': lambda p, c: p['units'][0].update(local_date='2026-09-13', relative_dir=day_dir(seoul, self.d(2026, 9, 13))),
@@ -1929,49 +1938,40 @@ class DayVerifyTests(unittest.TestCase):
         with self.assertRaises(r.Halt):
             self.verify(plan, catalog)  # Names on a non-Keep-Everything unit.
 
-    def test_day_pick_prepares_keep_everything_streams_last_with_the_r2_lister(self):
+    def test_day_pick_prepares_only_keep_everything_streams_with_the_r2_lister(self):
         j = self.job
-        calls = []
-        with patch.object(j, 'query', return_value=[]), \
-             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: calls.append((sid, args)) or False):
-            self.assertIsNone(j.day_pick())
-        sids = [sid for sid, _ in calls]
-        ke = [sid for sid in sids if sid in j.keep_everything]
-        self.assertTrue(ke and sids == sorted(set(sids) - j.keep_everything) + sorted(ke))
-        self.assertTrue(all(('--r2prune' in args) == (sid in j.keep_everything) for sid, args in calls))
-
-    def test_day_pick_skips_keep_everything_streams_and_plans_while_held(self):
-        j = self.job
-        (j.root / 'KE_HOLD').write_text('hold')
         calls, sql = [], []
         with patch.object(j, 'query', side_effect=lambda q, *_: sql.append(q) or []), \
-             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: calls.append(sid) or False):
+             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: calls.append((sid, args)) or False):
             self.assertIsNone(j.day_pick())
-        self.assertTrue(calls and not set(calls) & j.keep_everything)
-        self.assertIn('NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id IN (', sql[0])
-        self.assertIn('u.stream_id IN (%s))' % ','.join(str(sid) for sid in sorted(j.keep_everything)), sql[0])
-        (j.root / 'KE_HOLD').unlink()
-        calls.clear(); sql.clear()
-        with patch.object(j, 'query', side_effect=lambda q, *_: sql.append(q) or []), \
-             patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: calls.append(sid) or False):
+        self.assertEqual([sid for sid, _ in calls], sorted(j.keep_everything))
+        self.assertTrue(all(args[args.index('--r2prune') + 1] == str(r.R2PRUNE) for _, args in calls))
+        # An admitted plan is picked only when every unit is Keep Everything.
+        self.assertIn('NOT EXISTS(SELECT 1 FROM nas_cleanup_day_units u WHERE u.plan_id=p.id AND u.stream_id NOT IN (%s))'
+                      % ','.join(str(sid) for sid in sorted(j.keep_everything)), sql[0])
+
+    def test_day_pick_picks_and_prepares_nothing_while_held(self):
+        j = self.job
+        (j.root / 'KE_HOLD').write_text('hold')
+        with patch.object(j, 'query', side_effect=AssertionError('read')), \
+             patch.object(j, 'prepare_stream', side_effect=AssertionError('prepare')):
             self.assertIsNone(j.day_pick())
-        self.assertTrue(set(calls) & j.keep_everything)
-        self.assertNotIn('nas_cleanup_day_units', sql[0])
 
     def test_day_pick_ignores_per_file_exclusions_and_keeps_its_own(self):
         # Per-file exclusions came from per-file refusals (source holds); they never skip day plans.
         j = self.job
+        a, b = sorted(j.keep_everything)[:2]
         evidence = lambda sid: dict(http_status=409, stream_id=sid, reason='source_hold', label='k28auto-x-s%d-raw-0001' % sid)
-        j.status.update(excluded_streams={'3': evidence(3)}, day_excluded_streams={'4': evidence(4)})
+        j.status.update(excluded_streams={str(a): evidence(a)}, day_excluded_streams={str(b): evidence(b)})
         seen = []
         with patch.object(j, 'query', return_value=[]), \
              patch.object(j, 'prepare_stream', side_effect=lambda sid, args, exclusions: seen.append((sid, exclusions)) or False):
             self.assertIsNone(j.day_pick())
-        self.assertIn((3, r.DAY_EXCLUSIONS), seen)
-        self.assertNotIn(4, [sid for sid, _ in seen])
+        self.assertIn((a, r.DAY_EXCLUSIONS), seen)
+        self.assertNotIn(b, [sid for sid, _ in seen])
         self.assertTrue(all(exclusions == r.DAY_EXCLUSIONS for _, exclusions in seen))
-        self.assertFalse(j.stream_ready(3))  # Per-file mode still skips it.
-        self.assertTrue(j.stream_ready(4))
+        self.assertFalse(j.stream_ready(a))  # Per-file mode still skips it.
+        self.assertTrue(j.stream_ready(b))
 
     def test_day_admission_409_excludes_the_stream_from_day_plans_only(self):
         j = self.job
@@ -2016,15 +2016,17 @@ class DayVerifyTests(unittest.TestCase):
 class FakeDayRunner(FakeRunner):
     def __init__(self, root, dry_run=False):
         super().__init__(root, dry_run)
-        self.timezones, self.keep_everything, self.folders = {3: 'UTC'}, set(), {'f': 3}
-        self.day, self.day_cat = day_fixture(r.date(2026, 8, 12))
+        self.timezones, self.keep_everything, self.folders = {3: 'UTC'}, {3}, {'f': 3}
+        self.day, self.day_cat = day_fixture(r.date(2026, 8, 12), names=copy.deepcopy(KE_NAMES))
         self.day_picks = [77]
+        self.samples = []
 
     def active(self):
         return {'plans': [], 'batches': 0, 'day_plans': [77] if self.day['mode'] == 'enabled' else []}
     def day_plan(self, pid): return copy.deepcopy(self.day)
     def day_catalog(self, plan): return self.day_cat
     def day_pick(self): return self.day_picks.pop(0) if self.day_picks else None
+    def day_sample(self, plan): self.samples.append(plan['id'])
     def api(self, method, path, body=None):
         self.events.append(path)
         if path.endswith('/control'):
@@ -2065,37 +2067,30 @@ class DayLoopTests(unittest.TestCase):
             job.day_finish = lambda p: finished.append(p['id'])
             job.day_monitor(77)
             self.assertEqual(finished, [77])  # Paused, drained and closed, not left running.
-            job.keep_everything = set()
+            (Path(root) / 'KE_HOLD').unlink()
             job.day.update(mode='dry_run')
-            self.assertEqual(job.day_checked(job.day), 200)  # Non-KE plans ignore the hold.
+            self.assertEqual(job.day_checked(job.day), 200)
+            self.assertEqual(job.samples, [77])  # Every passing check restore-samples the plan.
 
-    def test_one_owned_day_plan_enables_through_the_gate_then_pauses_and_closes(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'):
-            job = FakeDayRunner(root)
-            def deleted(pid):
-                job.events.append('day_monitor')
-                for u in job.day['units']:
-                    u.update(state='deleted', receipts=[dict(attempt=1, outcome='deleted', media_files=2, media_bytes=200)])
-                job.day.update(deleted_media_files=2, deleted_media_bytes=200)
-                r.Runner.day_monitor(job, pid)
-            job.day_monitor = deleted
-            job.run_day()
-            self.assertEqual(job.events, ['idle', 'idle', 'day-plans/77/control', 'day_monitor', 'day-plans/77/control', 'day-plans/77/close'])
-            self.assertEqual(job.control['reason'][:6], 'comple')
-            self.assertEqual(job.day['mode'], 'retired')
-            self.assertIsNone(job.status['current_day_plan'])
-            self.assertEqual((job.status['day_deleted_files'], job.status['day_deleted_bytes']), (2, 200))
-            self.assertEqual(job.status['phase'], 'day_complete')
-
-    def test_enable_body_is_the_day_approval(self):
+    def test_day_activation_fails_closed_until_shared_wire_reservation_exists(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
             job = FakeDayRunner(root)
-            bodies = []
-            job.day_monitor = lambda pid: job.stopping or setattr(job, 'stopping', True)
-            original = job.api
-            job.api = lambda method, path, body=None: bodies.append(body) or original(method, path, body)
-            job.run_day()
-            self.assertEqual(bodies[0], {'mode': 'enabled', 'plan_sha256': job.day['plan_sha256'], 'approval_hours': 24, 'reason': r.DAY_REASON})
+            with self.assertRaisesRegex(r.Halt, 'shared persistent survivor reservation'):
+                job.run_day()
+            self.assertEqual(job.day['mode'], 'dry_run')
+            self.assertEqual(job.samples, [77])
+            self.assertNotIn('day-plans/77/control', job.events)
+
+    def test_legacy_enabled_plan_is_paused_and_drained_not_resumed(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeDayRunner(root)
+            job.day.update(mode='enabled', approved_until=(NOW + timedelta(hours=1)).isoformat())
+            job.status.update(current_day_plan=77, started_day_plan_sha256=job.day['plan_sha256'])
+            job.day_monitor = lambda pid: self.fail('legacy unprotected operation resumed')
+            with self.assertRaisesRegex(r.Halt, 'shared persistent survivor reservation'):
+                job.run_day()
+            self.assertEqual(job.events, ['day-plans/77/control', 'day-plans/77/close'])
+            self.assertEqual(job.day['mode'], 'retired')
 
     def test_dry_run_never_enables(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
@@ -2103,6 +2098,9 @@ class DayLoopTests(unittest.TestCase):
             job.run_day()
             self.assertNotIn('day-plans/77/control', job.events)
             self.assertEqual(job.status['phase'], 'day_dry_run_pass')
+            self.assertTrue(job.status['verification_only'])
+            self.assertFalse(job.status['restore_sample_minimum_met'])
+            self.assertEqual(job.status['restore_sampled'], 2)
 
     def test_failed_independent_check_never_enables(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
@@ -2118,10 +2116,36 @@ class DayLoopTests(unittest.TestCase):
             def refused(pid):
                 job.day['units'][0]['state'] = 'client_refused'
                 r.Runner.day_monitor(job, pid)
-            job.day_monitor = refused
+            job.day.update(mode='enabled', approved_until=(NOW + timedelta(hours=1)).isoformat())
             with self.assertRaisesRegex(r.Halt, 'refused a permitted directory-day'):
-                job.run_day()
+                refused(77)
             self.assertNotIn('day-plans/77/close', job.events)
+
+    def test_a_plan_without_a_proven_second_copy_is_closed_finished_or_refused(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'):
+            job = FakeDayRunner(root)
+            job.keep_everything = set()  # Stream 3 is not Keep Everything.
+            self.assertIsNone(job.day_checked(job.day))
+            self.assertEqual((job.day['mode'], job.status['current_day_plan']), ('retired', None))
+            self.assertEqual(job.samples, [])
+            job.day.update(mode='enabled', approved_until=(NOW + timedelta(hours=1)).isoformat())
+            finished = []
+            job.day_finish = lambda p: finished.append(p['id'])
+            job.day_monitor(77)
+            self.assertEqual(finished, [77])  # An enabled one is paused and closed, not left deleting.
+            (Path(root) / 'dry').mkdir()
+            dry = FakeDayRunner(Path(root) / 'dry', dry_run=True)
+            dry.keep_everything = set()
+            with self.assertRaisesRegex(r.Halt, 'without a proven second copy cannot be closed by a dry run'):
+                dry.day_checked(dry.day)
+
+    def test_a_failed_restore_sample_never_enables(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
+            job = FakeDayRunner(root)
+            job.day_sample = lambda plan: r.require(False, 'R2 restore sample differs from the catalogue or the NAS inventory')
+            with self.assertRaisesRegex(r.Halt, 'restore sample differs'):
+                job.run_day()
+            self.assertEqual(job.events, [])
 
     def test_per_file_run_refuses_open_day_ownership(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2130,6 +2154,111 @@ class DayLoopTests(unittest.TestCase):
             with self.assertRaisesRegex(r.Halt, 'day cleanup ownership'):
                 job.run()
 
+
+
+class RestoreSampleTests(unittest.TestCase):
+    """Full byte reads against a local conditional-S3 CLI fixture, never a live store."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.job = FakeDayRunner(self.root)
+        self.job.repo = Path(__file__).resolve().parents[3]
+        self.bodies = {'managed/%d' % n: b'clip %d' % n for n in range(30)}
+        self.plan_names(30)
+        self.aws = self.root / 'aws'
+        self.log = self.root / 'aws.jsonl'
+        self.aws.write_text(r"""#!/usr/bin/python3 -I
+import hashlib, json, os, pathlib, sys, time
+args = sys.argv[1:]
+operation = args[1]
+key = args[args.index('--key') + 1]
+body = bytes.fromhex(json.loads(os.environ['FIXTURE_BODIES'])[key])
+etag = hashlib.md5(body).hexdigest()
+assert args[args.index('--if-match') + 1] == '"' + etag + '"'
+assert 's3cret' not in args
+assert os.environ['AWS_SECRET_ACCESS_KEY'] == 's3cret'
+with open(os.environ['FIXTURE_LOG'], 'a') as out:
+    out.write(json.dumps([operation, key]) + '\n')
+mode = os.environ.get('FAIL', '')
+if mode == 'timeout': time.sleep(2)
+if mode == 'transport': sys.exit(1)
+version = 'fixture-version'
+if operation == 'get-object':
+    assert args[args.index('--version-id') + 1] == version
+    pathlib.Path(args[-1]).write_bytes(body[:-1] if mode == 'short' else (b'x' * len(body) if mode == 'changed' else body))
+    if mode == 'version': version = 'replacement'
+print(json.dumps({'ETag': '"' + etag + '"', 'ContentLength': len(body), 'VersionId': version}))
+""")
+        self.aws.chmod(0o755)
+        self.env = dict(R2_ACCESS_KEY_ID='id', R2_SECRET_ACCESS_KEY='s3cret', R2_ACCOUNT_ID='acct', R2_BUCKET='bucket',
+                        FIXTURE_BODIES=json.dumps({key: b.hex() for key, b in self.bodies.items()}), FIXTURE_LOG=str(self.log))
+
+    def plan_names(self, count):
+        self.job.day['units'][0]['names'] = [dict(name='%03d.mp4' % n, size_bytes=len(self.bodies['managed/%d' % n])) for n in range(count)]
+        self.job.day['plan_sha256'] = r.day_digest(self.job.day['units'])
+
+    def row(self, n):
+        body = self.bodies['managed/%d' % n]
+        sha = hashlib.sha256(body).hexdigest()
+        return ['managed/%d' % n, len(body), sha, sha, hashlib.md5(body).hexdigest()]
+
+    def sample(self, rows, **env):
+        sql = []
+        with patch.object(self.job, 'query', side_effect=lambda q, step: sql.append(q) or rows), \
+             patch.object(r, 'AWS', self.aws), patch.dict(os.environ, self.env | env), patch.object(r, 'utcnow', return_value=NOW):
+            r.Runner.day_sample(self.job, self.job.day)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [key for operation, key in calls if operation == 'get-object'], sql[0]
+
+    def test_twenty_random_hashed_names_are_actually_read(self):
+        # The migrated-schema test executes the SQL selector; this seeded
+        # fixture performs the full read and hash for a random subset.
+        rows = [self.row(n) for n in random.Random(20261127).sample(range(30), 20)]
+        fetched, sql = self.sample(rows)
+        self.assertEqual(fetched, [row[0] for row in rows])
+        self.assertIn('ORDER BY random() LIMIT 20', sql)
+        self.assertIn('WHERE live AND cat_sha=nas_sha', sql)
+        self.assertNotIn('collation_outputs', sql)
+        [line] = [json.loads(l) for l in (self.root / 'runner.jsonl').read_text().splitlines()]
+        self.assertEqual((line['phase'], line['names'], line['sampled']), ('day_restore_sample', 30, 20))
+        self.assertTrue(line['minimum_met'] and line['verification_only'])
+        self.assertEqual(line['verify_until'], (NOW + timedelta(seconds=r.RESTORE_TIMEOUT_SEC)).isoformat())
+        self.assertEqual([e['key'] for e in line['survivors']], fetched)
+        self.assertTrue(all(e['version_id'] == 'fixture-version' for e in line['survivors']))
+
+    def test_short_duplicate_hashless_or_mismatched_sample_stops(self):
+        rows = [self.row(n) for n in range(20)]
+        for bad in (rows[:-1], rows[:-1] + rows[:1]):
+            with self.assertRaisesRegex(r.Halt, 'too few distinct hashed names'):
+                self.sample(bad)
+        for change in ({2: None}, {3: 'f' * 64}, {2: 'f' * 64, 3: 'f' * 64}, {1: 999}):
+            bad = copy.deepcopy(rows)
+            bad[0] = [change.get(i, v) for i, v in enumerate(bad[0])]
+            with self.subTest(change=change), self.assertRaises(r.Halt):
+                self.sample(bad)
+
+    def test_small_plan_reads_every_name_and_fails_on_change_short_read_or_transport(self):
+        self.plan_names(2)
+        rows = [self.row(0), self.row(1)]
+        fetched, _ = self.sample(rows)
+        self.assertEqual(fetched, [row[0] for row in rows])
+        [line] = [json.loads(l) for l in (self.root / 'runner.jsonl').read_text().splitlines()]
+        self.assertFalse(line['minimum_met'])
+        self.assertTrue(line['verification_only'])
+        for failure in ('short', 'changed', 'version', 'transport'):
+            with self.subTest(failure=failure), self.assertRaises(r.Halt):
+                self.sample(rows, FAIL=failure)
+
+    def test_stalled_read_is_bounded_and_changed_plan_is_refused(self):
+        self.plan_names(1)
+        rows = [self.row(0)]
+        with patch.object(r, 'RESTORE_TIMEOUT_SEC', 0.1), self.assertRaisesRegex(r.Halt, 'timed out'):
+            self.sample(rows, FAIL='timeout')
+        changed = copy.deepcopy(self.job.day)
+        changed['mode'] = 'enabled'
+        with patch.object(self.job, 'day_plan', return_value=changed), self.assertRaisesRegex(r.Halt, 'plan changed'):
+            self.sample(rows)
 
 
 class DayReconcileTests(unittest.TestCase):
@@ -2215,7 +2344,7 @@ class DayReconcileTests(unittest.TestCase):
             with self.assertRaisesRegex(r.Halt, r'HTTP request failed \(POST\)'):
                 job.day_control(77, 'control', self.body(job), 'enabled')
 
-    def test_enable_pause_and_close_all_reconcile(self):
+    def test_pause_and_close_of_legacy_plan_reconcile(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW), patch.object(r.time, 'sleep'), \
              patch.object(r.sys, 'stderr', new=io.StringIO()):
             job = FakeDayRunner(root)
@@ -2225,14 +2354,13 @@ class DayReconcileTests(unittest.TestCase):
                 raise r.MutationUnconfirmed('HTTP request failed (POST)')
             job.api = flaky
             job.call = lambda method, path, body=None: copy.deepcopy(job.day)
-            def deleted(pid):
-                for u in job.day['units']:
-                    u.update(state='deleted', receipts=[dict(attempt=1, outcome='deleted', media_files=2, media_bytes=200)])
-                r.Runner.day_monitor(job, pid)
-            job.day_monitor = deleted
-            job.run_day()
-            self.assertEqual(job.events, ['idle', 'idle', 'day-plans/77/control', 'day-plans/77/control', 'day-plans/77/close'])
-            self.assertEqual((job.day['mode'], job.status['phase']), ('retired', 'day_complete'))
+            job.day.update(mode='enabled', approved_until=(NOW + timedelta(hours=1)).isoformat())
+            job.status.update(current_day_plan=77, started_day_plan_sha256=job.day['plan_sha256'])
+            with self.assertRaisesRegex(r.Halt, 'shared persistent survivor reservation'):
+                job.run_day()
+            self.assertEqual(job.events, ['day-plans/77/control', 'day-plans/77/close'])
+            self.assertEqual(job.day['mode'], 'retired')
+
 
 
 if __name__ == '__main__': unittest.main()

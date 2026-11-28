@@ -2,9 +2,7 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
 	_ "embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,38 +22,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Day-directory NAS-only cleanup. Owner (Deniz), verbatim: "yes, delete"; "if
-// its outside of keep everything, then a nas copy only needs to be checked if
-// its in the keep 20? otherwise it can be deleted right?"; "yea we don tneed
-// exreme intense checkingm"; "lift nas cleanup dialy limit please".
-//
-// A unit is one stream-day of raw NAS footage in one directory: a plaza
-// <folder>/<Month>/<DD-Weekday> directory, or the files of one local day in a
-// flat <folder>/<recording>/{continuous,<job>} directory. Its stream comes from
-// the reviewed folder map the NAS client pins, its date from the path. The
-// server issues one permit per unit after checking the whole local day lies
-// outside the stream's pinned 20-day window (with a one-day guard band on
-// each side), and no catalogued clip of the unit is held. A
-// non-Keep-Everything unit has no R2 copy check, and only a live NAS cleanup
-// incident hold or a GSS delivery hold keeps it (0259, 0261; Deniz: "we need to
-// remove whatever is making us think thats a mistake"; on the delivery, Nov 25:
-// "i wnat to save it if its not"). There is no daily cap.
-//
-// Keep Everything (Deniz, verbatim: "nas shoul dnot have any of the keep
-// everything (except the keep 20)"; "if its the same size and same file name or
-// whatever checks we have already?"): a KE unit names its exact media files
-// (name and size), always goes in names mode, and the server permits a named
-// file only while its R2 counterpart is live in the catalogue: the clip's own
-// raw object (not purged or retired) or a stitched output listing the clip
-// (not retired or reserved for retirement), with the NAS size equal to the
-// catalogued clip size. KE stays in R2, so the counterpart persists.
-//
-// The catalogue is known to drift from R2 (objects gone while purged_at is
-// null), so every admission, enable and permit also HEADs each catalogue-live
-// counterpart of every named file it would permit (Deniz: KE footage leaves the
-// NAS only when R2 actually has the same name and size). Each such file needs
-// at least one counterpart R2 holds at its catalogued size, or the unit is
-// refused; any R2 error refuses the unit.
+// Day-directory NAS cleanup is currently verification-only. Deniz's Nov 27
+// rule requires a proven second copy, and non-Keep-Everything day cleanup is
+// finished/disabled. For Keep Everything, only the same raw bytes qualify:
+// exact NAS size and SHA256, catalogue identity, and a live matching R2 object.
+// A stitched output cannot stand in for the raw file. Keep20, boundary days,
+// folder/stream checks, incident and delivery holds are still enforced.
+// Existing receipts remain reconcilable, but enable and permit are blocked
+// until every R2 remover/replacer shares the durable survivor reservation.
 
 //go:embed nas_cleanup_folder_streams.json
 var cleanupFolderStreamsJSON []byte
@@ -66,11 +40,12 @@ const cleanupFolderStreamsSHA = "94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88b
 const (
 	nasCleanupDayMaxUnits  = 1000
 	nasCleanupDayMaxNames  = 100000
-	nasCleanupDayPermitTTL = 10 * time.Minute
 	nasCleanupDayDigestTag = "stoarama-nas-cleanup-day-v1"
 	// nasCleanupDayHeads bounds the live R2 HEADs of one KE unit check.
-	nasCleanupDayHeads       = 32
-	nasCleanupDayHeadTimeout = 2 * time.Minute
+	nasCleanupDayHeads            = 32
+	nasCleanupDayHeadTimeout      = 2 * time.Minute
+	nasCleanupDayIntegrationBlock = "day cleanup blocked: no shared persistent survivor reservation at the R2 wire boundary"
+	nasCleanupDayNonKEBlock       = "non-Keep-Everything NAS-only day cleanup is disabled"
 )
 
 type nasCleanupDayOutcome string
@@ -334,28 +309,21 @@ func cleanupDayModeOf(u nasCleanupDayUnit) nasCleanupDayMode {
 	return nasCleanupDayNames
 }
 
-// cleanupDayR2LiveSQL returns the catalogue-live R2 counterparts (clip, key,
-// catalogued size) of the clips ($1): the raw object in bucket $2, neither
-// purged nor retired, and every stitched output listing the clip that is
-// neither retired nor reserved for retirement. The r2prune lane records
-// collated deletes only in r2_object_retirements. A reserved raw object is
-// already a held clip. The clip rows are share-locked so a concurrent
-// purged_at write waits for this permit's commit; R2 purges then skip clips a
-// live KE unit names.
-const cleanupDayR2LiveSQL = `WITH c AS (SELECT id,bucket,object_key,size_bytes,purged_at FROM recording_clips WHERE id=ANY($1::bigint[]) FOR SHARE)
- SELECT c.id,c.object_key,c.size_bytes FROM c WHERE c.bucket=$2 AND c.purged_at IS NULL AND c.object_key<>''
-  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='raw' AND x.source_id=c.id)
- UNION ALL
- SELECT s.id,o.object_key,o.size_bytes FROM recording_collation_outputs o CROSS JOIN unnest(o.source_clip_ids) s(id)
- WHERE o.source_clip_ids && $1::bigint[] AND s.id=ANY($1::bigint[])
-  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE x.kind='collated' AND x.source_id=o.id)
-  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE x.kind='collated' AND x.source_id=o.id)`
+// Only the clip's own raw object is a survivor. A stitched output does not
+// preserve the same bytes. A pending retirement intent is already unsafe.
+const cleanupDayR2LiveSQL = `WITH c AS (SELECT id,bucket,object_key,size_bytes,etag,sha256,display_path,purged_at FROM recording_clips WHERE id=ANY($1::bigint[]) FOR SHARE)
+ SELECT c.id,c.object_key,c.size_bytes,trim(both '"' from c.etag),lower(c.sha256) FROM c
+ JOIN nas_inventory_files f ON f.connection_id=13 AND f.clip_id=c.id AND f.state='present' AND f.relative_path=c.display_path
+ WHERE c.bucket=$2 AND c.purged_at IS NULL AND c.object_key<>'' AND c.etag<>'' AND f.size_bytes=c.size_bytes
+  AND lower(c.sha256) ~ '^[0-9a-f]{64}$' AND lower(f.sha256)=lower(c.sha256)
+  AND NOT EXISTS(SELECT 1 FROM r2_object_retirements x WHERE (x.bucket=c.bucket AND x.object_key=c.object_key) OR (x.kind='raw' AND x.source_id=c.id))
+  AND NOT EXISTS(SELECT 1 FROM r2_retirement_reservations x WHERE (x.bucket=c.bucket AND x.object_key=c.object_key) OR (x.kind='raw' AND x.source_id=c.id))
+  AND NOT EXISTS(SELECT 1 FROM r2_inverse_intents x WHERE (x.bucket=c.bucket AND x.object_key=c.object_key) OR x.source_id=c.id)
+  AND NOT EXISTS(SELECT 1 FROM r2_keep28_intents x WHERE (x.bucket=c.bucket AND x.object_key=c.object_key) OR x.source_id=c.id)`
 
-// cleanupDayCounterpart is one R2 object a KE file relies on, by key and the
-// catalogued size R2 must hold.
 type cleanupDayCounterpart struct {
-	key  string
-	size int64
+	key, etag, sha string
+	size           int64
 }
 
 // cleanupDayR2Verify HEADs every counterpart with bounded concurrency and
@@ -377,6 +345,10 @@ func cleanupDayR2Verify(ctx context.Context, store *r2.Client, counterparts []cl
 				return fmt.Errorf("R2 counterpart %s unverified: %w", c.key, err)
 			case head.SizeBytes != c.size:
 				reasons[i] = fmt.Sprintf("%s is %d bytes, catalogued %d", c.key, head.SizeBytes, c.size)
+			case head.ETag != c.etag || c.etag == "":
+				reasons[i] = fmt.Sprintf("%s R2 generation differs", c.key)
+			case head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, c.sha):
+				reasons[i] = fmt.Sprintf("%s R2 sha256 metadata differs", c.key)
 			}
 			return nil
 		})
@@ -498,7 +470,7 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		for rows.Next() {
 			var id int64
 			var c cleanupDayCounterpart
-			if err := rows.Scan(&id, &c.key, &c.size); err != nil {
+			if err := rows.Scan(&id, &c.key, &c.size, &c.etag, &c.sha); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -514,7 +486,7 @@ func cleanupDayCheck(ctx context.Context, q cleanupDayQuerier, u nasCleanupDayUn
 		}
 		keep = func(f present) bool {
 			size, ok := named[f.media.Name]
-			return ok && size == f.media.SizeBytes && f.catalogued == size && len(live[f.id]) > 0
+			return ok && size == f.media.SizeBytes && f.catalogued == size && len(live[f.id]) == 1
 		}
 	}
 	var entries []nasCleanupDayEntry
@@ -709,7 +681,7 @@ func (s *Server) handleServiceNASCleanupDayControl(w http.ResponseWriter, r *htt
 		}
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_day_plans SET mode='paused',approval_reason=$2,updated_at=now() WHERE id=$1`, id, req.Reason)
 	} else {
-		err = s.cleanupDayEnable(ctx, tx, id, mode, req.Reason, req.ApprovalHours)
+		err = cleanupDayEnable(ctx, tx, id, mode)
 	}
 	if err != nil {
 		util.WriteError(w, 409, err.Error())
@@ -722,59 +694,36 @@ func (s *Server) handleServiceNASCleanupDayControl(w http.ResponseWriter, r *htt
 	util.WriteJSON(w, 200, map[string]any{"id": id, "plan_sha256": req.PlanSHA, "mode": req.Mode})
 }
 
-// cleanupDayEnable re-checks every pending unit; units that no longer qualify
-// are refused, never deleted.
-func (s *Server) cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode, reason string, hours int) error {
+// Day execution is disabled. Do not hold database locks across R2 network
+// checks for an enable request that cannot issue authority; verification
+// remains on the dry-run admission path.
+func cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode string) error {
 	if mode != "dry_run" && mode != "paused" {
 		return errors.New("only a dry-run or paused day cleanup plan can enable")
 	}
-	if err := cleanupMaintenanceCheck(ctx, tx); err != nil {
-		return errors.New("cleanup maintenance gate unavailable or active")
-	}
-	var busy bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled')
- OR EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled')
- OR EXISTS(SELECT 1 FROM nas_cleanup_day_plans WHERE mode='enabled')`).Scan(&busy); err != nil || busy {
-		return errors.New("another cleanup plan is enabled")
-	}
-	rows, err := tx.Query(ctx, `SELECT id,stream_id,relative_dir,local_date::text,files,bytes,names FROM nas_cleanup_day_units
- WHERE plan_id=$1 AND state='pending' ORDER BY ordinal FOR UPDATE`, id)
+	rows, err := tx.Query(ctx, `SELECT DISTINCT stream_id FROM nas_cleanup_day_units WHERE plan_id=$1 AND state='pending'`, id)
 	if err != nil {
 		return err
 	}
-	type pending struct {
-		id   int64
-		unit nasCleanupDayUnit
-	}
-	var units []pending
+	defer rows.Close()
+	seen := false
 	for rows.Next() {
-		var p pending
-		if err := rows.Scan(&p.id, &p.unit.StreamID, &p.unit.RelativeDir, &p.unit.LocalDate, &p.unit.Files, &p.unit.Bytes, &p.unit.Names); err != nil {
-			rows.Close()
+		var stream int64
+		if err := rows.Scan(&stream); err != nil {
 			return err
 		}
-		units = append(units, p)
+		seen = true
+		if !cleanupEmbeddedPolicyWindow(stream).KeepEverything {
+			return errors.New(nasCleanupDayNonKEBlock)
+		}
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	eligible := 0
-	for _, p := range units {
-		if _, err := cleanupDayCheck(ctx, tx, p.unit, s.r2); err != nil {
-			if _, err := tx.Exec(ctx, `UPDATE nas_cleanup_day_units SET state='refused',refusal=$2,updated_at=now() WHERE id=$1`, p.id, err.Error()); err != nil {
-				return err
-			}
-			continue
-		}
-		eligible++
-	}
-	if eligible == 0 {
+	if !seen {
 		return errors.New("no pending unit still qualifies")
 	}
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_day_plans SET mode='enabled',approval_reason=$2,
- approved_until=now()+$3::int*interval '1 hour',updated_at=now() WHERE id=$1`, id, reason, hours)
-	return err
+	return errors.New(nasCleanupDayIntegrationBlock)
 }
 
 func (s *Server) handleServiceNASCleanupDayClose(w http.ResponseWriter, r *http.Request) {
@@ -883,75 +832,29 @@ func (s *Server) handleAccountNASCleanupDayPermit(w http.ResponseWriter, r *http
 		util.WriteError(w, 409, "cleanup maintenance gate unavailable or active")
 		return
 	}
-	for range 25 {
-		var unitID int64
-		var permit nasCleanupDayPermit
-		var until time.Time
-		var names []nasCleanupDayName
-		// A Keep Everything unit goes only to a release that accepts it.
-		err = tx.QueryRow(ctx, `SELECT u.id,u.plan_id,p.plan_sha256,u.stream_id,u.relative_dir,u.local_date::text,u.files,u.bytes,u.names,p.approved_until
+	// Do not issue or re-issue a permit, including for a plan enabled by an
+	// older binary. Existing permit receipts can still reconcile via the
+	// receipt endpoint. A disabled lane with no pending work stays idle.
+	var stream int64
+	err = tx.QueryRow(ctx, `SELECT u.stream_id
  FROM nas_cleanup_day_units u JOIN nas_cleanup_day_plans p ON p.id=u.plan_id
  WHERE p.mode='enabled' AND p.approved_until>clock_timestamp()+interval '1 minute' AND p.connection_id=$1
   AND (u.state='pending' OR (u.state='permitted' AND u.permit_expires_at<=clock_timestamp())) AND (u.names IS NULL OR $2)
- ORDER BY u.plan_id,u.ordinal LIMIT 1 FOR UPDATE OF u SKIP LOCKED FOR SHARE OF p`, cid, slices.Contains(nasCleanupDayKEVersions, req.ClientVersion)).Scan(&unitID, &permit.PlanID, &permit.PlanSHA,
-			&permit.StreamID, &permit.RelativeDir, &permit.LocalDate, &permit.Files, &permit.Bytes, &names, &until)
-		if errors.Is(err, pgx.ErrNoRows) {
-			break
-		}
-		if err != nil {
-			util.WriteError(w, 500, "day cleanup unit unavailable")
-			return
-		}
-		unit := nasCleanupDayUnit{RelativeDir: permit.RelativeDir, LocalDate: permit.LocalDate, StreamID: permit.StreamID, Files: permit.Files, Bytes: permit.Bytes, Names: names}
-		entries, err := cleanupDayCheck(ctx, tx, unit, s.r2)
-		if err != nil {
-			if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_day_units SET state='refused',refusal=$2,updated_at=now() WHERE id=$1`, unitID, err.Error()); err != nil {
-				util.WriteError(w, 500, "day cleanup refusal failed")
-				return
-			}
-			continue
-		}
-		secret := make([]byte, 32)
-		if _, err = rand.Read(secret); err != nil {
-			util.WriteError(w, 500, "day cleanup permit unavailable")
-			return
-		}
-		permit.UnitID, permit.Token = unitID, hex.EncodeToString(secret)
-		if len(names) > 0 {
-			files, _ := cleanupDayMedia(entries)
-			permit.DroppedNames = int64(len(names)) - files
-		}
-		permit.Timezone = cleanupEmbeddedPolicyWindow(permit.StreamID).Timezone
-		if slices.Contains(nasCleanupDayModeVersions, req.ClientVersion) {
-			permit.Mode = cleanupDayModeOf(unit)
-			if permit.Mode == nasCleanupDayNames {
-				permit.Entries = entries
-			}
-		}
-		// A fresh session is required to receive the permit, but its expiry is
-		// not tied to that heartbeat: the unlink pass runs inside the permit
-		// even when the next heartbeat lands later than five minutes.
-		expires := time.Now().Add(nasCleanupDayPermitTTL)
-		if until.Before(expires) {
-			expires = until
-		}
-		if err = tx.QueryRow(ctx, `UPDATE nas_cleanup_day_units SET state='permitted',attempt=attempt+1,permit_token_sha256=$2,
- permit_expires_at=$3,dropped_names=$4,updated_at=now() WHERE id=$1 RETURNING attempt,permit_expires_at`, unitID, cleanupSHA([]byte(permit.Token)), expires, permit.DroppedNames).Scan(&permit.Attempt, &permit.ExpiresAt); err != nil {
-			util.WriteError(w, 500, "day cleanup permit failed")
-			return
-		}
-		if err = tx.Commit(ctx); err != nil {
-			util.WriteError(w, 500, "day cleanup permit failed")
-			return
-		}
-		util.WriteJSON(w, 200, map[string]any{"unit": permit})
+ ORDER BY u.plan_id,u.ordinal LIMIT 1`, cid, slices.Contains(nasCleanupDayKEVersions, req.ClientVersion)).Scan(&stream)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteJSON(w, 200, map[string]any{"unit": nil})
 		return
 	}
-	if err = tx.Commit(ctx); err != nil {
-		util.WriteError(w, 500, "day cleanup refusal failed")
+	if err != nil {
+		util.WriteError(w, 500, "day cleanup unit unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"unit": nil})
+	if !cleanupEmbeddedPolicyWindow(stream).KeepEverything {
+		util.WriteError(w, 409, nasCleanupDayNonKEBlock)
+		return
+	}
+	util.WriteError(w, 409, nasCleanupDayIntegrationBlock)
+
 }
 
 func cleanupEmbeddedPolicyWindow(stream int64) cleanupKeepWindow {
