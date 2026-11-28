@@ -54,6 +54,7 @@ import csv
 import dataclasses
 import datetime
 import enum
+from fractions import Fraction
 import gzip
 import hashlib
 import hmac
@@ -83,7 +84,7 @@ FRAME_DIFF_HALF_S = 10.0
 TAIL_TOLERANCE_S = 0.2  # previous file's media end vs its DB span (the audit's content-vs-DB tolerance)
 OUTPUT_TOLERANCE_S = 0.1  # joined duration vs the sum of its inputs
 BATCH_PREFIX = 'clock-prestitch-'
-PASS_VERSION = 'continuity-join/2'
+PASS_VERSION = 'continuity-join/3'
 FFMPEG = os.environ.get('FFMPEG_BIN', 'ffmpeg')
 FFPROBE = os.environ.get('FFPROBE_BIN', 'ffprobe')
 DECODE_THREADS = os.environ.get('FFMPEG_THREADS', '0')  # 0 = ffmpeg's choice
@@ -162,6 +163,8 @@ class Seam:
     frame_ratio: float = None
     before_dates: tuple = ()
     after_dates: tuple = ()
+    before_positions: tuple = READ_AT_S
+    after_positions: tuple = READ_AT_S
 
 
 def side_offset(reads):
@@ -206,8 +209,8 @@ def clock_check(seam):
         return KeepReason.CLOCK_DATE_UNPROVEN, None
     # The evidence offsets were formed from integer displayed seconds, plus or
     # minus the exact fixed sample position. A stationary display is not a clock.
-    before = [round(c - t, 3) for c, t in zip(seam.before, READ_AT_S) if c is not None][::-1]
-    after = [round(c + t, 3) for c, t in zip(seam.after, READ_AT_S) if c is not None]
+    before = [round(c - t, 3) for c, t in zip(seam.before, seam.before_positions) if c is not None][::-1]
+    after = [round(c + t, 3) for c, t in zip(seam.after, seam.after_positions) if c is not None]
     for reads in (before, after):
         if reads[-1] - reads[0] < 0.999 or any(y < x for x, y in zip(reads, reads[1:])):
             return KeepReason.CLOCK_INCONSISTENT, None
@@ -324,14 +327,23 @@ def probe(src, etag=None):
 
 
 def read_clock(src, t, crop, tmp, etag=None):
-    """Read one exact frame with all OCR thresholds; preserve every raw attempt."""
+    """Read one selected frame, retaining its actual container-relative PTS."""
     with tempfile.TemporaryDirectory(dir=tmp, prefix="clock-read-") as fresh:
         raw = os.path.join(fresh, "frame.png")
-        subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src, '-frames:v', '1',
-                        '-vf', f'scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray', '-y', raw],
-                       capture_output=True, timeout=300, check=True)
+        p = subprocess.run([FFMPEG, '-v', 'info', '-nostdin', '-copyts', '-start_at_zero', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src,
+                            '-map', '0:v:0', '-frames:v', '1', '-fps_mode', 'passthrough', '-vf',
+                            f"select=eq(n\\,0),scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray,showinfo", '-y', raw],
+                           capture_output=True, timeout=300, check=True)
         if not os.path.exists(raw):
-            return None, None, []
+            return None, None, [], None
+        # showinfo is on the same single-frame filter/PNG path. Its integer
+        # ticks and filter time base are exact; pts_time is rounded for display.
+        log = p.stderr.decode('utf-8', errors='replace')
+        bases = re.findall(r'\[Parsed_showinfo_\d+[^\n]*\] config in time_base: (\d+/\d+)', log)
+        ticks = re.findall(r'\[Parsed_showinfo_\d+[^\n]*\] n:\s*0\s+pts:\s*(-?\d+)\s', log)
+        if len(bases) != 1 or len(ticks) != 1:
+            raise ValueError('missing unique decoded frame timestamp')
+        pts = [int(ticks[0]), bases[0]]
         texts = []
         for th in CLOCK_THRESHOLDS:
             png = f'{raw}.{th}.png'
@@ -340,7 +352,7 @@ def read_clock(src, t, crop, tmp, etag=None):
             texts.append(subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True,
                                         text=True, timeout=60, check=True).stdout)
         c, day, _ = clock_frame_consensus(texts)
-        return c, day, texts
+        return c, day, texts, pts
 
 
 def parse_clock_token(txt):
@@ -435,6 +447,35 @@ def frame_ratio(prev_frames, next_frames):
     return round(near / rest, 3) if rest else 99.0
 
 
+def sample_distances(media, stamps, before):
+    """Exact seam-relative sample distances from the selected frame's ticks.
+
+    A seek that lands more than one frame from its target is not a sample of
+    the requested boundary window. No timestamp is inferred from seek time.
+    """
+    if len(stamps) != len(READ_AT_S):
+        raise ValueError('incomplete frame timestamps')
+    duration = Fraction(str(media.duration_s))
+    frame = Fraction(str(media.frame_s))
+    result = []
+    for target, stamp in zip(READ_AT_S, stamps):
+        if stamp is None:
+            result.append(None)
+            continue
+        if (not isinstance(stamp, (list, tuple)) or len(stamp) != 2 or type(stamp[0]) is not int or
+                not isinstance(stamp[1], str) or not re.fullmatch(r'[1-9]\d*/[1-9]\d*', stamp[1])):
+            raise ValueError('invalid decoded frame timestamp')
+        pts = stamp[0] * Fraction(stamp[1])
+        distance = duration - pts if before else pts
+        if not 0 <= pts < duration or distance <= 0 or abs(distance - Fraction(str(target))) > frame:
+            raise ValueError('decoded frame outside the requested seam sample')
+        result.append(distance)
+    got = [d for d in result if d is not None]
+    if any(a >= b for a, b in zip(got, got[1:])):
+        raise ValueError('decoded frame timestamps not strictly ordered')
+    return tuple(result)
+
+
 def seam_evidence(row):
     """Media evidence of one planned seam (row from `plan`), gathered only as far as the rule
     needs it: nothing for a seam the metadata keeps or on a recording without a clock
@@ -454,12 +495,15 @@ def seam_evidence(row):
         with tempfile.TemporaryDirectory() as tmp:
             br = [read_clock(prev_src, pm.duration_s - d, crop, tmp, pe) for d in READ_AT_S]
             ar = [read_clock(next_src, d, crop, tmp, ne) for d in READ_AT_S]
-            before = [None if c is None else round(c+d,3) for (c,_,_),d in zip(br,READ_AT_S)]
-            after = [None if c is None else round(c-d,3) for (c,_,_),d in zip(ar,READ_AT_S)]
-            bd, ad = tuple(day for _,day,_ in br), tuple(day for _,day,_ in ar)
-        out.update(clock_before=before, clock_after=after, clock_before_dates=bd, clock_after_dates=ad,
-                   clock_before_raw=[raw for _,_,raw in br], clock_after_raw=[raw for _,_,raw in ar])
-        if (clock_check(Seam('', 0.0, 0.0, before=tuple(before), after=tuple(after), before_dates=bd, after_dates=ad))[0] is None
+            bp, ap = [p for _,_,_,p in br], [p for _,_,_,p in ar]
+            out.update(clock_before_pts=bp, clock_after_pts=ap,
+                       clock_before_raw=[raw for _,_,raw,_ in br], clock_after_raw=[raw for _,_,raw,_ in ar])
+            bt, at = sample_distances(pm, bp, True), sample_distances(nm, ap, False)
+            before = [None if c is None or d is None else float(c+d) for (c,_,_,_),d in zip(br,bt)]
+            after = [None if c is None or d is None else float(c-d) for (c,_,_,_),d in zip(ar,at)]
+            bd, ad = tuple(day for _,day,_,_ in br), tuple(day for _,day,_,_ in ar)
+        out.update(clock_before=before, clock_after=after, clock_before_dates=bd, clock_after_dates=ad)
+        if (clock_check(seam_of(out))[0] is None
                 and raw_clock_evidence_matches(out)):
             out['frame_ratio'] = frame_ratio(gray_frames(prev_src, pm.duration_s - FRAME_DIFF_HALF_S, FRAME_DIFF_HALF_S + 1, pe),
                                              gray_frames(next_src, 0, FRAME_DIFF_HALF_S, ne))
@@ -474,22 +518,39 @@ def media_of(d):
 
 
 def seam_of(ev):
+    pm = media_of(ev['prev_media']) if 'prev_media' in ev else None
+    nm = media_of(ev['next_media']) if 'next_media' in ev else None
+    def positions(media, side):
+        try:
+            distances = sample_distances(media, ev['clock_' + side + '_pts'], side == 'before')
+            return tuple(float(d) if d is not None else t for t,d in zip(READ_AT_S, distances))
+        except (KeyError, AttributeError, TypeError, ValueError, ZeroDivisionError):
+            # Old discovery rows can explain a negative but cannot support a
+            # positive verdict: raw_clock_evidence_matches requires exact PTS.
+            return READ_AT_S
     return Seam(ev['collation_reason'], ev['db_gap_s'], ev['prev_span_s'],
-                media_of(ev['prev_media']) if 'prev_media' in ev else None,
-                media_of(ev['next_media']) if 'next_media' in ev else None,
+                pm, nm,
                 tuple(ev.get('clock_before', ())), tuple(ev.get('clock_after', ())), ev.get('frame_ratio'),
-                tuple(ev.get('clock_before_dates', ())), tuple(ev.get('clock_after_dates', ())))
+                tuple(ev.get('clock_before_dates', ())), tuple(ev.get('clock_after_dates', ())),
+                positions(pm, 'before'), positions(nm, 'after'))
 
 
 def raw_clock_evidence_matches(ev):
-    """A positive decision is reproducible from the exact OCR strings, not an inferred hour mode."""
+    """Recompute exact display-clock intervals from raw OCR and decoded PTS."""
+    bounds = []
     for side, sign in (('before', 1), ('after', -1)):
         readings = ev.get('clock_' + side, ())
         dates = ev.get('clock_' + side + '_dates', ())
         raw = ev.get('clock_' + side + '_raw', ())
         if not len(readings) == len(dates) == len(raw) == len(READ_AT_S):
             return False
-        for pos, offset, date, texts in zip(READ_AT_S, readings, dates, raw):
+        try:
+            media = media_of(ev['prev_media' if side == 'before' else 'next_media'])
+            positions = sample_distances(media, ev['clock_' + side + '_pts'], side == 'before')
+        except (KeyError, AttributeError, TypeError, ValueError, ZeroDivisionError):
+            return False
+        exact = []
+        for pos, offset, date, texts in zip(positions, readings, dates, raw):
             if not isinstance(texts, (tuple,list)) or (texts and len(texts) != len(CLOCK_THRESHOLDS)) or not all(isinstance(t,str) for t in texts):
                 return False
             if offset is None:
@@ -497,9 +558,16 @@ def raw_clock_evidence_matches(ev):
                     return False
                 continue
             seconds, derived_date, mode = clock_frame_consensus(texts)
-            if seconds is None or not mode or date is None or derived_date != date or round(seconds + sign*pos,3) != offset:
+            if pos is None or seconds is None or not mode or date is None or derived_date != date or float(seconds + sign*pos) != offset:
                 return False
-    return True
+            exact.append(seconds + sign*pos)
+        if len(exact) < MIN_READS:
+            return False
+        bounds.append((max(exact), min(exact)+1))
+    (bl,bh),(al,ah) = bounds
+    # Do not round the interval bound: a positive verdict must prove that
+    # every feasible jump is within the approved one-second resolution.
+    return max(bl,al) < min(bh,ah) and max(ah-bl,bh-al) <= CLOCK_TOLERANCE_S
 
 
 def verdict(ev):

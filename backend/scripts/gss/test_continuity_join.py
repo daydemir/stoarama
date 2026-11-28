@@ -23,6 +23,8 @@ DATES = ("2026-09-19",) * 3
 BEFORE, AFTER = (60338.2,60338.7,60338.2),(60338.8,60338.3,60338.8)
 BEFORE_RAW = tuple([t]*3 for t in ('2026-09-19 16:45:38','2026-09-19 16:45:38','2026-09-19 16:45:37'))
 AFTER_RAW = tuple([t]*3 for t in ('2026-09-19 16:45:39','2026-09-19 16:45:39','2026-09-19 16:45:40'))
+BEFORE_PTS = tuple([int(round((300-d)*10)), '1/10'] for d in C.READ_AT_S)
+AFTER_PTS = tuple([int(round(d*10)), '1/10'] for d in C.READ_AT_S)
 
 
 def seam(reason='frame_jump', gap=0.0, before=CLOCK, after=CLOCK, ratio=0.9, prev=MEDIA, nxt=MEDIA, span=300.0, before_dates=DATES, after_dates=DATES):
@@ -197,7 +199,8 @@ class ExactPlanTests(unittest.TestCase):
         rows = C.plan(ledger, seams, source, 433, registry)
         decisions = [dict(r, prev_media=dataclasses.asdict(MEDIA), next_media=dataclasses.asdict(MEDIA),
                           clock_before=BEFORE, clock_after=AFTER, clock_before_dates=DATES, clock_after_dates=DATES,
-                          clock_before_raw=BEFORE_RAW, clock_after_raw=AFTER_RAW, frame_ratio=.5, join=True,
+                          clock_before_raw=BEFORE_RAW, clock_after_raw=AFTER_RAW, clock_before_pts=BEFORE_PTS,
+                          clock_after_pts=AFTER_PTS, frame_ratio=.5, join=True,
                           keep_reason=None, clock_delta_s=0.6) for r in rows]
         return rows, decisions, ledger, seams, source, registry
 
@@ -218,6 +221,9 @@ class ExactPlanTests(unittest.TestCase):
         _, decisions, *_ = self.fixture()
         e = decisions[0]
         self.assertEqual(C.verdict(e), (True,None,.6))
+        self.assertFalse(C.verdict(dict(e, clock_before_pts=()))[0])
+        self.assertFalse(C.verdict(dict(e, clock_after_pts=([4,'1/10'],AFTER_PTS[1],AFTER_PTS[-1])))[0])
+        self.assertFalse(C.verdict(dict(e, clock_after_pts=([21,'1/100'],AFTER_PTS[1],AFTER_PTS[-1])))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=[['2026-09-19 01:45:39 am']*3]*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=[['2026-09-19 04:45:39']*3]*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=()))[0])
@@ -263,8 +269,10 @@ class BuildTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, stdout='2026-09-19 12:34:56', stderr='')
                 return actual_run(args, **kwargs)
             with mock.patch.object(C.subprocess,'run',side_effect=with_ocr):
-                self.assertEqual(C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d),(45296,'2026-09-19',['2026-09-19 12:34:56']*3))
-                self.assertEqual(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d),(None,None,[]))
+                got = C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d)
+                self.assertEqual(got[:3],(45296,'2026-09-19',['2026-09-19 12:34:56']*3))
+                self.assertEqual(got[3][0]*C.Fraction(got[3][1]), C.Fraction('1.2'))
+                self.assertEqual(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d),(None,None,[],None))
             def date_only(args, **kwargs):
                 if args[0] == 'tesseract':
                     return subprocess.CompletedProcess(args,0,stdout='27.Sep 2026',stderr='')
@@ -272,6 +280,22 @@ class BuildTests(unittest.TestCase):
             with mock.patch.object(C.subprocess,'run',side_effect=date_only):
                 got=C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d)
                 self.assertIsNone(got[0]); self.assertIsNone(got[1]); self.assertIn('27.Sep 2026',got[2])
+
+    def test_real_vfr_seek_retains_later_frame_pts_and_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'vfr.mp4')
+            subprocess.run([C.FFMPEG,'-v','error','-f','lavfi','-i','color=c=red:s=320x240:r=25:d=4',
+                            '-vf',"select='not(between(n,4,9))'",'-fps_mode','vfr','-c:v','libx264',p],check=True)
+            actual_run = subprocess.run
+            def with_ocr(args, **kwargs):
+                if args[0] == 'tesseract':
+                    return subprocess.CompletedProcess(args,0,stdout='2026-09-19 16:45:35',stderr='')
+                return actual_run(args, **kwargs)
+            with mock.patch.object(C.subprocess,'run',side_effect=with_ocr):
+                got=C.read_clock(p,.2,'crop=100:50:0:0',d)
+            self.assertEqual(got[3][0]*C.Fraction(got[3][1]), C.Fraction('0.4'))
+            with self.assertRaisesRegex(ValueError, 'outside the requested'):
+                C.sample_distances(C.probe(p), [got[3], None, None], False)
 
     def test_join_keeps_audio_and_duration_and_the_ledger_reads_its_proof(self):
         with tempfile.TemporaryDirectory() as d:
@@ -297,7 +321,8 @@ class BuildTests(unittest.TestCase):
                        'hour_id': 'h-1', 'seam': i+1, 'served': 3, 'collation_reason': 'frame_jump', 'db_gap_s': 0,
                        'prev_span_s': 300, 'prev_media': dataclasses.asdict(MEDIA), 'next_media': dataclasses.asdict(MEDIA),
                        'clock_before': BEFORE, 'clock_after': AFTER, 'clock_before_dates': DATES, 'clock_after_dates': DATES,
-                       'clock_before_raw': BEFORE_RAW, 'clock_after_raw': AFTER_RAW, 'frame_ratio': .5, 'join': True,
+                       'clock_before_raw': BEFORE_RAW, 'clock_after_raw': AFTER_RAW, 'clock_before_pts': BEFORE_PTS,
+                       'clock_after_pts': AFTER_PTS, 'frame_ratio': .5, 'join': True,
                        'keep_reason': None, 'clock_delta_s': 0.6}
                 for side, x in (('prev', prev), ('next', nxt)):
                     row.update({f'{side}_{k}': v for k, v in C.source_identity(registry, x['file_id'], x['key'], 433).items()})
