@@ -20964,30 +20964,21 @@ def native_stitch_manifest_hash(clips):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def download_verified(url, temp_path, expected_bytes, expected_sha, headers=None):
+def download_verified(url, out, expected_bytes, expected_sha, headers=None):
+    """Stream into the caller's exclusively created private descriptor."""
     digest = hashlib.sha256()
     written = 0
     req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT, **(headers or {})})
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response, open(temp_path, "wb") as out:
-            remember_response_secrets(response)
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
-                digest.update(chunk)
-                written += len(chunk)
-            out.flush()
-            os.fsync(out.fileno())
-    except BaseException:
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response:
+        remember_response_secrets(response)
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            digest.update(chunk)
+            written += len(chunk)
     if written != expected_bytes or digest.hexdigest() != expected_sha:
-        temp_path.unlink()
         raise RuntimeError("download checksum mismatch")
 
 
@@ -25380,9 +25371,116 @@ def stitch_provenance(clip):
     }
 
 
-def write_stitch_sidecar(clip_path, clip):
-    payload = json.dumps(stitch_provenance(clip), sort_keys=True, separators=(",", ":"))
-    atomic_write(stitch_sidecar_path(clip_path), (payload + "\n").encode("utf-8"))
+def open_raw_parent(root, relative, create=True):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent = os.open(str(root), flags)
+    try:
+        device = os.fstat(parent).st_dev
+        for part in relative.parts[:-1]:
+            try:
+                child = os.open(part, flags, dir_fd=parent)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o755, dir_fd=parent)
+                except FileExistsError:
+                    pass
+                os.fsync(parent)
+                child = os.open(part, flags, dir_fd=parent)
+            if os.fstat(child).st_dev != device:
+                os.close(child)
+                raise ExistingFileMismatch("raw output crosses filesystem boundary")
+            os.close(parent)
+            parent = child
+        return parent
+    except BaseException:
+        os.close(parent)
+        raise
+
+
+def verify_raw_entry(parent, name, expected_bytes, expected_sha):
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if not stat_module.S_ISREG(before.st_mode) or before.st_size != expected_bytes:
+            raise ExistingFileMismatch("existing raw file conflicts; preserved: %s" % name)
+        digest = hashlib.sha256()
+        written = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            written += len(chunk)
+            if written > expected_bytes:
+                raise ExistingFileMismatch("existing raw file grew during verification: %s" % name)
+        after = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (certification_identity(before) != certification_identity(after)
+                or certification_identity(after) != certification_identity(named)
+                or written != expected_bytes or digest.hexdigest() != expected_sha):
+            raise ExistingFileMismatch("existing raw file conflicts; preserved: %s" % name)
+        return after
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def raw_private_stage(parent, final, mode):
+    # Never reopen a previous attempt's name, even after an interrupted copy.
+    name = ".stoarama-raw.part-%d" % uuid.uuid4().int  # Existing inventory partial exclusion.
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+    with os.fdopen(fd, "wb") as out:
+        try:
+            yield name, out
+        finally:
+            # Remove only the inode created by this call. An unexpected alias
+            # or replaced stage is not scratch that we can safely discard.
+            try:
+                named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                named = None
+            if named is not None and same_joined_inode(named, os.fstat(fd)):
+                published = None
+                if named.st_nlink == 2:
+                    try:
+                        published = os.stat(final, dir_fd=parent, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                if named.st_nlink == 1 or same_joined_inode(named, published):
+                    os.unlink(name, dir_fd=parent)
+                    os.fsync(parent)
+
+
+def check_raw_stage(parent, stage, out):
+    info = os.fstat(out.fileno())
+    named = os.stat(stage, dir_fd=parent, follow_symlinks=False)
+    if info.st_nlink != 1 or certification_identity(info) != certification_identity(named):
+        raise ExistingFileMismatch("raw publication stage is not private")
+    return info
+
+
+def write_stitch_sidecar(clip_path, clip, *, parent_fd=None):
+    payload = (json.dumps(stitch_provenance(clip), sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    name = stitch_sidecar_path(clip_path).name
+    # Keep ordinary replay's deterministic metadata rewrite, but never truncate
+    # a predictable .tmp inode which might be shared with retained media.
+    with ExitStack() as stack:
+        if parent_fd is None:
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            parent_fd = os.open(str(clip_path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            stack.callback(os.close, parent_fd)
+        with raw_private_stage(parent_fd, name, 0o600) as (stage, out):
+            out.write(payload)
+            out.flush()
+            os.fsync(out.fileno())
+            check_raw_stage(parent_fd, stage, out)
+            os.replace(stage, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
 
 
 @NAS_COPY_PATHS.delivery
@@ -25394,38 +25492,68 @@ def process_clip(cfg, clip, release=True, prepare_download=None):
     expected_sha = str(clip.get("sha256", "")).lower()
     if expected_bytes < 0 or len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha):
         raise ValueError("clip %d has invalid integrity metadata" % clip_id)
-    final_path = cfg.output_dir / valid_relative_path(clip)
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        exists = verified_file(final_path, expected_bytes, expected_sha)
-    except ExistingFileMismatch as exc:
-        quarantine = final_path.with_name(f".{final_path.name}.invalid-{clip_id}-{time.time_ns()}")
-        if quarantine.exists():
-            raise ExistingFileMismatch(quarantine) from exc
-        os.replace(str(final_path), str(quarantine))
-        fsync_dir(final_path.parent)
-        log("WARN", f"clip_id={clip_id} quarantined checksum-mismatched file={quarantine}")
-        exists = False
+    relative = valid_relative_path(clip)
+    final_path = cfg.output_dir / relative
+    name = relative.name
     retries = 0
     downloaded_bytes = 0
-    if not exists:
-        temp_path = final_path.with_name(final_path.name + ".part-%d" % clip_id)
+    parent = open_raw_parent(cfg.output_dir, relative)
+    try:
+        verified = verify_raw_entry(parent, name, expected_bytes, expected_sha)
+        if verified is None:
+            def download():
+                presigned = prepare_download() if prepare_download else request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
+                url = str(presigned.get("url", ""))
+                if not url:
+                    raise RuntimeError("clip %d presign returned no URL" % clip_id)
+                with raw_private_stage(parent, name, 0o666) as (stage, out):
+                    download_verified(url, out, expected_bytes, expected_sha, presigned.get("headers"))
+                    out.flush()
+                    os.fsync(out.fileno())
+                    staged = check_raw_stage(parent, stage, out)
+                    if staged.st_size != expected_bytes:
+                        raise ExistingFileMismatch("raw stage size changed before publication")
+                    # Atomic create-only publication. A racing writer's canonical
+                    # bytes are either exact and usable, or a conflict to preserve.
+                    try:
+                        if sys.platform.startswith("linux"):
+                            # As in collated handoff, publish the exact open inode,
+                            # not an independently re-resolved stage pathname.
+                            os.link("/proc/self/fd/%d" % out.fileno(), name, dst_dir_fd=parent, follow_symlinks=True)
+                        else:
+                            # The exclusively generated stage name is used by local Mac fixtures.
+                            os.link(stage, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                    except FileExistsError:
+                        observed = verify_raw_entry(parent, name, expected_bytes, expected_sha)
+                        if observed is None:
+                            raise ExistingFileMismatch("raw publication collision disappeared: %s" % name)
+                    else:
+                        observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                        if not same_joined_inode(observed, staged):
+                            raise ExistingFileMismatch("raw publication inode changed: %s" % name)
+                    os.fsync(parent)
+                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                # Our own successful link/unlink changes ctime; the verified
+                # inode's bytes and mtime must remain unchanged.
+                if (not same_joined_inode(current, observed) or current.st_size != observed.st_size
+                        or current.st_mtime_ns != observed.st_mtime_ns):
+                    raise ExistingFileMismatch("raw published file changed: %s" % name)
+                return current
 
-        def download():
-            presigned = prepare_download() if prepare_download else request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
-            url = str(presigned.get("url", ""))
-            if not url:
-                raise RuntimeError("clip %d presign returned no URL" % clip_id)
-            download_verified(url, temp_path, expected_bytes, expected_sha, presigned.get("headers"))
-
-        _, retries = retry_transient(download, clip_id, "download")
-        os.replace(str(temp_path), str(final_path))
-        fsync_dir(final_path.parent)
-        downloaded_bytes = expected_bytes
-    # Persist stitch provenance durably before releasing the server-side row.
-    # If the process crashes after this write, replay safely verifies the MP4 and
-    # rewrites the same deterministic sidecar before retrying release.
-    write_stitch_sidecar(final_path, clip)
+            verified, retries = retry_transient(download, clip_id, "download")
+            downloaded_bytes = expected_bytes
+        # Persist provenance durably before releasing the server-side row.
+        write_stitch_sidecar(final_path, clip, parent_fd=parent)
+        current_parent = open_raw_parent(cfg.output_dir, relative, create=False)
+        try:
+            if not same_joined_inode(os.fstat(parent), os.fstat(current_parent)):
+                raise ExistingFileMismatch("raw output directory changed: %s" % relative)
+            if certification_identity(os.stat(name, dir_fd=current_parent, follow_symlinks=False)) != certification_identity(verified):
+                raise ExistingFileMismatch("raw canonical changed before release: %s" % relative)
+        finally:
+            os.close(current_parent)
+    finally:
+        os.close(parent)
     if release and not cfg.dry_run:
         _, release_retries = retry_transient(
             lambda: release_clip(cfg, recording_id, clip_id), clip_id, "release"
@@ -54025,7 +54153,7 @@ def copy_r2_manifest(cfg, filename, expected_sha, max_bytes):
                     return response
                 response = prepare()
                 clip = response["clip"]
-                # Reject existing conflicts before process_clip can quarantine one.
+                # Reject existing conflicts before reserving space for process_clip.
                 final = cfg.output_dir / valid_relative_path(clip)
                 for path in [final, *final.parents]:
                     if path == cfg.output_dir.parent:

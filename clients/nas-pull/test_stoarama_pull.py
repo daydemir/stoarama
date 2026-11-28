@@ -15,6 +15,7 @@ import datetime
 import signal
 import shutil
 import subprocess
+import sys
 import time
 import unittest
 import urllib.error
@@ -1485,10 +1486,10 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             target = Path(raw) / "clip.part"
             response = mock.MagicMock()
             response.__enter__.return_value.read.side_effect = [b"abc", b""]
-            with mock.patch.object(pull.urllib.request, "urlopen", return_value=response):
+            with mock.patch.object(pull.urllib.request, "urlopen", return_value=response), target.open("xb") as out:
                 pull.download_verified(
                     "https://example.test/clip",
-                    target,
+                    out,
                     3,
                     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 )
@@ -1636,35 +1637,158 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         self.assertEqual(provenance["timestamp_contract"], contract)
         self.assertIsNone(provenance["timestamp_contract_reason"])
 
-    def test_checksum_mismatch_is_quarantined_and_redownloaded(self):
+    def raw_publication_fixture(self, raw):
+        cfg = self.config(Path(raw))
+        final = cfg.output_dir / "recordings" / "clip.mp4"
+        final.parent.mkdir()
+        clip = {
+            "clip_id": 7, "recording_id": 13, "size_bytes": 3,
+            "sha256": hashlib.sha256(b"abc").hexdigest(),
+            "relative_path": "recordings/clip.mp4",
+            "download_path": "/unused",
+        }
+        return cfg, final, clip
+
+    def test_checksum_mismatch_is_preserved_without_redownload(self):
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw))
-            final = cfg.output_dir / "recordings" / "clip.mp4"
-            final.parent.mkdir()
+            cfg, final, clip = self.raw_publication_fixture(raw)
             final.write_bytes(b"wrong")
-            clip = {
-                "clip_id": 7,
-                "recording_id": 13,
-                "size_bytes": 3,
-                "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-                "relative_path": "recordings/clip.mp4",
-                "download_path": "/account/recordings/3/clips/7/download",
-            }
-            with mock.patch.object(pull, "request_json", return_value={"url": "https://example.test/clip"}), mock.patch.object(
-                pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(b"abc")
-            ), mock.patch.object(pull, "release_clip"):
+            before = final.stat()
+            with mock.patch.object(pull, "request_json") as request, mock.patch.object(
+                pull, "release_clip"
+            ) as release, self.assertRaises(pull.ExistingFileMismatch):
+                pull.process_clip(cfg, clip)
+            request.assert_not_called()
+            release.assert_not_called()
+            self.assertEqual(final.read_bytes(), b"wrong")
+            self.assertEqual(final.stat().st_ino, before.st_ino)
+            self.assertEqual(list(final.parent.iterdir()), [final])
+
+    def test_directory_conflict_refuses_without_leaking_descriptors(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg, final, clip = self.raw_publication_fixture(raw)
+            final.mkdir()
+            retained = final / "retained"
+            retained.write_bytes(b"retained")
+            before = final.stat()
+            descriptors = len(os.listdir("/dev/fd"))
+            with mock.patch.object(pull, "request_json") as request, mock.patch.object(
+                pull, "release_clip"
+            ) as release:
+                for _ in range(32):
+                    with self.assertRaises(pull.ExistingFileMismatch):
+                        pull.process_clip(cfg, clip)
+                    self.assertEqual(len(os.listdir("/dev/fd")), descriptors)
+            request.assert_not_called()
+            release.assert_not_called()
+            self.assertEqual(final.stat().st_ino, before.st_ino)
+            self.assertEqual(retained.read_bytes(), b"retained")
+            self.assertEqual(list(final.parent.iterdir()), [final])
+
+    def test_ordinary_raw_download_preserves_retained_legacy_partial_links(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg, final, clip = self.raw_publication_fixture(raw)
+            retained = final.with_name("retained.mp4")
+            retained.write_bytes(b"retained")
+            old_partial = final.with_name(final.name + ".part-7")
+            old_sidecar_tmp = final.with_name(final.name + ".stoarama.json.tmp")
+            os.link(retained, old_partial)
+            os.link(retained, old_sidecar_tmp)
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.side_effect = [b"abc", b""]
+            with mock.patch.object(pull.urllib.request, "urlopen", return_value=response), mock.patch.object(
+                pull, "request_json", return_value={"url": "https://example.test/clip"}
+            ), mock.patch.object(pull, "release_clip") as release:
                 self.assertEqual(pull.process_clip(cfg, clip), (7, 3, 3, 0))
+            release.assert_called_once_with(cfg, 13, 7)
             self.assertEqual(final.read_bytes(), b"abc")
-            quarantines = list(final.parent.glob(".clip.mp4.invalid-7-*"))
-            self.assertEqual([path.read_bytes() for path in quarantines], [b"wrong"])
-            final.write_bytes(b"wrong again")
-            with mock.patch.object(pull, "request_json", return_value={"url": "https://example.test/clip"}), mock.patch.object(
-                pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(b"abc")
-            ), mock.patch.object(pull, "release_clip"):
-                self.assertEqual(pull.process_clip(cfg, clip), (7, 3, 3, 0))
+            self.assertEqual(retained.read_bytes(), b"retained")
+            self.assertEqual(old_partial.stat().st_ino, retained.stat().st_ino)
+            self.assertEqual(old_sidecar_tmp.stat().st_ino, retained.stat().st_ino)
+            self.assertEqual(list(final.parent.glob(".stoarama-raw.part-*")), [])
+
+    def test_exclusive_stage_refuses_preexisting_inode(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg, final, clip = self.raw_publication_fixture(raw)
+            previous = final.parent / ".stoarama-raw.part-1234"
+            previous.write_bytes(b"previous")
+            before = previous.stat()
+            with mock.patch.object(pull.uuid, "uuid4", return_value=SimpleNamespace(int=1234)), mock.patch.object(
+                pull, "request_json", return_value={"url": "https://example.test/clip"}
+            ), mock.patch.object(pull.urllib.request, "urlopen") as download, mock.patch.object(
+                pull, "release_clip"
+            ) as release, self.assertRaises(FileExistsError):
+                pull.process_clip(cfg, clip)
+            download.assert_not_called()
+            release.assert_not_called()
+            self.assertEqual(previous.read_bytes(), b"previous")
+            self.assertEqual(previous.stat().st_ino, before.st_ino)
+            self.assertFalse(final.exists())
+
+    def test_ordinary_download_retry_uses_fresh_stage(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg, final, clip = self.raw_publication_fixture(raw)
+            stages = []
+            first, second = mock.MagicMock(), mock.MagicMock()
+            def interrupted(*args):
+                stages.append(next(final.parent.glob(".stoarama-raw.part-*")))
+                raise socket.timeout("synthetic timeout")
+            chunks = iter([b"abc", b""])
+            def completed(*args):
+                stages.append(next(final.parent.glob(".stoarama-raw.part-*")))
+                return next(chunks)
+            first.__enter__.return_value.read.side_effect = interrupted
+            second.__enter__.return_value.read.side_effect = completed
+            with mock.patch.object(pull.urllib.request, "urlopen", side_effect=[first, second]), mock.patch.object(
+                pull, "request_json", return_value={"url": "https://example.test/clip"}
+            ), mock.patch.object(pull.time, "sleep"), mock.patch.object(pull, "release_clip") as release:
+                self.assertEqual(pull.process_clip(cfg, clip), (7, 3, 3, 1))
+            release.assert_called_once_with(cfg, 13, 7)
+            self.assertNotEqual(stages[0], stages[1])
             self.assertEqual(final.read_bytes(), b"abc")
-            quarantines = list(final.parent.glob(".clip.mp4.invalid-7-*"))
-            self.assertEqual(sorted(path.read_bytes() for path in quarantines), [b"wrong", b"wrong again"])
+            self.assertEqual(list(final.parent.glob(".stoarama-raw.part-*")), [])
+
+    def test_interrupted_ordinary_download_removes_only_own_stage(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg, final, clip = self.raw_publication_fixture(raw)
+            previous = final.parent / ".stoarama-raw.part-1234"
+            previous.write_bytes(b"previous")
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.side_effect = [b"ab", KeyboardInterrupt()]
+            with mock.patch.object(pull.urllib.request, "urlopen", return_value=response), mock.patch.object(
+                pull, "request_json", return_value={"url": "https://example.test/clip"}
+            ), mock.patch.object(pull, "release_clip") as release, self.assertRaises(KeyboardInterrupt):
+                pull.process_clip(cfg, clip)
+            release.assert_not_called()
+            self.assertEqual(list(final.parent.iterdir()), [previous])
+            self.assertEqual(previous.read_bytes(), b"previous")
+
+    def test_concurrent_ordinary_publication_never_overwrites(self):
+        for winner in (b"xyz", b"abc"):
+            with self.subTest(winner=winner), tempfile.TemporaryDirectory() as raw:
+                cfg, final, clip = self.raw_publication_fixture(raw)
+                response = mock.MagicMock()
+                response.__enter__.return_value.read.side_effect = [b"abc", b""]
+                observed = []
+                def prepare():
+                    # Another process publishes after the initial absence check.
+                    subprocess.run([sys.executable, "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).write_bytes(bytes.fromhex(sys.argv[2]))", str(final), winner.hex()], check=True)
+                    observed.append(final.stat().st_ino)
+                    return {"url": "https://example.test/clip"}
+                with mock.patch.object(pull.urllib.request, "urlopen", return_value=response), mock.patch.object(
+                    pull, "release_clip"
+                ) as release:
+                    if winner == b"abc":
+                        self.assertEqual(pull.process_clip(cfg, clip, prepare_download=prepare), (7, 3, 3, 0))
+                        release.assert_called_once_with(cfg, 13, 7)
+                    else:
+                        with self.assertRaises(pull.ExistingFileMismatch):
+                            pull.process_clip(cfg, clip, prepare_download=prepare)
+                        release.assert_not_called()
+                        self.assertFalse(pull.stitch_sidecar_path(final).exists())
+                self.assertEqual(final.read_bytes(), winner)
+                self.assertEqual(final.stat().st_ino, observed[0])
+                self.assertEqual(list(final.parent.glob(".stoarama-raw.part-*")), [])
 
     def test_failed_clip_does_not_block_later_downloads_or_advance_past_it(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -5544,9 +5668,9 @@ class R2RetireCopyTests(unittest.TestCase):
             def prepare(_cfg, method, path, **kwargs):
                 self.assertEqual((method, path), ("POST", "/account/connections/redownload"))
                 return dict(response)
-            def download(_url, path, size, sha, headers):
+            def download(_url, out, size, sha, headers):
                 self.assertEqual(headers, {"If-Match": '"etag"'})
-                path.write_bytes(body)
+                out.write(body)
             with mock.patch.object(pull, "request_json", side_effect=prepare), mock.patch.object(
                     pull, "download_verified", side_effect=download), mock.patch.object(pull.Inventory, "sync_clip_ids") as sync:
                 result = pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
@@ -5617,7 +5741,7 @@ class R2RetireCopyTests(unittest.TestCase):
                     "url": "https://r2.test/exact", "headers": {"If-Match": ['"etag"']}}
             bad = dict(good, policy_sha256="0" * 64)
             with mock.patch.object(pull, "request_json", side_effect=[dict(good), dict(good), bad]), mock.patch.object(
-                    pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(body)), mock.patch.object(
+                    pull, "download_verified", side_effect=lambda _url, out, *_args: out.write(body)), mock.patch.object(
                     pull.Inventory, "sync_clip_ids") as sync, self.assertRaises(RuntimeError):
                 pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
             sync.assert_not_called()
