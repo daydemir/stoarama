@@ -25,6 +25,8 @@ BEFORE_RAW = tuple([t]*3 for t in ('2026-09-19 16:45:38','2026-09-19 16:45:38','
 AFTER_RAW = tuple([t]*3 for t in ('2026-09-19 16:45:39','2026-09-19 16:45:39','2026-09-19 16:45:40'))
 BEFORE_PTS = tuple([int(round((300-d)*10)), '1/10'] for d in C.READ_AT_S)
 AFTER_PTS = tuple([int(round(d*10)), '1/10'] for d in C.READ_AT_S)
+BEFORE_EDGE = {'raw':BEFORE_RAW[0], 'pts':[29996,'1/100']}
+AFTER_EDGE = {'raw':AFTER_RAW[0], 'pts':[0,'1/100']}
 
 
 def seam(reason='frame_jump', gap=0.0, before=CLOCK, after=CLOCK, ratio=0.9, prev=MEDIA, nxt=MEDIA, span=300.0, before_dates=DATES, after_dates=DATES):
@@ -200,7 +202,7 @@ class ExactPlanTests(unittest.TestCase):
         decisions = [dict(r, prev_media=dataclasses.asdict(MEDIA), next_media=dataclasses.asdict(MEDIA),
                           clock_before=BEFORE, clock_after=AFTER, clock_before_dates=DATES, clock_after_dates=DATES,
                           clock_before_raw=BEFORE_RAW, clock_after_raw=AFTER_RAW, clock_before_pts=BEFORE_PTS,
-                          clock_after_pts=AFTER_PTS, frame_ratio=.5, join=True,
+                          clock_after_pts=AFTER_PTS, clock_before_edge=BEFORE_EDGE, clock_after_edge=AFTER_EDGE,frame_ratio=.5, join=True,
                           keep_reason=None, clock_delta_s=0.6) for r in rows]
         return rows, decisions, ledger, seams, source, registry
 
@@ -224,6 +226,10 @@ class ExactPlanTests(unittest.TestCase):
         self.assertFalse(C.verdict(dict(e, clock_before_pts=()))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_pts=([4,'1/10'],AFTER_PTS[1],AFTER_PTS[-1])))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_pts=([21,'1/100'],AFTER_PTS[1],AFTER_PTS[-1])))[0])
+        self.assertFalse(C.verdict(dict(e,clock_before_edge={'pts':BEFORE_EDGE['pts'],'raw':['2026-09-19 16:45:36']*3}))[0])
+        self.assertFalse(C.verdict(dict(e,clock_after_edge={'pts':AFTER_EDGE['pts'],'raw':['2026-09-19 16:45:41']*3}))[0])
+        self.assertFalse(C.verdict(dict(e,clock_before_edge={'pts':[29980,'1/100'],'raw':BEFORE_EDGE['raw']}))[0])
+        self.assertFalse(C.verdict({k:v for k,v in e.items() if k!='clock_before_edge'})[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=[['2026-09-19 01:45:39 am']*3]*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=[['2026-09-19 04:45:39']*3]*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=()))[0])
@@ -273,6 +279,9 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(got[:3],(45296,'2026-09-19',['2026-09-19 12:34:56']*3))
                 self.assertEqual(got[3][0]*C.Fraction(got[3][1]), C.Fraction('1.2'))
                 self.assertEqual(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d),(None,None,[],None))
+                last=C.read_clock(os.path.join(d,'long.mp4'),0.5,'crop=100:50:0:0',d,last=True)
+                self.assertEqual(C.stamp_time(last[3]),C.Fraction('1.96'))
+                self.assertEqual(C.edge_distance(C.probe(os.path.join(d,'long.mp4')),last[3],True),C.Fraction('.04'))
             def date_only(args, **kwargs):
                 if args[0] == 'tesseract':
                     return subprocess.CompletedProcess(args,0,stdout='27.Sep 2026',stderr='')
@@ -322,7 +331,7 @@ class BuildTests(unittest.TestCase):
                        'prev_span_s': 300, 'prev_media': dataclasses.asdict(MEDIA), 'next_media': dataclasses.asdict(MEDIA),
                        'clock_before': BEFORE, 'clock_after': AFTER, 'clock_before_dates': DATES, 'clock_after_dates': DATES,
                        'clock_before_raw': BEFORE_RAW, 'clock_after_raw': AFTER_RAW, 'clock_before_pts': BEFORE_PTS,
-                       'clock_after_pts': AFTER_PTS, 'frame_ratio': .5, 'join': True,
+                       'clock_after_pts': AFTER_PTS, 'clock_before_edge':BEFORE_EDGE,'clock_after_edge':AFTER_EDGE,'frame_ratio': .5, 'join': True,
                        'keep_reason': None, 'clock_delta_s': 0.6}
                 for side, x in (('prev', prev), ('next', nxt)):
                     row.update({f'{side}_{k}': v for k, v in C.source_identity(registry, x['file_id'], x['key'], 433).items()})

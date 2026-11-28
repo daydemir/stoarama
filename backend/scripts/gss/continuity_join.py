@@ -84,7 +84,7 @@ FRAME_DIFF_HALF_S = 10.0
 TAIL_TOLERANCE_S = 0.2  # previous file's media end vs its DB span (the audit's content-vs-DB tolerance)
 OUTPUT_TOLERANCE_S = 0.1  # joined duration vs the sum of its inputs
 BATCH_PREFIX = 'clock-prestitch-'
-PASS_VERSION = 'continuity-join/3'
+PASS_VERSION = 'continuity-join/4'
 FFMPEG = os.environ.get('FFMPEG_BIN', 'ffmpeg')
 FFPROBE = os.environ.get('FFPROBE_BIN', 'ffprobe')
 DECODE_THREADS = os.environ.get('FFMPEG_THREADS', '0')  # 0 = ffmpeg's choice
@@ -326,13 +326,18 @@ def probe(src, etag=None):
                  float(v.get('start_time', 0)), float(j['format']['duration']), 1 / fraction(v['r_frame_rate']))
 
 
-def read_clock(src, t, crop, tmp, etag=None):
-    """Read one selected frame, retaining its actual container-relative PTS."""
+def read_clock(src, t, crop, tmp, etag=None, last=False):
+    """Read the selected frame (or the final presented frame through EOF)."""
     with tempfile.TemporaryDirectory(dir=tmp, prefix="clock-read-") as fresh:
         raw = os.path.join(fresh, "frame.png")
-        p = subprocess.run([FFMPEG, '-v', 'info', '-nostdin', '-copyts', '-start_at_zero', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src,
-                            '-map', '0:v:0', '-frames:v', '1', '-fps_mode', 'passthrough', '-vf',
-                            f"select=eq(n\\,0),scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray,showinfo", '-y', raw],
+        # For the preceding endpoint, consume every decoded frame through EOF;
+        # image2 replaces the same PNG for each, leaving exactly the last
+        # presentation. For other reads select just the first decoded frame.
+        select = '' if last else 'select=eq(n\\,0),'
+        output = ['-update', '1'] if last else ['-frames:v', '1']
+        p = subprocess.run([FFMPEG, '-v', 'info', '-xerror', '-nostdin', '-copyts', '-start_at_zero', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src,
+                            '-map', '0:v:0', *output, '-fps_mode', 'passthrough', '-vf',
+                            f"{select}scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray,showinfo", '-y', raw],
                            capture_output=True, timeout=300, check=True)
         if not os.path.exists(raw):
             return None, None, [], None
@@ -340,10 +345,11 @@ def read_clock(src, t, crop, tmp, etag=None):
         # ticks and filter time base are exact; pts_time is rounded for display.
         log = p.stderr.decode('utf-8', errors='replace')
         bases = re.findall(r'\[Parsed_showinfo_\d+[^\n]*\] config in time_base: (\d+/\d+)', log)
-        ticks = re.findall(r'\[Parsed_showinfo_\d+[^\n]*\] n:\s*0\s+pts:\s*(-?\d+)\s', log)
-        if len(bases) != 1 or len(ticks) != 1:
+        ticks = [(int(n),int(tick)) for n,tick in re.findall(r'\[Parsed_showinfo_\d+[^\n]*\] n:\s*(\d+)\s+pts:\s*(-?\d+)\s', log)]
+        if (len(bases) != 1 or not ticks or (not last and len(ticks) != 1) or
+                [n for n,_ in ticks] != list(range(len(ticks))) or any(a>=b for (_,a),(_,b) in zip(ticks,ticks[1:]))):
             raise ValueError('missing unique decoded frame timestamp')
-        pts = [int(ticks[0]), bases[0]]
+        pts = [ticks[-1][1], bases[0]]
         texts = []
         for th in CLOCK_THRESHOLDS:
             png = f'{raw}.{th}.png'
@@ -462,10 +468,7 @@ def sample_distances(media, stamps, before):
         if stamp is None:
             result.append(None)
             continue
-        if (not isinstance(stamp, (list, tuple)) or len(stamp) != 2 or type(stamp[0]) is not int or
-                not isinstance(stamp[1], str) or not re.fullmatch(r'[1-9]\d*/[1-9]\d*', stamp[1])):
-            raise ValueError('invalid decoded frame timestamp')
-        pts = stamp[0] * Fraction(stamp[1])
+        pts = stamp_time(stamp)
         distance = duration - pts if before else pts
         if not 0 <= pts < duration or distance <= 0 or abs(distance - Fraction(str(target))) > frame:
             raise ValueError('decoded frame outside the requested seam sample')
@@ -474,6 +477,25 @@ def sample_distances(media, stamps, before):
     if any(a >= b for a, b in zip(got, got[1:])):
         raise ValueError('decoded frame timestamps not strictly ordered')
     return tuple(result)
+
+
+def stamp_time(stamp):
+    if (not isinstance(stamp, (list, tuple)) or len(stamp) != 2 or type(stamp[0]) is not int or
+            not isinstance(stamp[1], str) or not re.fullmatch(r'[1-9]\d*/[1-9]\d*', stamp[1])):
+        raise ValueError('invalid decoded frame timestamp')
+    return stamp[0] * Fraction(stamp[1])
+
+
+def edge_distance(media, stamp, before):
+    pts = stamp_time(stamp)
+    duration = Fraction(str(media.duration_s))
+    distance = duration-pts if before else pts
+    # Codec/container durations may include a small final audio tail; the
+    # actual last frame must still be very close to the seam. The exact
+    # distance (not a substituted nominal frame interval) enters the proof.
+    if not 0 <= pts < duration or not 0 <= distance <= Fraction(str(media.frame_s)) + Fraction('0.001'):
+        raise ValueError('actual edge not at the media boundary')
+    return distance
 
 
 def seam_evidence(row):
@@ -502,9 +524,15 @@ def seam_evidence(row):
             before = [None if c is None or d is None else float(c+d) for (c,_,_,_),d in zip(br,bt)]
             after = [None if c is None or d is None else float(c-d) for (c,_,_,_),d in zip(ar,at)]
             bd, ad = tuple(day for _,day,_,_ in br), tuple(day for _,day,_,_ in ar)
-        out.update(clock_before=before, clock_after=after, clock_before_dates=bd, clock_after_dates=ad)
-        if (clock_check(seam_of(out))[0] is None
-                and raw_clock_evidence_matches(out)):
+            out.update(clock_before=before, clock_after=after, clock_before_dates=bd, clock_after_dates=ad)
+            # Only need the additional exact endpoint reads for plausible
+            # interior clock candidates. The final eligibility gate requires
+            # both even when all interior frames agree.
+            if clock_check(seam_of(out))[0] is None:
+                for side, src, t, etag, last in (('before',prev_src,max(0,pm.duration_s-2),pe,True),('after',next_src,0,ne,False)):
+                    _, _, raw, stamp = read_clock(src,t,crop,tmp,etag,last=last)
+                    out['clock_'+side+'_edge'] = {'raw':raw,'pts':stamp}
+        if raw_clock_evidence_matches(out) and clock_check(seam_of(out))[0] is None:
             out['frame_ratio'] = frame_ratio(gray_frames(prev_src, pm.duration_s - FRAME_DIFF_HALF_S, FRAME_DIFF_HALF_S + 1, pe),
                                              gray_frames(next_src, 0, FRAME_DIFF_HALF_S, ne))
     except Exception as e:  # recorded, and decide() keeps the seam split
@@ -547,6 +575,8 @@ def raw_clock_evidence_matches(ev):
         try:
             media = media_of(ev['prev_media' if side == 'before' else 'next_media'])
             positions = sample_distances(media, ev['clock_' + side + '_pts'], side == 'before')
+            edge = ev['clock_' + side + '_edge']
+            edge_pos = edge_distance(media,edge['pts'],side == 'before')
         except (KeyError, AttributeError, TypeError, ValueError, ZeroDivisionError):
             return False
         exact = []
@@ -563,6 +593,12 @@ def raw_clock_evidence_matches(ev):
             exact.append(seconds + sign*pos)
         if len(exact) < MIN_READS:
             return False
+        edge_seconds, edge_day, edge_mode = clock_frame_consensus(edge.get('raw'))
+        nearest_seconds, nearest_day, _ = clock_frame_consensus(raw[0])
+        if (edge_seconds is None or not edge_mode or edge_day != nearest_day or positions[0] is None or
+                edge_pos >= positions[0] or (edge_seconds-nearest_seconds)*sign < 0):
+            return False
+        exact.append(edge_seconds+sign*edge_pos)
         bounds.append((max(exact), min(exact)+1))
     (bl,bh),(al,ah) = bounds
     # Do not round the interval bound: a positive verdict must prove that
