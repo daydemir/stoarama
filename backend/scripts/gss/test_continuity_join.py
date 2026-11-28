@@ -243,6 +243,11 @@ class BuildTests(unittest.TestCase):
             [a] = L.read_proofs(out, listing, uploads, registry, store)
             self.assertEqual((a.source, a.input_ids, a.path), (L.Source.CLOCK_ASSEMBLY, (100, 101, 102), None))
             self.assertEqual(C.build_run(run, verdicts, 'clock-prestitch-20261126', out, os.path.join(d, 'work2'), parts, fetch), proof)
+            # Adjacent runs can share the same outer work path. A second output
+            # must not truncate the first content-addressed inode.
+            smaller = C.build_run(run[:2], verdicts[:1], 'clock-prestitch-20261126', out, os.path.join(d, 'work2'), parts, fetch)
+            self.assertNotEqual(smaller['output']['sha256'], proof['output']['sha256'])
+            self.assertEqual(C.sha256_file(obj), proof['output']['sha256'])
             with self.assertRaises(C.BuildRefused):
                 C.build_run(run, [], 'clock-prestitch-20261126', out, os.path.join(d, 'work3'), parts, fetch)
             with self.assertRaisesRegex(ValueError, 'incomplete boundary'):

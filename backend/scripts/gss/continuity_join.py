@@ -651,7 +651,8 @@ def build_run(run, verdicts, batch, out_dir, work, catalog_parts, fetch=download
     lst = os.path.join(work, 'concat.txt')
     with open(lst, 'w', encoding='utf-8') as f:
         f.writelines(f"file '{p}'\n" for p in local)
-    tmp_out = os.path.join(work, 'joined.mp4')
+    fd, tmp_out = tempfile.mkstemp(dir=work, prefix='joined-', suffix='.mp4')
+    os.close(fd)
     subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-y', '-f', 'concat', '-safe', '0', '-i', lst,
                     '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-movflags', '+faststart', tmp_out], check=True, timeout=3600)
     frame_s = media_of(inputs[0]['media']).frame_s
@@ -686,6 +687,9 @@ def build_run(run, verdicts, batch, out_dir, work, catalog_parts, fetch=download
     except FileExistsError:
         if os.path.getsize(obj) != proof['output']['size_bytes'] or sha256_file(obj) != sha:
             raise SystemExit(f'{obj} exists with differing bytes')
+    finally:
+        # Never let a future ffmpeg -y target an inode that was promoted.
+        os.unlink(tmp_out)
     fd, scratch = tempfile.mkstemp(dir=os.path.dirname(prf), prefix='.proof-')
     try:
         with os.fdopen(fd, 'wb') as f:
@@ -827,6 +831,7 @@ def main(argv=None):
         check_plan_parent(planned, registry)
         by_hour = checked_verdicts(planned, read_jsonl(a.verdicts))
         os.makedirs(a.out, exist_ok=True)
+        os.makedirs(a.work, exist_ok=True)
         shard, shards = map(int, a.shard.split('/'))
         if not 0 <= shard < shards:
             raise ValueError('invalid build shard')
@@ -857,7 +862,7 @@ def main(argv=None):
                 ids = tuple(x['file_id'] for x in run)
                 if idx % shards != shard or ids in done:
                     continue
-                work = os.path.join(a.work, hour_id)
+                work = tempfile.mkdtemp(dir=a.work, prefix='clock-run-')
                 try:
                     proof = build_run(run, seam_vs, a.batch, a.out, work, parts)
                 except BuildRefused as e:
