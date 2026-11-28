@@ -331,7 +331,7 @@ def probe(src, etag=None):
                  float(v.get('start_time', 0)), float(j['format']['duration']), 1 / fraction(v['r_frame_rate']))
 
 
-def read_clock(src, t, crop, tmp, etag=None, last=False, frame_s=None):
+def read_clock(src, t, crop, tmp, etag=None, last=False, *, frame_s=None, before=False):
     """Read the selected frame (or the final presented frame through EOF).
 
     `frame_s` marks an interior seam sample and carries that stream's probed
@@ -353,7 +353,8 @@ def read_clock(src, t, crop, tmp, etag=None, last=False, frame_s=None):
         elif frame_s is None:
             select, seek = 'select=eq(n\\,0),', t
         else:
-            select = f"select='isnan(prev_selected_t)*gte(t\\,{t - frame_s:.9f})',"
+            interior = '' if before else 'gt(t\\,0)*'
+            select = f"select='{interior}isnan(prev_selected_t)*gte(t\\,{t - frame_s:.9f})',"
             seek = max(0.0, t - max(PREROLL_S, 3 * frame_s))
         output = ['-update', '1'] if last else ['-frames:v', '1']
         p = subprocess.run([FFMPEG, '-v', 'info', '-xerror', '-nostdin', '-copyts', '-start_at_zero', '-ss', f'{seek:.3f}', *http_headers(etag), '-i', src,
@@ -536,7 +537,7 @@ def seam_evidence(row):
         if abs(row['db_gap_s']) > max(pm.frame_s, nm.frame_s):
             return out
         with tempfile.TemporaryDirectory() as tmp:
-            br = [read_clock(prev_src, pm.duration_s - d, crop, tmp, pe, frame_s=pm.frame_s) for d in READ_AT_S]
+            br = [read_clock(prev_src, pm.duration_s - d, crop, tmp, pe, frame_s=pm.frame_s, before=True) for d in READ_AT_S]
             ar = [read_clock(next_src, d, crop, tmp, ne, frame_s=nm.frame_s) for d in READ_AT_S]
             bp, ap = [p for _,_,_,p in br], [p for _,_,_,p in ar]
             out.update(clock_before_pts=bp, clock_after_pts=ap,

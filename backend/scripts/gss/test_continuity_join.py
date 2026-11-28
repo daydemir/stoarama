@@ -322,9 +322,9 @@ class BuildTests(unittest.TestCase):
                 if args[0] == C.FFMPEG and '-ss' in args:
                     commands.append(list(args))
                 return actual_run(args, **kwargs)
-            def encode(name, drop):
+            def encode(name, drop, rate=25):
                 p = os.path.join(d, name)
-                subprocess.run([C.FFMPEG, '-v', 'error', '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=25:duration=2',
+                subprocess.run([C.FFMPEG, '-v', 'error', '-f', 'lavfi', '-i', f'testsrc=size=320x240:rate={rate}:duration=2',
                                 '-vf', f"select='{drop}'", '-fps_mode', 'passthrough', '-c:v', 'libx264', '-g', '250',
                                 '-video_track_timescale', '11264', p], check=True)
                 return p
@@ -339,7 +339,7 @@ class BuildTests(unittest.TestCase):
                 m = C.probe(p)
                 self.assertEqual((m.video[6], m.frame_s), ('1/11264', 0.04))
                 with mock.patch.object(C.subprocess, 'run', side_effect=with_ocr):
-                    inside = C.read_clock(p, read, 'crop=100:50:0:0', d, frame_s=m.frame_s)
+                    inside = C.read_clock(p, read, 'crop=100:50:0:0', d, frame_s=m.frame_s, before=before)
                 self.assertEqual(distance(m, inside[3], before, target), expected)
                 seek = commands[-1][commands[-1].index('-ss') + 1]
                 self.assertEqual(seek, f'{max(0.0, read - C.PREROLL_S):.3f}')  # bounded preroll
@@ -351,9 +351,15 @@ class BuildTests(unittest.TestCase):
             wm = C.probe(p)
             with mock.patch.object(C.subprocess, 'run', side_effect=with_ocr):
                 got = C.read_clock(p, .7, 'crop=100:50:0:0', d, frame_s=wm.frame_s)
-            self.assertEqual(C.stamp_time(got[3]), C.Fraction(4731, 5632))  # 0.84 s, one frame late
+            self.assertEqual(C.stamp_time(got[3]), C.Fraction(4731, 5632))  # 0.84 s, outside the sample window
             with self.assertRaisesRegex(ValueError, 'outside the requested'):
                 distance(wm, got[3], False, .7)
+            # On a slow stream, PTS zero is the next endpoint, never an interior sample.
+            p = encode('slow.mp4', '1', rate=5)
+            slow = C.probe(p)
+            with mock.patch.object(C.subprocess, 'run', side_effect=with_ocr):
+                got = C.read_clock(p, .2, 'crop=100:50:0:0', d, frame_s=slow.frame_s)
+            self.assertGreater(distance(slow, got[3], False, .2), 0)
             # A default read keeps the original exact seek and single-frame select.
             with mock.patch.object(C.subprocess, 'run', side_effect=with_ocr):
                 C.read_clock(p, 1.2, 'crop=100:50:0:0', d)
