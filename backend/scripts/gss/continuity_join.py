@@ -79,6 +79,11 @@ READ_SPREAD_S = 1.0  # reads of one side that agree lie within this
 # Seconds before the seam (previous file) and after it (next file): the frames nearest the join, so a jump
 # or replay that resolves within ~1 s of it (seen on 437 and 442) still splits the reads.
 READ_AT_S = (0.2, 0.7, 1.2)
+# An input seek alone commonly lands 40-75 ms late on a 25 fps, 1/11264
+# stream. Interior reads seek this bounded preroll (or 3 probed frames if
+# longer) before the requested PTS and select the first decoded frame at or
+# after (target minus one probed frame). Endpoint reads are unchanged.
+PREROLL_S = 0.25
 FRAME_DIFF_VETO = 1.5
 FRAME_DIFF_HALF_S = 10.0
 TAIL_TOLERANCE_S = 0.2  # previous file's media end vs its DB span (the audit's content-vs-DB tolerance)
@@ -326,16 +331,32 @@ def probe(src, etag=None):
                  float(v.get('start_time', 0)), float(j['format']['duration']), 1 / fraction(v['r_frame_rate']))
 
 
-def read_clock(src, t, crop, tmp, etag=None, last=False):
-    """Read the selected frame (or the final presented frame through EOF)."""
+def read_clock(src, t, crop, tmp, etag=None, last=False, frame_s=None):
+    """Read the selected frame (or the final presented frame through EOF).
+
+    `frame_s` marks an interior seam sample and carries that stream's probed
+    nominal frame. The read then seeks a short bounded preroll before `t` and
+    selects the first decoded frame at or after `t - frame_s`, because a bare
+    input seek often lands 40-75 ms late on a 25 fps, 1/11264 stream. The select
+    runs inside the filter chain (isnan(prev_selected_t)) so exactly one frame
+    reaches the PNG path. Endpoint reads and every default caller keep the exact
+    unbounded seek. sample_distances still validates each decoded tick exactly,
+    and an interior read with no frame in the window keeps failing there.
+    """
     with tempfile.TemporaryDirectory(dir=tmp, prefix="clock-read-") as fresh:
         raw = os.path.join(fresh, "frame.png")
         # For the preceding endpoint, consume every decoded frame through EOF;
         # image2 replaces the same PNG for each, leaving exactly the last
-        # presentation. For other reads select just the first decoded frame.
-        select = '' if last else 'select=eq(n\\,0),'
+        # presentation. Other reads select just the first decoded frame.
+        if last:
+            select, seek = '', t
+        elif frame_s is None:
+            select, seek = 'select=eq(n\\,0),', t
+        else:
+            select = f"select='isnan(prev_selected_t)*gte(t\\,{t - frame_s:.9f})',"
+            seek = max(0.0, t - max(PREROLL_S, 3 * frame_s))
         output = ['-update', '1'] if last else ['-frames:v', '1']
-        p = subprocess.run([FFMPEG, '-v', 'info', '-xerror', '-nostdin', '-copyts', '-start_at_zero', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src,
+        p = subprocess.run([FFMPEG, '-v', 'info', '-xerror', '-nostdin', '-copyts', '-start_at_zero', '-ss', f'{seek:.3f}', *http_headers(etag), '-i', src,
                             '-map', '0:v:0', *output, '-fps_mode', 'passthrough', '-vf',
                             f"{select}scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray,showinfo", '-y', raw],
                            capture_output=True, timeout=300, check=True)
@@ -515,8 +536,8 @@ def seam_evidence(row):
         if abs(row['db_gap_s']) > max(pm.frame_s, nm.frame_s):
             return out
         with tempfile.TemporaryDirectory() as tmp:
-            br = [read_clock(prev_src, pm.duration_s - d, crop, tmp, pe) for d in READ_AT_S]
-            ar = [read_clock(next_src, d, crop, tmp, ne) for d in READ_AT_S]
+            br = [read_clock(prev_src, pm.duration_s - d, crop, tmp, pe, frame_s=pm.frame_s) for d in READ_AT_S]
+            ar = [read_clock(next_src, d, crop, tmp, ne, frame_s=nm.frame_s) for d in READ_AT_S]
             bp, ap = [p for _,_,_,p in br], [p for _,_,_,p in ar]
             out.update(clock_before_pts=bp, clock_after_pts=ap,
                        clock_before_raw=[raw for _,_,raw,_ in br], clock_after_raw=[raw for _,_,raw,_ in ar])
