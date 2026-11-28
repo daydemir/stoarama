@@ -72,6 +72,10 @@ class RuleTests(unittest.TestCase):
         before = (60338.2,60337.7,60338.2)
         after = (60338.8,60339.3,60338.8)
         self.assertEqual(C.decide(seam(before=before,after=after))[:2],(False,K.CLOCK_DISAGREES))
+        # Missing middle samples can make continuity feasible while leaving a
+        # possible jump larger than the approved one-second clock resolution.
+        self.assertEqual(C.decide(seam(before=(60338.2,None,60338.2),after=(60338.8,None,60338.8)))[:2],(False,K.CLOCK_DISAGREES))
+        self.assertTrue(C.decide(seam(before=BEFORE,after=AFTER))[0])
 
     def test_date_skip_and_unreadable_date_cannot_join(self):
         self.assertEqual(C.parse_display_date('2026-09-19 16:45:38'),'2026-09-19')

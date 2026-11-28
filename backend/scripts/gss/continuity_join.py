@@ -215,8 +215,18 @@ def clock_check(seam):
     # An integer displayed second describes a half-open one-second interval.
     # Every readable offset must admit one common seam instant; pairwise
     # medians can hide a genuine skip even when their residual is under 1 s.
-    offsets = [v for v in seam.before + seam.after if v is not None]
-    if max(offsets) >= min(offsets) + CLOCK_TOLERANCE_S:
+    before_offsets = [v for v in seam.before if v is not None]
+    after_offsets = [v for v in seam.after if v is not None]
+    offsets = before_offsets + after_offsets
+    if max(offsets) >= min(offsets) + 1.0:
+        return KeepReason.CLOCK_DISAGREES, delta
+    # Also bound BOTH directions of every feasible discontinuity, not just
+    # existence of a continuous interpretation. The approved clock proof has
+    # one-second resolution; do not claim sub-second continuity from it.
+    before_low, before_high = max(before_offsets), min(before_offsets) + 1.0
+    after_low, after_high = max(after_offsets), min(after_offsets) + 1.0
+    worst = round(max(after_high - before_low, before_high - after_low), 3)
+    if worst > CLOCK_TOLERANCE_S:
         return KeepReason.CLOCK_DISAGREES, delta
     return None, delta
 
