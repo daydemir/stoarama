@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import signal
@@ -109,6 +110,42 @@ class HeartbeatFreshStorageTests(unittest.TestCase):
         self.assertLessEqual(pull.heartbeat_monotonic(), kwargs['send_deadline'])
         self.assertEqual(headers['Authorization'], 'Bearer '+self.cfg.api_key)
         return 200, {}, b'{"ok":true}'
+
+    def test_installed_artifact_receipt_reads_stable_current_bytes_only(self):
+        self.cfg.is_candidate = False
+        body = b"reviewed installed artifact fixture"
+        self.cfg.current_file.write_bytes(body)
+        runtime = pull.Runtime(self.cfg)
+        runtime.host_facts = lambda: {"machine": "x86_64"}
+        with mock.patch.object(pull, "CLIENT_VERSION", pull.NAS_INSTALLED_RECEIPT_VERSION), \
+             mock.patch.object(pull, "executing_release_sha256", side_effect=AssertionError("manifest is not a receipt")):
+            def release():
+                return runtime.heartbeat_payload(None)["host"]["release"]
+            self.assertNotIn("artifact_sha256", release())
+            runtime.stable_marked = True
+            self.assertEqual(release()["artifact_sha256"], hashlib.sha256(body).hexdigest())
+            self.cfg.is_candidate = True
+            self.assertNotIn("artifact_sha256", release())
+            self.cfg.is_candidate = False
+            self.cfg.current_file.write_bytes(body + b"changed")
+            self.assertEqual(release()["artifact_sha256"], hashlib.sha256(body + b"changed").hexdigest())
+            self.cfg.current_file.unlink()
+            self.assertNotIn("artifact_sha256", release())
+            target = self.cfg.state_dir / "external.py"
+            target.write_bytes(body)
+            self.cfg.current_file.symlink_to(target)
+            self.assertNotIn("artifact_sha256", release())
+        with mock.patch.object(pull, "CLIENT_VERSION", pull.FAST_COPY_CLIENT_VERSION):
+            self.assertNotIn("artifact_sha256", runtime.heartbeat_payload(None)["host"]["release"])
+
+    def test_receipt_release_keeps_fast_copy_and_no_local_stitch(self):
+        with mock.patch.object(pull, "CLIENT_VERSION", pull.NAS_INSTALLED_RECEIPT_VERSION), \
+             mock.patch.object(pull, "r2_fast_copy_worker") as fast, \
+             mock.patch.object(pull, "r2_copy_worker") as slow:
+            self.assertFalse(pull.StitchSwitches().local_enabled)
+            pull.r2_copy_loop(None, None, None, None)
+            fast.assert_called_once_with(None, None, None, None)
+            slow.assert_not_called()
 
     def test_sample_follows_inventory_and_host_assembly(self):
         runtime = pull.Runtime(self.cfg)

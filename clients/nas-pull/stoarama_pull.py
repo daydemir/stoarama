@@ -59,6 +59,8 @@ KEEP20_CLEANUP_CLIENT_VERSION = "r2-copy-v8-keep20-cleanup"
 # leases NAS-only stitched-output restores, and leases read-only stream-day
 # inventories.
 FAST_COPY_CLIENT_VERSION = "r2-copy-v8-inventory"
+NAS_INSTALLED_RECEIPT_VERSION = "r2-copy-v8-inventory-receipt"
+FAST_COPY_READ_VERSIONS = frozenset((FAST_COPY_CLIENT_VERSION, NAS_INSTALLED_RECEIPT_VERSION))
 LOW_MEMORY_CLEANUP_VERSIONS = frozenset((LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION))
 CLEANUP_CERTIFIED_STITCH_REASON = "durham_stitch_certified"
 CLEANUP_CERTIFIED_STITCH_RECOVERY = "nas_stitch_certified"
@@ -698,7 +700,7 @@ class StitchSwitches:
     def __init__(self):
         # Both low-memory literals are copy-only; the tuple keeps this class
         # loadable as an isolated contract fixture.
-        self.local_enabled = (CLIENT_VERSION not in (LOW_MEMORY_COPY_CLIENT_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION) and
+        self.local_enabled = (CLIENT_VERSION not in (LOW_MEMORY_COPY_CLIENT_VERSION, LOW_MEMORY_CLEANUP_CLIENT_VERSION, KEEP20_CLEANUP_CLIENT_VERSION, FAST_COPY_CLIENT_VERSION, NAS_INSTALLED_RECEIPT_VERSION) and
                               env_str("STOARAMA_V85_STITCH_ENABLED", "true").lower() == "true")
         self.local_deletion_enabled = env_str("STOARAMA_V85_STITCH_DELETION_ENABLED", "true").lower() == "true"
         cancel = threading.Event()
@@ -776,7 +778,7 @@ class Config:
         self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 60)
         self.download_workers = env_int("STOARAMA_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)
         self.restore_workers = env_int("STOARAMA_RESTORE_WORKERS", DEFAULT_RESTORE_WORKERS)
-        if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+        if CLIENT_VERSION in FAST_COPY_READ_VERSIONS:
             self.fast_copy_reread = env_str("STOARAMA_R2_FAST_COPY_REREAD", "false").lower() == "true"
         self.inventory_scan_interval_sec = env_int("STOARAMA_INVENTORY_SCAN_INTERVAL_SEC", INVENTORY_SCAN_INTERVAL_SEC)
         # Hash throughput already bounds disk pressure. An additional per-file
@@ -1925,6 +1927,7 @@ class Runtime:
         self.list_succeeded = False
         self.stable_marked = False
         self.release_candidate_at_start = bool(getattr(cfg, "is_candidate", False))
+        self.release_cfg = cfg
         self.inventory = inventory
         # Remote authorization is process-local and fail-closed. A restart must
         # negotiate again; no manifest, environment, or progress file enables it.
@@ -2261,6 +2264,10 @@ class Runtime:
                     raise StitchHold("bounded proof status unavailable")
             payload["stitch"] = redact_diagnostics(dict(stitch, last_error=error, last_error_at=at))
         payload["client_last_error"] = redact_diagnostics(payload["client_last_error"])
+        if CLIENT_VERSION == NAS_INSTALLED_RECEIPT_VERSION and release["stable"] and not release["candidate"]:
+            digest = installed_client_sha256(self.release_cfg)
+            if digest is not None:
+                release["artifact_sha256"] = digest
         host_facts = getattr(self, "host_facts", None)
         if host_facts is not None:
             try:
@@ -52491,6 +52498,35 @@ def update_loop(cfg, runtime, stop_event, inventory_stop_event, update_ready, jo
         stop_event.wait(UPDATE_INTERVAL_SEC)
 
 
+def installed_client_sha256(cfg):
+    """Read the promoted, stable installed source itself, not its manifest digest."""
+    if cfg.is_candidate:
+        return None
+    path = cfg.current_file
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat_module.S_ISREG(before.st_mode) or not 0 < before.st_size <= 8 * 1024 * 1024:
+                return None
+            digest, size = hashlib.sha256(), 0
+            while True:
+                chunk = source.read(64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > before.st_size:
+                    return None
+                digest.update(chunk)
+            if (size != before.st_size or file_identity(os.fstat(source.fileno())) != file_identity(before)
+                    or file_identity(path.lstat()) != file_identity(before) or cfg.is_candidate):
+                return None
+            return digest.hexdigest()
+    except OSError:
+        # Diagnostic only: an unavailable receipt must not interrupt heartbeat.
+        return None
+
+
 def executing_release_sha256(cfg):
     # CLIENT_VERSION is a literal in the code this interpreter compiled.
     # The immutable version-specific manifest binds that boot to its approved
@@ -53401,7 +53437,7 @@ def run(cfg):
         # Verify-only selected manifests are independent from the cursor feed and
         # never write media bytes.
         threading.Thread(target=selected_verify_loop, args=(cfg, stop_event), daemon=True).start()
-        if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+        if CLIENT_VERSION in FAST_COPY_READ_VERSIONS:
             # Read-only stream-day inventories; the API leases them only to this release.
             threading.Thread(target=day_inventory_loop, args=(cfg, stop_event), daemon=True).start()
     copy_worker = None
@@ -53409,7 +53445,7 @@ def run(cfg):
         copy_worker = threading.Thread(target=r2_copy_loop, args=(cfg, runtime, inventory, inventory_stop_event), daemon=True, name="nas-r2-copy")
         copy_worker.start()
     cleanup_worker = None
-    if not cfg.dry_run:
+    if not cfg.dry_run and CLIENT_VERSION != NAS_INSTALLED_RECEIPT_VERSION:
         cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event, cleanup_verified), daemon=True)
         cleanup_worker.start()
     stitch_worker = None
@@ -54487,7 +54523,7 @@ class R2CopyControl:
                                "Content-Type": "application/json",
                                **({"X-Stoarama-Copy-Control": "inventory"} if operation is R2CopyControlOperation.INVENTORY else {})},
                    "body": base64.b64encode(json.dumps(body).encode()).decode() if body is not None else None}) + "\n").encode()
-        limit = 262144 if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION and operation is R2CopyControlOperation.INVENTORY else 32768
+        limit = 262144 if CLIENT_VERSION in FAST_COPY_READ_VERSIONS and operation is R2CopyControlOperation.INVENTORY else 32768
         if len(message) > limit:
             raise R2CopyHold("copy HTTP input exceeds bound")
         started = time.monotonic()
@@ -55304,7 +55340,7 @@ def r2_fast_copy_worker(cfg, runtime, inventory, stop):
 
 def r2_copy_loop(cfg, runtime, inventory, stop):
     # The caller owns this thread and waits for its lease and transport to drain.
-    if CLIENT_VERSION == FAST_COPY_CLIENT_VERSION:
+    if CLIENT_VERSION in FAST_COPY_READ_VERSIONS:
         r2_fast_copy_worker(cfg, runtime, inventory, stop)
     else:
         r2_copy_worker(cfg, runtime, inventory, stop, 0)
