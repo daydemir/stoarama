@@ -514,6 +514,10 @@ esac
         self.assertEqual(p.returncode, 8, p.stderr)
         self.assertIn('UNRESOLVED DIVERGENCE', p.stderr)
         self.assertEqual(self.state.read_text(), CANDIDATE)
+        self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
+        self.assertTrue((self.home / '.stoarama-gss-cycle.lock').is_dir())
+        p = self.run_cycle('success')
+        self.assertEqual(p.returncode, 8, p.stderr)
 
     def test_competing_swap_refusal_does_not_rollback(self):
         p = self.run_cycle('refused')
@@ -528,6 +532,8 @@ esac
                 self.assertIn('UNRESOLVED DIVERGENCE', p.stderr)
                 self.assertNotIn('gss_gen.py swap', self.calls.read_text())
                 self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
+                self.assertTrue((self.home / '.stoarama-gss-cycle.lock').is_dir())
+                (self.home / '.stoarama-gss-cycle.lock').rmdir()
 
     def test_stage_status_survives_both_shell_layers(self):
         for scenario, expected in (('stage_unresolved', 8), ('stage_disconnected', 8), ('stage_failed', 5)):
@@ -539,6 +545,9 @@ esac
                 self.assertNotIn('gss_gen.py swap', self.calls.read_text())
                 self.assertEqual(self.state.read_text(), PARENT)
                 self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
+                if expected == 8:
+                    self.assertTrue((self.home / '.stoarama-gss-cycle.lock').is_dir())
+                    (self.home / '.stoarama-gss-cycle.lock').rmdir()
 
     def test_success_publishes_ledger(self):
         p = self.run_cycle('success')

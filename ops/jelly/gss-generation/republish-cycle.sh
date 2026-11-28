@@ -119,12 +119,16 @@ finish() {
     ledger_records restore || status=8
     if [ "$status" = 8 ]; then
       echo "Ledger recovery may be needed; backup retained at $ledger_tmp" >&2
-      # Keep the local lock as well: pointer verification alone cannot
-      # establish that the previous ledger was recovered.
-      exit 8
+      ledger_tmp=
     fi
   fi
   [ -z "$ledger_tmp" ] || rm -rf "$ledger_tmp"
+  # Every unresolved cycle must hold subsequent publication, including a
+  # rollback failure before ledger preparation has begun.
+  if [ "$status" = 8 ]; then
+    echo "Publication lock retained at $LOCK until reconciliation" >&2
+    exit 8
+  fi
   rmdir "$LOCK"
   exit "$status"
 }

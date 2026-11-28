@@ -83,7 +83,8 @@ and Mooney lock until reconciliation.
 | 8 | Unresolved divergence or unavailable publication lock: pointer or ledger state requires reconciliation before retry. |
 | Other nonzero | Pre-swap failure, e.g. build, stage or offline check. |
 
-An exit 8 is not a successful rollback. Stop publication attempts until the
+An exit 8 is not a successful rollback. Every unresolved cycle retains the
+Mooney publication lock, even if ledger replacement has not begun. Stop publication attempts until the
 actual pointer identities, any outstanding request, and ledger status are
 accounted for. Do not use an unconditional pointer write to repair a conflict.
 Only if no pending write remains and the state is still within the original
