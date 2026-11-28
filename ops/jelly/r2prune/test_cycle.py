@@ -3,6 +3,7 @@
 # also runs preflight.sql on a stub catalog and checks the chunked vetoes equal the old
 # single JSON-literal statement's, and that RECEIPTS reads live clips through migration
 # 0273's index with an unchanged result. Nothing reaches production.
+import hashlib
 import importlib.util
 import json
 import os
@@ -101,6 +102,229 @@ class Script(Lane):
         self.psql = '/nonexistent/psql'
         self.use_db('postgres://u@db.invalid:5432/x')
         self.assertEqual(cycle.preflight(str(self.dir), [], {}), set())
+
+
+# A stub `stoaramactl nas-selected-verify`: requests and reports come from a JSON state
+# file the test writes, and every call is logged there.
+STOARAMACTL = r"""#!/usr/bin/python3 -I
+import json, os, sys
+state_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'verify-state.json')
+state = json.load(open(state_path))
+state['calls'].append({'argv': sys.argv[1:], 'database_url': os.environ.get('DATABASE_URL')})
+args = sys.argv[2:]
+if state.get('fail'):
+    json.dump(state, open(state_path, 'w'))
+    sys.stderr.write('connect database: ' + os.environ['DATABASE_URL'] + '\n')
+    sys.exit(1)
+if args[0] == 'request':
+    out = {'plan_sha256': state['plan_sha256'], 'items': state.get('plan_items', len(state['reports'][0]['items']))}
+else:
+    reports = state['reports']
+    out = reports[0] if len(reports) == 1 else reports.pop(0)
+json.dump(state, open(state_path, 'w'))
+print(json.dumps(out))
+"""
+PLAN_SHA = 'a' * 64
+# A stub r2prune: lists the snapshot rows it is given, plans every listed key for delete,
+# and on delete logs which manifest keys its --fresh-listing admitted.
+R2PRUNE = r"""#!/usr/bin/python3 -I
+import hashlib, json, os, sys
+L = os.path.dirname(os.path.abspath(sys.argv[0]))
+a = sys.argv[1:]
+opt = lambda name: a[a.index(name) + 1]
+if a[0] == 'list':
+    for k, size in (('joined/nightly-collation-v2/c', 300), ('managed/a', 100), ('managed/b', 200), ('managed/nohash', 400)):
+        print(f'{k}\t{size}\t"e"\t1')
+elif a[0] == 'plan':
+    out = opt('--out')
+    os.makedirs(out)
+    rows = [l.split('\t') for l in open(opt('--snapshot'))]
+    with open(out + '/delete-manifest.jsonl', 'w') as f:
+        for k, size, etag, mtime in rows:
+            f.write(json.dumps({'key': k, 'size': int(size), 'etag': etag, 'mtime': int(mtime), 'class': 'delete_window_20d_on_nas'}) + '\n')
+    digest = hashlib.sha256(open(out + '/delete-manifest.jsonl', 'rb').read()).hexdigest()
+    json.dump({'manifest_sha256': digest, 'delete': {'objects': len(rows), 'bytes': 1},
+               'by_class': {'delete_window_20d_on_nas': {'objects': len(rows)}}}, open(out + '/summary.json', 'w'))
+elif a[0] == 'delete':
+    fresh = {l.split('\t')[0] for l in open(opt('--fresh-listing'))}
+    keys = [json.loads(l)['key'] for l in open(opt('--manifest'))]
+    with open(opt('--ledger'), 'w') as f:
+        f.write(json.dumps({'type': 'run', 'manifest_sha256': opt('--expected-sha256'), 'limit': 0}) + '\n')
+        for k in keys:
+            row = json.loads(open(opt('--manifest')).read().splitlines()[keys.index(k)])
+            outcome = 'deleted' if k in fresh else 'skipped_changed'
+            f.write(json.dumps({'key': k, 'size': row['size'], 'outcome': outcome, 'at': '2026-11-27T09:00:00Z'}) + '\n')
+    with open(L + '/deletes.jsonl', 'a') as f:
+        f.write(json.dumps({'deleted': sorted(fresh & set(keys)), 'skipped': sorted(set(keys) - fresh)}) + '\n')
+"""
+
+
+def verify_item(kind, source_id, size, sha, state='match', completed='2099-01-01 00:00:01.5+00'):
+    return {'item_id': source_id, 'kind': kind, 'source_id': source_id, 'relative_path': f'p/{source_id}',
+            'size_bytes': size, 'sha256': sha, 'state': state, 'attempts': 1,
+            'completed_at': completed if state not in ('pending', 'leased') else None, 'error': ''}
+
+
+class Redundancy(Lane):
+    """The live NAS gate in front of every lane DELETE."""
+
+    def setUp(self):
+        super().setUp()
+        self.L = str(self.dir)
+        Path(self.L, 'stoaramactl').write_text(STOARAMACTL)
+        os.chmod(Path(self.L, 'stoaramactl'), 0o755)
+        env = self.dir / 'db.env'
+        env.write_text("DATABASE_URL='postgres://u:s%40cret@db.invalid:5432/x'\n")
+        for name, value in (('DBENV', str(env)), ('NAS_VERIFY_POLL_SEC', 0), ('NAS_VERIFY_CHUNK', 2)):
+            patch = unittest.mock.patch.object(cycle, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.W = str(self.dir / 'cycle')
+        os.makedirs(self.W)
+        self.sources = {'managed/a': self.source('raw', 11, 100), 'managed/b': self.source('raw', 12, 200),
+                        'joined/nightly-collation-v2/c': self.source('collated', 7, 300)}
+        Path(self.W, 'snapshot.tsv').write_text(''.join(f'{k}\t{s["size"]}\t"e"\t1\n' for k, s in sorted(self.sources.items())))
+
+    @staticmethod
+    def source(kind, sid, size):
+        return {'kind': kind, 'source_id': sid, 'stream_id': 1, 'size': size,
+                'sha256': hashlib.sha256(str(sid).encode()).hexdigest(), 'etag': 'e'}
+
+    def reports(self, *item_lists, created='2099-01-01 00:00:00+00'):
+        return [{'label': 'x', 'plan_sha256': PLAN_SHA, 'created_at': created, 'items': items} for items in item_lists]
+
+    def chunk_items(self, **overrides):
+        # The chunk is the first NAS_VERIFY_CHUNK planned keys: joined/... and managed/a.
+        items = []
+        for key in ('joined/nightly-collation-v2/c', 'managed/a'):
+            s = self.sources[key]
+            item = verify_item(s['kind'], s['source_id'], s['size'], s['sha256'])
+            item.update(overrides.get(key, {}))
+            items.append(item)
+        return items
+
+    def write_state(self, reports, **extra):
+        Path(self.L, 'verify-state.json').write_text(json.dumps({'calls': [], 'plan_sha256': PLAN_SHA, 'reports': reports, **extra}))
+
+    def state(self):
+        return json.loads(Path(self.L, 'verify-state.json').read_text())
+
+    def run_gate(self):
+        return cycle.verified_chunk(self.L, self.W, '20261127T090000Z', self.sources, self.sources)
+
+    def test_fresh_exact_matches_admit_only_the_chunk(self):
+        pending = [dict(i, state='leased', completed_at=None) for i in self.chunk_items()]
+        self.write_state(self.reports(pending, self.chunk_items()))
+        self.assertEqual(self.run_gate(), ['joined/nightly-collation-v2/c', 'managed/a'])
+        listing = Path(self.W, 'delete-listing.tsv').read_text().splitlines()
+        self.assertEqual([l.split('\t')[0] for l in listing], ['joined/nightly-collation-v2/c', 'managed/a'])
+        calls = [c['argv'] for c in self.state()['calls']]
+        base = ['nas-selected-verify', 'request', '--label', 'r2prune-lane-20261127t090000z',
+                '--clip-ids', '11', '--collated-ids', '7']
+        self.assertEqual(calls[0], base + ['--dry-run', '--json'])
+        self.assertEqual(calls[1], base + ['--expected-plan-sha256', PLAN_SHA, '--json'])
+        self.assertEqual(calls[2:], [['nas-selected-verify', 'report', '--label', 'r2prune-lane-20261127t090000z', '--json']] * 2)
+        # Credentials reach stoaramactl only through the environment.
+        self.assertTrue(all(c['database_url'].startswith('postgres://') for c in self.state()['calls']))
+        self.assertFalse(any('cret' in a for c in calls for a in c))
+        self.assertEqual(json.loads(Path(self.W, 'nas-verify.json').read_text())['plan_sha256'], PLAN_SHA)
+
+    def assert_refused(self, reports, pattern, **extra):
+        self.write_state(reports, **extra)
+        with self.assertRaisesRegex(RuntimeError, pattern):
+            self.run_gate()
+        self.assertFalse(Path(self.W, 'delete-listing.tsv').exists())
+
+    def test_any_single_failure_stops_the_chunk_at_once(self):
+        for state in ('missing', 'conflict', 'unverified'):
+            with self.subTest(state=state):
+                items = self.chunk_items(**{'managed/a': {'state': state, 'error': 'local sha256 differs'}})
+                items[0].update(state='pending', completed_at=None)
+                self.assert_refused(self.reports(items, self.chunk_items()), f'1 NAS copies not verified.*{state}')
+                self.assertEqual(len(self.state()['calls']), 3)  # no second report was waited for
+
+    def test_identity_mismatch_refuses(self):
+        other = hashlib.sha256(b'other').hexdigest()
+        for override in ({'size_bytes': 101}, {'sha256': other}, {'source_id': 99},
+                         {'completed_at': '2098-12-31 23:59:59+00'}):
+            with self.subTest(override=override):
+                self.assert_refused(self.reports(self.chunk_items(**{'managed/a': override})),
+                                    'not a fresh exact match|differ from the chunk')
+
+    def test_an_old_plan_is_not_fresh(self):
+        self.assert_refused(self.reports(self.chunk_items(), created='2026-01-01 00:00:00+00'), 'predates this chunk')
+
+    def test_unfinished_verify_times_out_without_deleting(self):
+        pending = [dict(i, state='pending', completed_at=None) for i in self.chunk_items()]
+        with unittest.mock.patch.object(cycle, 'NAS_VERIFY_WAIT_SEC', -1):
+            self.assert_refused(self.reports(pending), 'not finished')
+
+    def test_short_plan_refuses_before_inserting(self):
+        self.assert_refused(self.reports(self.chunk_items()), 'verify plan has 1 items', plan_items=1)
+        self.assertEqual(len(self.state()['calls']), 1)
+
+    def test_stoaramactl_failure_redacts_the_password(self):
+        self.write_state(self.reports(self.chunk_items()), fail=True)
+        with self.assertRaisesRegex(RuntimeError, 'nas-selected-verify request failed') as caught:
+            self.run_gate()
+        self.assertNotIn('cret', str(caught.exception))
+        self.assertIn('[redacted]', str(caught.exception))
+
+    def test_cycle_deletes_only_the_verified_chunk(self):
+        """A whole cycle on stubs: the hashless key never reaches a plan, the gate runs
+        before the intent, and r2prune deletes only the chunk; a failed gate runs no DELETE."""
+        L, I = self.L, Path(self.L, 'inputs')
+        I.mkdir()
+        (I / 'durham-holds.jsonl').write_text('{}\n')
+        home = self.dir / 'home'
+        (home / 'stoarama-gss-freeze').mkdir(parents=True)
+        (home / 'stoarama-gss-freeze' / 'gss-protect.tsv').write_text('x\n' * 1035152)
+        Path(L, 'r2.env').write_text('R2_ACCOUNT_ID=a\nR2_BUCKET=b\nR2_ACCESS_KEY_ID=c\nR2_SECRET_ACCESS_KEY=d\n')
+        Path(L, 'aws').write_text('#!/bin/sh\necho "An error occurred (404)" >&2\nexit 254\n')
+        Path(L, 'r2prune').write_text(R2PRUNE)
+        for stub in ('aws', 'r2prune'):
+            os.chmod(Path(L, stub), 0o755)
+        rows = [(k, s) for k, s in sorted(self.sources.items())] + [('managed/nohash', dict(self.source('raw', 13, 400), sha256=''))]
+        def fake_psql(sql, out, *, script=None):
+            name = os.path.basename(out)
+            text = ''.join(f'{k}\t1\t1\t{s["kind"]}\t{s["source_id"]}\t1\t{s["size"]}\t{s["sha256"]}\te\n'
+                           for k, s in rows) if name == 'receipts.tsv' else ''
+            Path(out).write_text(text)
+        for name, value in (('psql', fake_psql), ('R2ENV', L + '/r2.env'), ('AWS', L + '/aws'),
+                            ('apply_receipts', lambda W, total, fd: Path(W, 'applied').write_text(str(total)))):
+            patch = unittest.mock.patch.object(cycle, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        patch = unittest.mock.patch.dict(os.environ, {'HOME': str(home)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        self.write_state(self.reports(self.chunk_items(**{'managed/a': {'state': 'conflict'}})))
+        W = str(self.dir / 'refused')
+        os.makedirs(W)
+        with unittest.mock.patch('sys.stdout'), self.assertRaisesRegex(RuntimeError, 'not verified'):
+            cycle.run(L, W, '20261127T090000Z', 0)
+        self.assertFalse(Path(W, 'delete-intent.json').exists())
+        self.assertFalse(Path(L, 'deletes.jsonl').exists())
+
+        self.write_state(self.reports(self.chunk_items()))
+        W = str(self.dir / 'admitted')
+        os.makedirs(W)
+        with unittest.mock.patch('sys.stdout'):
+            cycle.run(L, W, '20261127T091500Z', 0)
+        [call] = [json.loads(l) for l in Path(L, 'deletes.jsonl').read_text().splitlines()]
+        self.assertEqual(call['deleted'], ['joined/nightly-collation-v2/c', 'managed/a'])
+        self.assertEqual(call['skipped'], ['managed/b'])
+        self.assertEqual(Path(W, 'applied').read_text(), '2')
+        [log] = [json.loads(l) for l in Path(L, 'runs.jsonl').read_text().splitlines()]
+        self.assertEqual((log['nas_verified'], log['deferred'], log['skipped']['no_hash']), (2, 1, 1))
+        self.assertEqual(log['outcomes'], {'deleted': 2, 'skipped_changed': 1})
+
+    def test_pg_time_is_utc_only(self):
+        self.assertEqual(cycle.pg_time('2026-11-27 09:02:02.359751+00').isoformat(), '2026-11-27T09:02:02.359751+00:00')
+        self.assertEqual(cycle.pg_time('2026-11-27 09:02:02+00').second, 2)
+        with self.assertRaises(ValueError):
+            cycle.pg_time('2026-11-27 04:02:02-05')
 
 
 # Stub catalog: the relations and functions preflight.sql reads, with rows hitting each veto.
