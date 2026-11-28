@@ -11,6 +11,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"net"
 	"net/http"
@@ -78,6 +79,129 @@ func TestKeep28ExecutorFreshCustodyAndNoReplay(t *testing.T) {
 	f.pool.QueryRow(f.ctx, `SELECT (SELECT count(*) FROM r2_inverse_intents),(SELECT count(*) FROM r2_keep28_intents),(SELECT count(*) FROM r2_keep28_events)`).Scan(&b1, &b2, &events)
 	if b1 != 0 || b2 != 1 || events != 1 {
 		t.Fatalf("history mixed: %d %d %d", b1, b2, events)
+	}
+}
+
+func TestKeep28SelectedCustodyConsumesExactMatch(t *testing.T) {
+	f := newKeep28Fixture(t)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := f.pool.Exec(f.ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	digest := strings.Repeat("a", 64)
+	exec(`UPDATE nas_inventory_files SET verified_at=clock_timestamp()-interval '2 days' WHERE clip_id=9000001`)
+	exec(`INSERT INTO nas_r2_copy_items(connection_id,kind,source_id,manifest_sha256,policy_sha256,item,state,blocked_reason,updated_at)
+ VALUES(13,'raw',9000001,$2,$2,jsonb_build_object('bucket','stoarama','object_key',$1::text,
+ 'relative_path','keep28/1.mp4','sha256',repeat('b',64),'size_bytes',100),'blocked','sidecar_conflict',clock_timestamp()-interval '4 minutes')`,
+		f.key, digest)
+	exec(`INSERT INTO nas_selected_verify_plans(id,account_id,connection_id,label,manifest,plan_sha256,created_at)
+ VALUES(21,47,13,'keep28-selected-test',jsonb_build_array(jsonb_build_object('kind','raw','source_id',9000001,
+ 'relative_path','keep28/1.mp4','r2_source',$1::text,'sha256',repeat('b',64),'size_bytes',100)),$2,clock_timestamp()-interval '3 minutes')`,
+		f.key, digest)
+	exec(`INSERT INTO nas_selected_verify_items(id,plan_id,ordinal,kind,source_id,relative_path,size_bytes,sha256,state,attempts,leased_at,completed_at)
+ VALUES(37,21,1,'raw',9000001,'keep28/1.mp4',100,repeat('b',64),'match',1,clock_timestamp()-interval '2 minutes',clock_timestamp()-interval '1 minute')`)
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256,selected_verify_item_id)
+ VALUES('raw',9000001,'stoarama',$1,100,repeat('b',64),$2,37)`, f.key, digest); err == nil {
+		t.Fatal("selected proof allowed a reservation without a matching B2 intent")
+	}
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err = tx.Exec(f.ctx, `SELECT lock_r2_keep28_selected_source(9000001)`); err != nil {
+		t.Fatal(err)
+	}
+	var lockCount int
+	if err = tx.QueryRow(f.ctx, `SELECT count(*) FROM generate_series(1,10000) AS source(id)
+ WHERE try_lock_r2_keep28_selected_source(source.id)`).Scan(&lockCount); err != nil || lockCount != 10000 {
+		t.Fatalf("exercise locks for 10000 sources: %d %v", lockCount, err)
+	}
+	if err = tx.QueryRow(f.ctx, `SELECT count(*) FROM pg_locks
+ WHERE pid=pg_backend_pid() AND locktype='advisory' AND classid=7343226`).Scan(&lockCount); err != nil || lockCount != 64 {
+		t.Fatalf("source lock footprint exceeded its bound: %d %v", lockCount, err)
+	}
+	reader, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Rollback(f.ctx)
+	a := &inverseApplier{store: f.sdk, opts: inverseApplyOptions{SelectedPlan: keep28SelectedPlan{ID: 21, SHA: digest}}}
+	_, err = a.lockSelectedKeep28Custody(f.ctx, reader, inverseRawTarget{ID: 9000001}, f.key)
+	var busy inverseBusy
+	if !errors.As(err, &busy) {
+		t.Fatalf("selected proof contention must retry through ordinary admission: %v", err)
+	}
+	if err = reader.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`UPDATE nas_inventory_files SET state='missing' WHERE connection_id=13 AND clip_id=9000001`,
+		`UPDATE nas_selected_verify_items SET state='conflict' WHERE id=37`,
+	} {
+		_, err = f.pool.Exec(f.ctx, query)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Fatalf("NAS observation did not respect the selected proof lock: %v", err)
+		}
+	}
+	if err = tx.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	observation, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observation.Rollback(f.ctx)
+	if _, err = observation.Exec(f.ctx, `UPDATE nas_inventory_files SET state='missing',
+ server_received_at=now()-interval '1 hour',client_updated_at=now()-interval '1 hour'
+ WHERE connection_id=13 AND clip_id=9000001`); err != nil {
+		t.Fatal(err)
+	}
+	var eligible bool
+	if err = observation.QueryRow(f.ctx, `SELECT EXISTS(SELECT 1 FROM r2_keep28_selected_custody WHERE verify_item_id=37)`).Scan(&eligible); err != nil || eligible {
+		t.Fatalf("late contradictory inventory publication left custody eligible: %t %v", eligible, err)
+	}
+	if _, err = observation.Exec(f.ctx, `UPDATE nas_selected_verify_items SET state='leased',completed_at=NULL,
+ lease_expires_at=now()+interval '1 minute' WHERE id=37`); err != nil {
+		t.Fatal(err)
+	}
+	var stamped bool
+	if err = observation.QueryRow(f.ctx, `UPDATE nas_selected_verify_items SET state='match',lease_expires_at=NULL,
+ completed_at=now()-interval '1 hour' WHERE id=37 RETURNING completed_at>=transaction_timestamp()`).Scan(&stamped); err != nil || !stamped {
+		t.Fatalf("selected verification did not stamp the accepted result: %t %v", stamped, err)
+	}
+	if err = observation.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := json.Marshal(inverseEntry{ObjectInfo: f.store.objects[f.key], Class: inverseHeld, Reason: "live_hold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(f.options.Manifest, append(manifest, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.options.ManifestSHA, err = inverseFileSHA(f.options.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.options.SelectedPlan = keep28SelectedPlan{ID: 21, SHA: strings.Repeat("d", 64)}
+	if result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options); err != nil || result.Deleted != 0 || f.deletes() != 0 {
+		t.Fatalf("different plan digest reached wire: %+v %v", result, err)
+	}
+	f.options.SelectedPlan.SHA = digest
+	result, err := applyInverse(f.ctx, f.pool, f.sdk, f.options)
+	if err != nil || result.Deleted != 1 || f.deletes() != 1 {
+		t.Fatalf("exact selected proof did not reach wire: %+v %v", result, err)
+	}
+	var selectedID int64
+	var reason string
+	err = f.pool.QueryRow(f.ctx, `SELECT r.selected_verify_item_id,c.blocked_reason
+ FROM r2_retirement_reservations r JOIN nas_r2_copy_items c ON c.source_id=r.source_id`).Scan(&selectedID, &reason)
+	if err != nil || selectedID != 37 || reason != "sidecar_conflict" {
+		t.Fatalf("custody linkage %d or preserved COPY block %q differs: %v", selectedID, reason, err)
 	}
 }
 
