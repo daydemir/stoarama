@@ -117,6 +117,19 @@ func TestNASR2CopyV8FastBatchLeaseCapAndExactGET(t *testing.T) {
 	}
 }
 
+func TestNASInstalledReceiptFastCopyLeaseCap(t *testing.T) {
+	f, item := copyTestFixture(t)
+	queueCopySources(t, f, item)
+	useFastCopyFixture(t, f)
+	applyMigrations(t, f, "0275_nas_installed_receipt_copy_cap.sql")
+	f.useClientVersion(nasInstalledReceiptClientVersion)
+	f.s.cfg.NASR2FastCopyBatchSize = 5
+	batch := fastCopyLease(t, f)
+	if len(batch.Tasks) != 5 {
+		t.Fatalf("receipt version did not preserve 64-lease class: %d tasks", len(batch.Tasks))
+	}
+}
+
 func TestNASR2CopyV8FastResultRequiresFreshInventoryAndToken(t *testing.T) {
 	f, item := copyTestFixture(t)
 	useFastCopyFixture(t, f)
