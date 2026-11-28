@@ -430,7 +430,7 @@ def read_uploads(path):
     return out
 
 
-def read_proofs(directory, listing, uploads):
+def read_proofs(directory, listing, uploads, registry, store):
     """Bind every exact local proof AND its video to the listed, server-checked upload."""
     out, seen = [], set()
     for p in sorted(Path(directory).rglob('*.json')):
@@ -449,6 +449,11 @@ def read_proofs(directory, listing, uploads):
         ids = tuple(int(i['output_id']) for i in proof['inputs'])
         if VETOED_PAIRS.intersection(zip(ids, ids[1:])):
             raise LedgerError(f'{o["key"]}: contains an explicitly vetoed original-output boundary')
+        from continuity_join import validate_clock_proof
+        try:
+            validate_clock_proof(proof, registry, store)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise LedgerError(f'{o["key"]}: {exc}') from exc
         out.append(Assembly('sha256:' + sha, o['key'], size, listing[o['key']][1], sha, ids, Source.CLOCK_ASSEMBLY, None))
     if seen != set(uploads):
         raise LedgerError('clock proof set does not match the complete upload log')
@@ -483,7 +488,7 @@ def load(a):
     if a.clock_proofs:
         if not a.clock_uploads:
             raise LedgerError('--clock-proofs needs --clock-uploads (the server-checked upload log)')
-        live = with_proofs(live, read_proofs(a.clock_proofs, listing, read_uploads(a.clock_uploads)), registry)
+        live = with_proofs(live, read_proofs(a.clock_proofs, listing, read_uploads(a.clock_uploads), registry, store), registry)
     return Inputs(read_best14(a.best14), read_extract(a.extract), live, listing, registry, holds, unheld,
                   delivery_naming.catalog_names(store.load('/public/catalog.json'))), store
 

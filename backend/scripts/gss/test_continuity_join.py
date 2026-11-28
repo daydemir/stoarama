@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import best14_ledger as L  # noqa: E402
@@ -27,7 +28,7 @@ def seam(reason='frame_jump', gap=0.0, before=CLOCK, after=CLOCK, ratio=0.9, pre
 class RuleTests(unittest.TestCase):
     def test_clock_agreeing_seam_joins(self):
         self.assertEqual(C.decide(seam()), (True, None, 0.0))
-        self.assertEqual(C.decide(seam(after=(60339.5, 60339.5, None)))[0], True)  # 1 s is the tolerance
+        self.assertEqual(C.decide(seam(after=(60339.5,) * 3))[0], True)  # 1 s is the tolerance
 
     def test_clock_disagreeing_seam_never_joins(self):
         for after in ((60458.5,) * 3, (60218.5,) * 3, (60340.0,) * 3):  # 120 s skip, 120 s back, 1.5 s
@@ -41,19 +42,26 @@ class RuleTests(unittest.TestCase):
                                        ((60338.5, None, None), CLOCK, K.CLOCK_UNREADABLE),
                                        (CLOCK, (60338.5, None, None), K.CLOCK_UNREADABLE),
                                        ((60338.5, 60341.0, 60343.5), CLOCK, K.CLOCK_INCONSISTENT),
-                                       ((60338.5, 60340.5, None), CLOCK, K.CLOCK_INCONSISTENT)):
+                                       ((60338.5, 60340.5, None), CLOCK, K.CLOCK_UNREADABLE)):
                 self.assertEqual(C.decide(seam(reason, before=before, after=after, ratio=0.1))[:2], (False, why))
 
-    def test_one_misread_among_three_is_outvoted(self):
-        self.assertEqual(C.side_offset((60338.5, 60400.5, 60338.5)), (60338.5, None))
-        self.assertEqual(C.decide(seam(before=(60338.5, 60344.5, 60338.5)))[:2], (True, None))
-        self.assertEqual(C.decide(seam(after=(60458.5, 60338.5, 60458.5)))[:2], (False, K.CLOCK_DISAGREES))  # the majority decides
-        self.assertEqual(C.side_offset((60338.5, 60340.0, None)), (None, K.CLOCK_INCONSISTENT))  # two that disagree: no majority
+    def test_one_misread_among_three_is_not_outvoted(self):
+        self.assertEqual(C.side_offset((60338.5, 60400.5, 60338.5)), (None, K.CLOCK_INCONSISTENT))
+        self.assertEqual(C.decide(seam(before=(60338.5, 60344.5, 60338.5)))[:2], (False, K.CLOCK_INCONSISTENT))
+        self.assertEqual(C.decide(seam(after=(60458.5, 60338.5, 60458.5)))[:2], (False, K.CLOCK_INCONSISTENT))  # the contradictory reading stays split
+        self.assertEqual(C.side_offset((60338.5, 60340.0, None)), (None, K.CLOCK_UNREADABLE))  # two that disagree: no majority
 
     def test_frame_diff_only_vetoes(self):
         self.assertEqual(C.decide(seam(ratio=1.5))[:2], (False, K.FRAME_DIFF_VETO))
         self.assertEqual(C.decide(seam(ratio=None))[:2], (False, K.FRAME_DIFF_UNAVAILABLE))
         self.assertEqual(C.decide(seam(before=(), ratio=0.0))[:2], (False, K.CLOCK_UNREADABLE))
+
+    def test_clock_must_tick_and_nearest_read_cannot_be_outvoted(self):
+        frozen_before = (4000.2, 4000.7, 4001.2)
+        frozen_after = (3999.8, 3999.3, 3998.8)
+        self.assertFalse(C.decide(seam(before=frozen_before, after=frozen_after))[0])
+        self.assertFalse(C.decide(seam(before=(60350.5, 60338.5, 60338.5)))[0])
+        self.assertTrue(C.decide(seam(before=(60338.5, None, 60338.5)))[0])
 
     def test_media_and_timing_must_match(self):
         other = C.Media(VIDEO[:7] + ('SHA256:cc',), AUDIO, 0.0, 300.0, 0.04)
@@ -87,7 +95,7 @@ class RuleTests(unittest.TestCase):
             cases = json.load(f)['cases']
         self.assertEqual((len(cases), sum(x['visual'] == 'real' for x in cases)), (122, 61))
         for x in cases:
-            before = tuple(None if c is None else c - (t - x['prev_duration_s']) for t, c in x['prev_reads'])
+            before = tuple(None if c is None else c - (t - x['prev_duration_s']) for t, c in sorted(x['prev_reads'], reverse=True))
             after = tuple(None if c is None else c - t for t, c in x['next_reads'])
             join, why, _ = C.decide(seam('frame_jump', before=before, after=after, ratio=0.5, span=x['prev_duration_s'],
                                          prev=C.Media(VIDEO, AUDIO, 0.0, x['prev_duration_s'], 0.04)))
@@ -165,6 +173,17 @@ class ExactPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'nonconsecutive'):
             C.checked_verdicts(bad_plan, bad_decisions)
 
+    def test_revoked_run_cannot_reuse_receipt(self):
+        plan, decisions, *rest = self.fixture()
+        by_hour = C.checked_verdicts(plan, decisions)
+        receipt = dict(plan_sha256='p', verdicts_sha256='v', batch='b', served_inputs=['1','2','3'])
+        self.assertEqual(C.resume_runs([receipt], 'p','v','b',by_hour), {('1','2','3')})
+        with self.assertRaisesRegex(ValueError, 'different exact plan'):
+            C.resume_runs([receipt], 'p','new','b',by_hour)
+        revoked = {h: [dict(row, join=False) for row in rows] for h, rows in by_hour.items()}
+        with self.assertRaisesRegex(ValueError, 'do not accept'):
+            C.resume_runs([receipt], 'p','v','b',revoked)
+
     def test_old_seam_or_parent_mismatch_refused(self):
         _, _, ledger, seams, source, registry = self.fixture()
         with self.assertRaisesRegex(ValueError, 'exact current'):
@@ -193,8 +212,21 @@ class BuildTests(unittest.TestCase):
                     'etag': '"' + C.file_md5(os.path.join(src, f'{i}.mp4')) + '"'} for i in range(3)]
             fetch = lambda key, path, etag: shutil.copy(os.path.join(src, key), path)
             out = os.path.join(d, 'out')
-            proof = C.build_run(run, [], 'clock-prestitch-20261126', out, os.path.join(d, 'work'),
-                                lambda fid: [int(fid)], fetch)
+            registry = {'generation': 'a' * 32, 'files': {x['file_id']: dict(x, verified=True) for x in run}}
+            store = mock.Mock(); store.load.return_value = {'repairs': []}
+            verdicts = []
+            for i, (prev, nxt) in enumerate(zip(run, run[1:])):
+                row = {'generation': 'a' * 32, 'recording_id': 433, 'local_date': '2026-09-19', 'delivery_hour': 3,
+                       'hour_id': 'h-1', 'seam': i+1, 'served': 3, 'collation_reason': 'frame_jump', 'db_gap_s': 0,
+                       'prev_span_s': 300, 'prev_media': dataclasses.asdict(MEDIA), 'next_media': dataclasses.asdict(MEDIA),
+                       'clock_before': CLOCK, 'clock_after': CLOCK, 'frame_ratio': .5, 'join': True,
+                       'keep_reason': None, 'clock_delta_s': 0.0}
+                for side, x in (('prev', prev), ('next', nxt)):
+                    row.update({f'{side}_{k}': v for k, v in C.source_identity(registry, x['file_id'], x['key'], 433).items()})
+                verdicts.append(row)
+            parts = C.parent_lineage(registry, store)
+            proof = C.build_run(run, verdicts, 'clock-prestitch-20261126', out, os.path.join(d, 'work'), parts, fetch)
+
             obj = os.path.join(out, proof['output']['key'])
             m = C.probe(obj)
             self.assertAlmostEqual(m.duration_s, sum(i['duration_s'] for i in proof['inputs']), delta=C.OUTPUT_TOLERANCE_S)
@@ -208,10 +240,17 @@ class BuildTests(unittest.TestCase):
             listing[proof_key] = (os.path.getsize(proof_path), C.file_md5(proof_path))
             uploads = {proof['output']['key']: (proof['output']['size_bytes'], md5, proof['output']['sha256']),
                        proof_key: (*listing[proof_key], C.sha256_file(proof_path))}
-            [a] = L.read_proofs(out, listing, uploads)
+            [a] = L.read_proofs(out, listing, uploads, registry, store)
             self.assertEqual((a.source, a.input_ids, a.path), (L.Source.CLOCK_ASSEMBLY, (100, 101, 102), None))
-            with self.assertRaisesRegex(SystemExit, 'create-only'):
-                C.build_run(run, [], 'clock-prestitch-20261126', out, os.path.join(d, 'work2'), lambda fid: [int(fid)], fetch)
+            self.assertEqual(C.build_run(run, verdicts, 'clock-prestitch-20261126', out, os.path.join(d, 'work2'), parts, fetch), proof)
+            with self.assertRaises(C.BuildRefused):
+                C.build_run(run, [], 'clock-prestitch-20261126', out, os.path.join(d, 'work3'), parts, fetch)
+            with self.assertRaisesRegex(ValueError, 'incomplete boundary'):
+                C.validate_clock_proof(dict(proof, seams=[]), registry, store)
+            bad = dict(proof, inputs=[dict(proof['inputs'][0], output_id=999)] + proof['inputs'][1:])
+            with self.assertRaisesRegex(ValueError, 'lineage differs'):
+                C.validate_clock_proof(bad, registry, store)
+
 
 
 if __name__ == '__main__':

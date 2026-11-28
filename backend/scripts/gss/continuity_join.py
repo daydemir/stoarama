@@ -7,8 +7,8 @@ time.. but otherwise do relaly want things as stitched as possible". The rule
 (project lead, binding) joins two adjacent served files of the same hour only when
 ALL of these hold:
   - the burned-in clock offset (clock reading minus seam-relative file time) agrees
-    within CLOCK_TOLERANCE_S across the seam, each side the median of the largest
-    agreeing subset (at least MIN_READS) of reads at READ_AT_S from the join;
+    within CLOCK_TOLERANCE_S across the seam, each side must have readable nearest and farthest frames showing an advancing
+    clock with all readable offsets agreeing; nearest offsets also agree;
   - codec, resolution, fps, timebase (and the codec extradata, which stream copy
     needs) match;
   - there is no PTS/duration discontinuity: the DB gap is within one frame, the
@@ -57,7 +57,6 @@ import enum
 import gzip
 import hashlib
 import hmac
-import itertools
 import json
 import math
 import os
@@ -71,6 +70,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from best14_ledger import VETOED_PAIRS  # noqa: E402
+from build_generation import AssetStore  # noqa: E402
 
 CLOCK_TOLERANCE_S = 1.0
 MIN_READS = 2
@@ -155,21 +155,13 @@ class Seam:
 
 
 def side_offset(reads):
-    """(median offset, None) of the largest subset of at least MIN_READS reads that agree within
-    READ_SPREAD_S, so one OCR misread among three is outvoted; else (None, KeepReason). Two equally
-    large agreeing subsets with different medians are inconsistent."""
+    """All readable offsets must agree; do not outvote a contradictory frame."""
     got = [r for r in reads if r is not None]
-    if any(not math.isfinite(r) for r in got):
-        return None, KeepReason.CLOCK_INCONSISTENT
-    if len(got) < MIN_READS:
+    if len(got) < MIN_READS or len(reads) != len(READ_AT_S) or reads[0] is None or reads[-1] is None:
         return None, KeepReason.CLOCK_UNREADABLE
-    for n in range(len(got), MIN_READS - 1, -1):
-        meds = [statistics.median(c) for c in itertools.combinations(got, n) if max(c) - min(c) <= READ_SPREAD_S]
-        if meds:
-            if len(set(meds)) != 1:
-                return None, KeepReason.CLOCK_INCONSISTENT
-            return meds[0], None
-    return None, KeepReason.CLOCK_INCONSISTENT
+    if not all(math.isfinite(r) for r in got) or max(got) - min(got) > READ_SPREAD_S:
+        return None, KeepReason.CLOCK_INCONSISTENT
+    return statistics.median(got), None
 
 
 def metadata_keep(seam):
@@ -184,13 +176,22 @@ def metadata_keep(seam):
 
 
 def clock_check(seam):
-    """(KeepReason or None, clock delta): the clock must prove the seam continuous."""
+    """Prove advancing clocks on both sides plus agreement at the nearest reads."""
     b, why = side_offset(seam.before)
     a, why_a = side_offset(seam.after)
     if why or why_a:
         return why or why_a, None
+    # The evidence offsets were formed from integer displayed seconds, plus or
+    # minus the exact fixed sample position. A stationary display is not a clock.
+    before = [round(c - t, 3) for c, t in zip(seam.before, READ_AT_S) if c is not None][::-1]
+    after = [round(c + t, 3) for c, t in zip(seam.after, READ_AT_S) if c is not None]
+    for reads in (before, after):
+        if reads[-1] - reads[0] < 0.999 or any(y < x for x, y in zip(reads, reads[1:])):
+            return KeepReason.CLOCK_INCONSISTENT, None
     delta = round(a - b, 3)
-    return (KeepReason.CLOCK_DISAGREES if abs(delta) > CLOCK_TOLERANCE_S else None), delta
+    if abs(seam.after[0] - seam.before[0]) > CLOCK_TOLERANCE_S or abs(delta) > CLOCK_TOLERANCE_S:
+        return KeepReason.CLOCK_DISAGREES, delta
+    return None, delta
 
 
 def decide(seam):
@@ -412,6 +413,8 @@ def source_identity(registry, fid, key, recording_id):
     if (f['key'] != key or int(f['recording_id']) != recording_id or not f.get('verified') or
             not re.fullmatch('[0-9a-f]{64}', f['sha256']) or int(f['size_bytes']) <= 0):
         raise ValueError(f'{fid}: exact parent file identity differs')
+    if f.get("etag") is None:
+        raise ValueError(f'{fid}: parent file lacks an ETag')
     http_headers(f['etag'])
     return {'file': fid, 'key': key, 'sha256': f['sha256'], 'size_bytes': int(f['size_bytes']), 'etag': f['etag']}
 
@@ -447,6 +450,59 @@ def plan(ledger, seams, served_files, recording_id, registry):
                 row.update({f'{side}_{field}': value for field, value in identity.items()})
             out.append(row)
     return out
+
+
+def parent_lineage(registry, store):
+    parts = {}
+    for repair in store.load('/public/growth.json')['repairs']:
+        fid = 'sha256:' + repair['sha256']
+        if fid in parts:
+            raise ValueError(f'{fid}: duplicate parent repair')
+        parts[fid] = tuple(int(i) for i in repair['input_ids'])
+    def get(fid):
+        if fid not in registry['files']:
+            raise ValueError(f'{fid}: source absent from exact parent')
+        return (int(fid),) if fid.isdigit() else parts[fid]
+    return get
+
+
+def check_plan_parent(rows, registry):
+    for row in rows:
+        if row['generation'] != registry['generation']:
+            raise ValueError('plan belongs to a different parent')
+        for side in ('prev', 'next'):
+            identity = source_identity(registry, row[f'{side}_file'], row[f'{side}_key'], row['recording_id'])
+            if any(row[f'{side}_{k}'] != v for k, v in identity.items()):
+                raise ValueError('plan source identity differs from exact parent')
+
+
+def validate_clock_proof(proof, registry, store):
+    """Independent publisher gate: the proof must describe every exact parent boundary."""
+    if proof['pass_version'] != PASS_VERSION or proof['parent_generation'] != registry['generation']:
+        raise ValueError('clock proof is not from the current reviewed reader and parent')
+    rid, files, seams = proof['recording_id'], proof['served_inputs'], proof['seams']
+    if rid not in CLOCK_CROPS or len(files) < 2 or len(set(files)) != len(files) or len(seams) != len(files) - 1:
+        raise ValueError('clock proof has an incomplete boundary sequence')
+    parts = parent_lineage(registry, store)
+    expected = []
+    for fid in files:
+        identity = source_identity(registry, fid, registry['files'][fid]['key'], rid)
+        expected += [dict(output_id=i, served_file=fid, served_key=identity['key'], served_sha256=identity['sha256'],
+                          served_size_bytes=identity['size_bytes']) for i in parts(fid)]
+    inputs = proof['inputs']
+    if len(expected) != len(inputs) or any(any(actual.get(k) != v for k, v in exp.items()) for exp, actual in zip(expected, inputs)):
+        raise ValueError('clock proof original-output lineage differs from exact parent')
+    for i, ev in enumerate(seams):
+        if (ev['generation'], ev['recording_id'], ev['local_date'], ev['delivery_hour'], ev['hour_id'],
+                ev['prev_file'], ev['next_file']) != (proof['parent_generation'], rid, proof['local_date'], proof['delivery_hour'],
+                                                     proof['hour_id'], files[i], files[i+1]):
+            raise ValueError('clock proof boundary does not match served sequence')
+        if i and ev['seam'] != seams[i-1]['seam'] + 1:
+            raise ValueError('clock proof boundaries are not consecutive')
+        check_plan_parent([ev], registry)
+        join, why, delta = verdict(ev)
+        if not join or ev.get('join') is not True or ev.get('keep_reason') is not None or ev.get('clock_delta_s') != delta:
+            raise ValueError('clock proof contains a boundary without verified advancing-clock evidence')
 
 
 def seam_id(row):
@@ -573,6 +629,8 @@ class BuildRefused(Exception):
 def build_run(run, verdicts, batch, out_dir, work, catalog_parts, fetch=download):
     """Join one run of served files; returns the proof (also written under out_dir)."""
     os.makedirs(work, exist_ok=True)
+    if len(run) < 2 or len(verdicts) != len(run) - 1 or any(not verdict(v)[0] for v in verdicts):
+        raise BuildRefused(['missing or rejected boundary evidence'])
     expansion = [tuple(int(i) for i in catalog_parts(x['file_id'])) for x in run]
     ids = tuple(i for group in expansion for i in group)
     if (any(not group for group in expansion) or any(i <= 0 for i in ids) or len(set(ids)) != len(ids) or
@@ -619,13 +677,29 @@ def build_run(run, verdicts, batch, out_dir, work, catalog_parts, fetch=download
     obj = os.path.join(out_dir, key)
     prf = os.path.join(out_dir, f'joined/{batch}/proofs/{sha}.json')
     for p in (obj, prf):
-        if os.path.exists(p):
-            raise SystemExit(f'{p} exists: outputs are create-only')
         os.makedirs(os.path.dirname(p), exist_ok=True)
-    os.rename(tmp_out, obj)
-    with open(prf, 'x', encoding='utf-8') as f:
-        json.dump(proof, f, indent=1)
-        f.write('\n')
+    # Retry the exact same create-only pair after an interruption. An existing
+    # byte mismatch never gets overwritten or treated as success.
+    proof_bytes = (json.dumps(proof, indent=1) + '\n').encode()
+    try:
+        os.link(tmp_out, obj)
+    except FileExistsError:
+        if os.path.getsize(obj) != proof['output']['size_bytes'] or sha256_file(obj) != sha:
+            raise SystemExit(f'{obj} exists with differing bytes')
+    fd, scratch = tempfile.mkstemp(dir=os.path.dirname(prf), prefix='.proof-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(proof_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(scratch, prf)
+        except FileExistsError:
+            with open(prf, 'rb') as f:
+                if f.read() != proof_bytes:
+                    raise SystemExit(f'{prf} exists with differing bytes')
+    finally:
+        os.unlink(scratch)
     return proof
 
 
@@ -673,6 +747,21 @@ def read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
+def resume_runs(receipts, plan_sha, verdicts_sha, batch, by_hour):
+    if any(r.get('plan_sha256') != plan_sha or r.get('verdicts_sha256') != verdicts_sha or r.get('batch') != batch for r in receipts):
+        raise ValueError('upload log belongs to a different exact plan, evidence or batch')
+    done = {tuple(r['served_inputs']) for r in receipts}
+    if len(done) != len(receipts):
+        raise ValueError('duplicate upload receipt')
+    accepted = set()
+    for rows in by_hour.values():
+        ids = [rows[0]['prev_file']] + [v['next_file'] for v in rows]
+        accepted.update(tuple(r) for r in runs(ids, [v['join'] for v in rows]) if len(r) > 1)
+    if not done <= accepted:
+        raise ValueError('upload receipt contains a run the current verdicts do not accept')
+    return done
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -693,13 +782,12 @@ def main(argv=None):
     b = sub.add_parser('build')
     b.add_argument('--verdicts', required=True)
     b.add_argument('--plan', required=True, help='complete original exact-parent seam plan')
-    b.add_argument('--parts', required=True, help='JSON {served file id: [part output ids]}; a part maps to itself')
+    b.add_argument('--registry', required=True, help='exact published parent registry')
+    b.add_argument('--assets', required=True, help='parent asset mirror; growth is verified against registry')
     b.add_argument('--batch', required=True, help=f'{BATCH_PREFIX}YYYYMMDD')
     b.add_argument('--out', required=True)
     b.add_argument('--work', required=True)
-    b.add_argument('--upload-log', help='upload each run create-only right after it is built (R2_* env), append the verified '
-                                        'object and proof here (best14_ledger.py --clock-uploads), and delete the local video; '
-                                        'a run already in the log is skipped')
+    b.add_argument('--upload-log', help='create-only upload each checked run; append exact evidence-bound receipt')
     b.add_argument('--shard', default='0/1', help='K/N: build only the runs whose index modulo N is K')
     a = ap.parse_args(argv)
 
@@ -733,20 +821,19 @@ def main(argv=None):
     elif a.cmd == 'build':
         if not a.batch.startswith(BATCH_PREFIX):
             raise SystemExit(f'--batch must start with {BATCH_PREFIX}')
-        with open(a.parts, encoding='utf-8') as f:
-            parts = json.load(f)
-        by_hour = checked_verdicts(read_jsonl(a.plan), read_jsonl(a.verdicts))
+        registry = read_registry(a.registry)
+        parts = parent_lineage(registry, AssetStore(registry, a.assets))
+        planned = read_jsonl(a.plan)
+        check_plan_parent(planned, registry)
+        by_hour = checked_verdicts(planned, read_jsonl(a.verdicts))
         os.makedirs(a.out, exist_ok=True)
         shard, shards = map(int, a.shard.split('/'))
         if not 0 <= shard < shards:
             raise ValueError('invalid build shard')
         plan_sha = sha256_file(a.plan)
+        verdicts_sha = sha256_file(a.verdicts)
         receipts = read_jsonl(a.upload_log) if a.upload_log and os.path.exists(a.upload_log) else []
-        if any(r.get('plan_sha256') != plan_sha for r in receipts):
-            raise ValueError('upload log belongs to a different exact seam plan')
-        done = {tuple(r['served_inputs']) for r in receipts}
-        if len(done) != len(receipts):
-            raise ValueError('duplicate upload receipt')
+        done = resume_runs(receipts, plan_sha, verdicts_sha, a.batch, by_hour)
         proofs, refused, idx = [], 0, 0
         for hour, vs in sorted(by_hour.items()):
             hour_id = hour[-1]
@@ -772,9 +859,7 @@ def main(argv=None):
                     continue
                 work = os.path.join(a.work, hour_id)
                 try:
-                    proof = build_run(run, [{key: v[key] for key in ('seam', 'collation_reason', 'db_gap_s', 'clock_before', 'clock_after',
-                                                                      'clock_delta_s', 'frame_ratio')} for v in seam_vs],
-                                      a.batch, a.out, work, lambda fid: parts[fid])
+                    proof = build_run(run, seam_vs, a.batch, a.out, work, parts)
                 except BuildRefused as e:
                     refused += 1
                     with open(os.path.join(a.out, 'refused.jsonl'), 'a', encoding='utf-8') as f:
@@ -786,11 +871,13 @@ def main(argv=None):
                 if a.upload_log:
                     obj = os.path.join(a.out, o['key'])
                     prf_key = f'joined/{a.batch}/proofs/{o["sha256"]}.json'
-                    up = {'hour_id': hour_id, 'plan_sha256': plan_sha, 'served_inputs': list(ids), 'duration_s': o['duration_s'],
+                    up = {'hour_id': hour_id, 'plan_sha256': plan_sha, 'verdicts_sha256': verdicts_sha, 'batch': a.batch, 'served_inputs': list(ids), 'duration_s': o['duration_s'],
                           'object': upload_create_only(o['key'], obj, 'video/mp4'),
                           'proof': upload_create_only(prf_key, os.path.join(a.out, prf_key), 'application/json')}
                     with open(a.upload_log, 'a', encoding='utf-8') as f:
                         f.write(json.dumps(up) + '\n')
+                        f.flush()
+                        os.fsync(f.fileno())
                     os.remove(obj)
                     shutil.rmtree(work, ignore_errors=True)
                 proofs.append(o['key'])

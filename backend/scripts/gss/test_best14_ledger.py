@@ -302,7 +302,7 @@ class AssemblyTests(unittest.TestCase):
 
     def test_reads_clock_join_proofs(self):
         a = self.w.assembly(self.rec, [2, 3], live=False)
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, mock.patch("continuity_join.validate_clock_proof"):
             proofs = os.path.join(d, 'joined', 'clock-prestitch-20261125', 'proofs')
             os.makedirs(proofs)
             p = Path(proofs) / (a.sha256 + '.json')
@@ -314,21 +314,21 @@ class AssemblyTests(unittest.TestCase):
             listing = {a.key: (a.size_bytes, ETAG), proof_key: (len(proof_bytes), ETAG)}
             uploads = {a.key: (a.size_bytes, ETAG, a.sha256),
                        proof_key: (len(proof_bytes), ETAG, hashlib.sha256(proof_bytes).hexdigest())}
-            self.assertEqual(L.read_proofs(d, listing, uploads), [a])
+            self.assertEqual(L.read_proofs(d, listing, uploads, {}, None), [a])
             for bad in ({}, {a.key: (a.size_bytes, ETAG, 'f' * 64)}, {a.key: (a.size_bytes, '1' * 32, a.sha256)}):
                 with self.assertRaisesRegex(L.LedgerError, 'no unique server-checked upload binds'):
-                    L.read_proofs(d, listing, bad)
+                    L.read_proofs(d, listing, bad, {}, None)
             with self.assertRaises(L.LedgerError):
-                L.read_proofs(d, {a.key: listing[a.key]}, uploads)
+                L.read_proofs(d, {a.key: listing[a.key]}, uploads, {}, None)
             with mock.patch.object(L, 'VETOED_PAIRS', frozenset(zip(a.input_ids, a.input_ids[1:]))):
                 with self.assertRaisesRegex(L.LedgerError, 'vetoed original-output boundary'):
-                    L.read_proofs(d, listing, uploads)
+                    L.read_proofs(d, listing, uploads, {}, None)
             p.write_bytes(proof_bytes + b' ')
             with self.assertRaisesRegex(L.LedgerError, 'exact proof bytes'):
-                L.read_proofs(d, listing, uploads)
+                L.read_proofs(d, listing, uploads, {}, None)
             p.write_bytes(proof_bytes)
             with self.assertRaisesRegex(L.LedgerError, 'complete upload log'):
-                L.read_proofs(d, listing, dict(uploads, extra=(1, ETAG, '0' * 64)))
+                L.read_proofs(d, listing, dict(uploads, extra=(1, ETAG, '0' * 64)), {}, None)
 
     def test_an_unheld_live_assembly_cannot_return_through_a_proof(self):
         a = self.w.assembly(self.rec, [2, 3], live=False)
