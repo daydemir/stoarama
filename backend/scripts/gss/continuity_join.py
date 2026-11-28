@@ -212,7 +212,11 @@ def clock_check(seam):
         if reads[-1] - reads[0] < 0.999 or any(y < x for x, y in zip(reads, reads[1:])):
             return KeepReason.CLOCK_INCONSISTENT, None
     delta = round(a - b, 3)
-    if abs(seam.after[0] - seam.before[0]) > CLOCK_TOLERANCE_S or abs(delta) > CLOCK_TOLERANCE_S:
+    # An integer displayed second describes a half-open one-second interval.
+    # Every readable offset must admit one common seam instant; pairwise
+    # medians can hide a genuine skip even when their residual is under 1 s.
+    offsets = [v for v in seam.before + seam.after if v is not None]
+    if max(offsets) >= min(offsets) + CLOCK_TOLERANCE_S:
         return KeepReason.CLOCK_DISAGREES, delta
     return None, delta
 

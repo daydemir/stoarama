@@ -32,7 +32,7 @@ def seam(reason='frame_jump', gap=0.0, before=CLOCK, after=CLOCK, ratio=0.9, pre
 class RuleTests(unittest.TestCase):
     def test_clock_agreeing_seam_joins(self):
         self.assertEqual(C.decide(seam()), (True, None, 0.0))
-        self.assertEqual(C.decide(seam(after=(60339.5,) * 3))[0], True)  # 1 s is the tolerance
+        self.assertFalse(C.decide(seam(after=(60339.5,) * 3))[0])  # touching half-open intervals cannot prove continuity
 
     def test_clock_disagreeing_seam_never_joins(self):
         for after in ((60458.5,) * 3, (60218.5,) * 3, (60340.0,) * 3):  # 120 s skip, 120 s back, 1.5 s
@@ -66,6 +66,12 @@ class RuleTests(unittest.TestCase):
         self.assertFalse(C.decide(seam(before=frozen_before, after=frozen_after))[0])
         self.assertFalse(C.decide(seam(before=(60350.5, 60338.5, 60338.5)))[0])
         self.assertTrue(C.decide(seam(before=(60338.5, None, 60338.5)))[0])
+
+    def test_integer_second_intervals_must_have_common_seam_instant(self):
+        # Actual seam times 38.25 and 39.75, exact floor-second reads.
+        before = (60338.2,60337.7,60338.2)
+        after = (60338.8,60339.3,60338.8)
+        self.assertEqual(C.decide(seam(before=before,after=after))[:2],(False,K.CLOCK_DISAGREES))
 
     def test_date_skip_and_unreadable_date_cannot_join(self):
         self.assertEqual(C.parse_display_date('2026-09-19 16:45:38'),'2026-09-19')
