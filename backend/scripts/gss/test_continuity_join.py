@@ -87,6 +87,8 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(C.parse_clock_token('2026-09-21 13:00:06'), (46806, True))
         self.assertEqual(C.parse_clock_token('2026-09-19 01:00:06 am'), (3606, True))
         self.assertEqual(C.parse_clock_token('2026-09-19 01:00:06 p.m.'), (46806, True))
+        self.assertEqual(C.parse_clock_token('2026-09-19 04:00:06 PM2.5'), (14406,False))
+        self.assertEqual(C.parse_clock_token('2026-09-19 04:00:06 amsterdam'), (14406,False))
         self.assertEqual(C.parse_clock_token('2026-09-19 01:00:06'), (3606, False))
 
     def test_media_and_timing_must_match(self):
@@ -207,6 +209,7 @@ class ExactPlanTests(unittest.TestCase):
         self.assertFalse(C.verdict(dict(e, clock_after_raw=['2026-09-19 01:45:39 am']*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=['2026-09-19 04:45:39']*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=()))[0])
+        self.assertFalse(C.verdict(dict(e, clock_before_raw=[t.replace('16:','04:')+' PM2.5' for t in BEFORE_RAW]))[0])
         self.assertFalse(C.verdict(dict(e, clock_before=(BEFORE[0],None,BEFORE[-1]),
             clock_before_dates=(DATES[0],None,DATES[-1]),
             clock_before_raw=[BEFORE_RAW[0],'2026-09-19 23:24:15',BEFORE_RAW[-1]]))[0])

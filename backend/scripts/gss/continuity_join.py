@@ -106,8 +106,8 @@ PROFILE_WIDTH = 1920
 CLOCK_CROPS = read_clock_profiles(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clock-profiles.tsv'))
 CLOCK_THRESHOLDS = (190, 150, 220)
 CLOCK_RX = (
-    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?)?', re.IGNORECASE),
-    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?)?', re.IGNORECASE),
+    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?(?![A-Za-z0-9.]))?', re.IGNORECASE),
+    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?(?![A-Za-z0-9.]))?', re.IGNORECASE),
 )
 DATE_ISO_RX = re.compile(r'(?<!\d)(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)')
 DATE_DMY_RX = re.compile(r'(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(20\d{2}|\d{2})(?!\d)')
