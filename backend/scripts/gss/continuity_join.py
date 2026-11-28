@@ -111,6 +111,8 @@ CLOCK_RX = (
 )
 DATE_ISO_RX = re.compile(r'(?<!\d)(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)')
 DATE_DMY_RX = re.compile(r'(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(20\d{2}|\d{2})(?!\d)')
+DATE_MONTH_RX = re.compile(r'(?<!\d)(\d{1,2})[.\s/-]+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[.\s/-]+(20\d{2})(?!\d)', re.IGNORECASE)
+MONTHS = {v:n for n,v in enumerate(('jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'),1)}
 
 
 # Collation split reasons that are themselves a time or stream discontinuity.
@@ -331,9 +333,11 @@ def read_clock(src, t, crop, tmp, etag=None):
 
 def parse_clock_token(txt):
     """(seconds, unambiguous hour mode). Preserve token boundaries and AM/PM."""
+    txt = DATE_MONTH_RX.sub(lambda m: ' ' * len(m.group()), txt)
     txt = txt.replace('O', '0').replace('o', '0')
     # A displayed date token can never contribute the hour digits.
-    txt = DATE_DMY_RX.sub(lambda m: ' ' * len(m.group()), DATE_ISO_RX.sub(lambda m: ' ' * len(m.group()), txt))
+    for rx in (DATE_ISO_RX, DATE_DMY_RX, DATE_MONTH_RX):
+        txt = rx.sub(lambda m: ' ' * len(m.group()), txt)
     got = []
     for rx in CLOCK_RX:
         for h, mi, sec, period in rx.findall(txt):
@@ -355,13 +359,15 @@ def parse_clock(txt):
 
 def parse_display_date(text):
     """Return one unambiguous displayed ISO day; never guess month/day order."""
-    text = text.replace('O','0').replace('o','0')
     dates = set()
     def add(y, m, d):
         try:
             dates.add(datetime.date(y,m,d).isoformat())
         except ValueError:
             pass
+    for d, month, y in DATE_MONTH_RX.findall(text):
+        add(int(y), MONTHS[month[:3].lower()], int(d))
+    text = DATE_MONTH_RX.sub(' ', text).replace('O','0').replace('o','0')
     for match in DATE_ISO_RX.finditer(text):
         add(*(int(x) for x in match.groups()))
     rest = DATE_ISO_RX.sub(' ', text)
