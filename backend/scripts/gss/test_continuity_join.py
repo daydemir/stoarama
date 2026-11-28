@@ -78,6 +78,7 @@ class RuleTests(unittest.TestCase):
 
     def test_time_token_boundaries_and_meridiem_never_inferred(self):
         self.assertEqual(C.parse_clock_token('2026-09-21 3:00:06'), (10806, False))
+        self.assertEqual(C.parse_clock_token('2026-09-19:00:06'), (None, False))
         self.assertEqual(C.parse_clock_token('2026-09-21 13:00:06'), (46806, True))
         self.assertEqual(C.parse_clock_token('2026-09-19 01:00:06 am'), (3606, True))
         self.assertEqual(C.parse_clock_token('2026-09-19 01:00:06 p.m.'), (46806, True))
@@ -201,6 +202,9 @@ class ExactPlanTests(unittest.TestCase):
         self.assertFalse(C.verdict(dict(e, clock_after_raw=['2026-09-19 01:45:39 am']*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=['2026-09-19 04:45:39']*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=()))[0])
+        self.assertFalse(C.verdict(dict(e, clock_before=(BEFORE[0],None,BEFORE[-1]),
+            clock_before_dates=(DATES[0],None,DATES[-1]),
+            clock_before_raw=[BEFORE_RAW[0],'2026-09-19 23:24:15',BEFORE_RAW[-1]]))[0])
 
     def test_revoked_run_cannot_reuse_receipt(self):
         plan, decisions, *rest = self.fixture()

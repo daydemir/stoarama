@@ -109,6 +109,9 @@ CLOCK_RX = (
     re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?)?', re.IGNORECASE),
     re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?)?', re.IGNORECASE),
 )
+DATE_ISO_RX = re.compile(r'(?<!\d)(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)')
+DATE_DMY_RX = re.compile(r'(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(20\d{2}|\d{2})(?!\d)')
+
 
 # Collation split reasons that are themselves a time or stream discontinuity.
 JOINABLE_REASONS = frozenset({'frame_jump', 'packet_replay', 'frame_overlap', 'frame_low_motion'})
@@ -329,6 +332,8 @@ def read_clock(src, t, crop, tmp, etag=None):
 def parse_clock_token(txt):
     """(seconds, unambiguous hour mode). Preserve token boundaries and AM/PM."""
     txt = txt.replace('O', '0').replace('o', '0')
+    # A displayed date token can never contribute the hour digits.
+    txt = DATE_DMY_RX.sub(lambda m: ' ' * len(m.group()), DATE_ISO_RX.sub(lambda m: ' ' * len(m.group()), txt))
     got = []
     for rx in CLOCK_RX:
         for h, mi, sec, period in rx.findall(txt):
@@ -357,11 +362,10 @@ def parse_display_date(text):
             dates.add(datetime.date(y,m,d).isoformat())
         except ValueError:
             pass
-    iso = re.compile(r'(?<!\d)(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)')
-    for match in iso.finditer(text):
+    for match in DATE_ISO_RX.finditer(text):
         add(*(int(x) for x in match.groups()))
-    rest = iso.sub(' ', text)
-    for first, second, year in re.findall(r'(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(20\d{2}|\d{2})(?!\d)',rest):
+    rest = DATE_ISO_RX.sub(' ', text)
+    for first, second, year in DATE_DMY_RX.findall(rest):
         d,m,y = int(first),int(second),int(year)
         if y < 100: y += 2000
         add(y,m,d); add(y,d,m)
@@ -450,7 +454,7 @@ def raw_clock_evidence_matches(ev):
             return False
         for pos, offset, date, text in zip(READ_AT_S, readings, dates, raw):
             if offset is None:
-                if date is not None:
+                if date is not None or text is not None:
                     return False
                 continue
             if not isinstance(text, str):
