@@ -219,11 +219,18 @@ def transition_state():
     return value
 
 
+class UnresolvedWrite(RuntimeError):
+    pass
+
+
 def require_no_pending_write():
-    state = transition_state()
+    try:
+        state = transition_state()
+    except (OSError, ValueError, RuntimeError) as error:
+        raise UnresolvedWrite('UNRESOLVED DIVERGENCE: transition state unavailable') from error
     if state is not None and state['pending'] is not None:
-        raise RuntimeError('UNRESOLVED DIVERGENCE: outstanding %s write for attempt %s' %
-                           (state['pending'], state['attempt']))
+        raise UnresolvedWrite('UNRESOLVED DIVERGENCE: outstanding %s write for attempt %s' %
+                              (state['pending'], state['attempt']))
 
 
 def claim_transition(attempt, parent, candidate):
@@ -290,6 +297,9 @@ def rollback(attempt, candidate, parent):
 
 def swap(attempt, parent, candidate):
     try:
+        # An outstanding request takes precedence over a cancelled or reused
+        # attempt: neither a new request nor a replay is a clean refusal.
+        require_no_pending_write()
         if not record_attempt(attempt, parent, candidate, cancel=False):
             print('REFUSED: publication attempt already cancelled', file=sys.stderr)
             return 3
@@ -297,19 +307,12 @@ def swap(attempt, parent, candidate):
         print('UNRESOLVED DIVERGENCE: attempt reservation failed:', error, file=sys.stderr)
         return 8
     try:
-        require_no_pending_write()
         bodies = {parent: staged(parent), candidate: staged(candidate)}
         if registry(bodies[candidate]).get('parent_generation') != parent:
             raise RuntimeError('candidate was not built from expected parent')
         initial = snapshot({parent: bodies[parent]})
     except FAILURES as error:
         print('REFUSED: swap precondition failed:', error, file=sys.stderr)
-        # An unresolved earlier write is a state that needs reconciliation,
-        # not a clean refusal. Do not tell the caller it is safe to proceed.
-        try:
-            require_no_pending_write()
-        except FAILURES:
-            return 8
         return 3
     try:
         owner = claim_transition(attempt, parent, candidate)
@@ -383,17 +386,29 @@ def main(args):
             raise ValueError('source and target generations must differ')
     else:
         raise SystemExit('usage: gss_gen.py stage DIR | verify ID | swap ATTEMPT PARENT CANDIDATE | rollback ATTEMPT CANDIDATE PARENT')
-    E = r2env()
-    B = E['R2_BUCKET']
-    EP = 'https://%s.r2.cloudflarestorage.com' % E['R2_ACCOUNT_ID']
     # All supported Jelly operations share a lock; it is released by the OS
     # even if the process dies. Never unlink the lock file.
     with open(os.path.join(H, 'generation.lock'), 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        # Read local uncertainty before initializing any external client. A
+        # missing credential cannot disguise an already-recorded unsafe state.
+        if step != 'rollback':
+            try:
+                require_no_pending_write()
+            except UnresolvedWrite as error:
+                print(error, file=sys.stderr)
+                return 8
+        E = r2env()
+        B = E['R2_BUCKET']
+        EP = 'https://%s.r2.cloudflarestorage.com' % E['R2_ACCOUNT_ID']
         if step == 'stage':
             stage(arg)
         elif step == 'verify':
-            verify(arg)
+            try:
+                verify(arg)
+            except UnresolvedWrite as error:
+                print(error, file=sys.stderr)
+                return 8
         elif step == 'swap':
             return swap(attempt, arg, target)
         else:

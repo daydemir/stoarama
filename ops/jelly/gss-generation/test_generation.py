@@ -202,6 +202,9 @@ class PointerTests(unittest.TestCase):
         self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
         with self.assertRaisesRegex(RuntimeError, 'outstanding current write'):
             gss.verify(PARENT)
+        with patch.object(gss, 'r2env', side_effect=AssertionError('unresolved state must block client initialization')):
+            self.assertEqual(gss.main(['verify', PARENT]), 8)
+            self.assertEqual(gss.main(['swap', ATTEMPT, PARENT, CANDIDATE]), 8)
         self.assertEqual(gss.swap('e' * 32, PARENT, CANDIDATE), 8)
         self.store.finish_outstanding_put()
         self.assertEqual(self.store.state(), (CANDIDATE, PARENT))
@@ -238,6 +241,13 @@ class PointerTests(unittest.TestCase):
             REAL_S3('put-object', single_attempt=True)
             self.assertEqual(run.call_args.kwargs['env']['AWS_MAX_ATTEMPTS'], '1')
             self.assertNotIn('AWS_MAX_ATTEMPTS', gss.E)
+
+    def test_invalid_transition_state_is_unresolved(self):
+        (Path(gss.H) / 'generation-transition.json').write_text('{}')
+        with patch.object(gss, 'r2env', return_value={'R2_BUCKET': 'fake', 'R2_ACCOUNT_ID': 'fake'}):
+            self.assertEqual(gss.main(['verify', PARENT]), 8)
+            self.assertEqual(gss.main(['swap', ATTEMPT, PARENT, CANDIDATE]), 8)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
 
     def test_current_body_must_match_staged(self):
         self.store.objects[gss.CURRENT] = body(PARENT, OTHER)
@@ -317,6 +327,7 @@ class CycleTests(unittest.TestCase):
 command=$*
 case "$command" in
   *"gss_gen.py verify "*)
+    [ "$SCENARIO" != pending_at_start ] || exit 8
     if [ "$SCENARIO" = final_verify_failed ] && [ "$(grep -c 'gss_gen.py verify ' "$CALLS")" = 3 ]; then
       exit 1
     fi
@@ -422,6 +433,13 @@ esac
         p = self.run_cycle('refused')
         self.assertEqual(p.returncode, 3, p.stderr)
         self.assertNotIn('gss_gen.py rollback', self.calls.read_text())
+
+    def test_pending_remote_preflight_keeps_unresolved_exit_status(self):
+        p = self.run_cycle('pending_at_start')
+        self.assertEqual(p.returncode, 8, p.stderr)
+        self.assertIn('UNRESOLVED DIVERGENCE', p.stderr)
+        self.assertNotIn('gss_gen.py swap', self.calls.read_text())
+        self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
 
     def test_success_publishes_ledger(self):
         p = self.run_cycle('success')

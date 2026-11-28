@@ -96,7 +96,17 @@ live() {
   response=$(curl -sf "$API") || return 1
   printf '%s\n' "$response" | python3 -I -c "import json,sys; m=json.load(sys.stdin); print(sum(1 for x in (m.get('streams') or m) if x.get('availability')=='available'))"
 }
-remote verify "$PREV" || { echo "REFUSED: manifest parent is not live"; exit 6; }
+if remote verify "$PREV"; then
+  :
+else
+  status=$?
+  if [ "$status" = 8 ]; then
+    echo "UNRESOLVED DIVERGENCE: prior publication requires reconciliation" >&2
+    exit 8
+  fi
+  echo "REFUSED: manifest parent is not verified live" >&2
+  exit 6
+fi
 CUR=$(live)
 [ "$REG" = 0 ] && [ "$AV" -ge "$CUR" ] || { echo "REFUSED $GEN: regressed=$REG available=$AV live=$CUR"; exit 3; }
 for smoke in viewer_smoke.py download_smoke.py; do
