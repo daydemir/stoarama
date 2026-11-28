@@ -306,6 +306,66 @@ class BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'outside the requested'):
                 C.sample_distances(C.probe(p), [got[3], None, None], False)
 
+    def test_interior_sample_selects_in_window_frame_on_both_sides(self):
+        """Real 25 fps, 1/11264 files with two dropped frames around the 0.7 s sample
+        (next side) and around 1.3 s = duration - 0.7 (previous side). The interior
+        read takes the first decoded frame at or after target minus one probed frame,
+        and the unchanged exact validation accepts its tick. A default read (endpoint
+        shape) keeps the exact unbounded seek, and a frame outside the window still
+        refuses."""
+        with tempfile.TemporaryDirectory() as d:
+            actual_run = subprocess.run
+            commands = []
+            def with_ocr(args, **kwargs):
+                if args[0] == 'tesseract':
+                    return subprocess.CompletedProcess(args, 0, stdout='2026-09-19 16:45:35', stderr='')
+                if args[0] == C.FFMPEG and '-ss' in args:
+                    commands.append(list(args))
+                return actual_run(args, **kwargs)
+            def encode(name, drop, rate=25):
+                p = os.path.join(d, name)
+                subprocess.run([C.FFMPEG, '-v', 'error', '-f', 'lavfi', '-i', f'testsrc=size=320x240:rate={rate}:duration=2',
+                                '-vf', f"select='{drop}'", '-fps_mode', 'passthrough', '-c:v', 'libx264', '-g', '250',
+                                '-video_track_timescale', '11264', p], check=True)
+                return p
+            def distance(media, stamp, before, target):
+                stamps = [None, None, None]
+                stamps[C.READ_AT_S.index(target)] = stamp
+                return C.sample_distances(media, stamps, before)[C.READ_AT_S.index(target)]
+            want = ((False, .7, .7, C.Fraction(7660, 11264)),      # 0.680043 before the hole
+                    (True, .7, 1.3, C.Fraction(8110, 11264)))      # 0.719993 from the media end
+            for i, (before, target, read, expected) in enumerate(want):
+                p = encode(f'{i}.mp4', 'not(between(n,18,19))' if not before else 'not(between(n,33,34))')
+                m = C.probe(p)
+                self.assertEqual((m.video[6], m.frame_s), ('1/11264', 0.04))
+                with mock.patch.object(C.subprocess, 'run', side_effect=with_ocr):
+                    inside = C.read_clock(p, read, 'crop=100:50:0:0', d, frame_s=m.frame_s, before=before)
+                self.assertEqual(distance(m, inside[3], before, target), expected)
+                seek = commands[-1][commands[-1].index('-ss') + 1]
+                self.assertEqual(seek, f'{max(0.0, read - C.PREROLL_S):.3f}')  # bounded preroll
+                vf = commands[-1][commands[-1].index('-vf') + 1]
+                self.assertIn('isnan(prev_selected_t)', vf)  # one frame reaches the PNG path
+                self.assertIn(f'gte(t\\,{read - m.frame_s:.9f})', vf)
+            # A frame the hole does not include is outside the window: refusal stands.
+            p = encode('wide.mp4', 'not(between(n,17,20))')
+            wm = C.probe(p)
+            with mock.patch.object(C.subprocess, 'run', side_effect=with_ocr):
+                got = C.read_clock(p, .7, 'crop=100:50:0:0', d, frame_s=wm.frame_s)
+            self.assertEqual(C.stamp_time(got[3]), C.Fraction(4731, 5632))  # 0.84 s, outside the sample window
+            with self.assertRaisesRegex(ValueError, 'outside the requested'):
+                distance(wm, got[3], False, .7)
+            # On a slow stream, PTS zero is the next endpoint, never an interior sample.
+            p = encode('slow.mp4', '1', rate=5)
+            slow = C.probe(p)
+            with mock.patch.object(C.subprocess, 'run', side_effect=with_ocr):
+                got = C.read_clock(p, .2, 'crop=100:50:0:0', d, frame_s=slow.frame_s)
+            self.assertGreater(distance(slow, got[3], False, .2), 0)
+            # A default read keeps the original exact seek and single-frame select.
+            with mock.patch.object(C.subprocess, 'run', side_effect=with_ocr):
+                C.read_clock(p, 1.2, 'crop=100:50:0:0', d)
+            self.assertEqual(commands[-1][commands[-1].index('-ss') + 1], '1.200')
+            self.assertIn('select=eq(n\\,0),', commands[-1][commands[-1].index('-vf') + 1])
+
     def test_join_keeps_audio_and_duration_and_the_ledger_reads_its_proof(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, 'src')
