@@ -305,17 +305,30 @@ class AssemblyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             proofs = os.path.join(d, 'joined', 'clock-prestitch-20261125', 'proofs')
             os.makedirs(proofs)
-            with open(os.path.join(proofs, a.sha256 + '.json'), 'w') as f:
-                json.dump({'hour_id': self.rec.hour_id, 'inputs': [{'output_id': i} for i in a.input_ids],
-                           'output': {'key': a.key, 'sha256': a.sha256, 'size_bytes': a.size_bytes}}, f)
-            listing = {a.key: (a.size_bytes, ETAG)}
-            uploads = {a.key: (a.size_bytes, ETAG, a.sha256)}
-            self.assertEqual(L.read_proofs(d, {}, uploads), [])
+            p = Path(proofs) / (a.sha256 + '.json')
+            record = {'hour_id': self.rec.hour_id, 'inputs': [{'output_id': i} for i in a.input_ids],
+                      'output': {'key': a.key, 'sha256': a.sha256, 'size_bytes': a.size_bytes}}
+            p.write_text(json.dumps(record), encoding='utf-8')
+            proof_key = a.key.replace('/objects/', '/proofs/').replace('.mp4', '.json')
+            proof_bytes = p.read_bytes()
+            listing = {a.key: (a.size_bytes, ETAG), proof_key: (len(proof_bytes), ETAG)}
+            uploads = {a.key: (a.size_bytes, ETAG, a.sha256),
+                       proof_key: (len(proof_bytes), ETAG, hashlib.sha256(proof_bytes).hexdigest())}
             self.assertEqual(L.read_proofs(d, listing, uploads), [a])
-            # A listed object no server-checked upload binds to the proof does not serve: same size, other bytes.
             for bad in ({}, {a.key: (a.size_bytes, ETAG, 'f' * 64)}, {a.key: (a.size_bytes, '1' * 32, a.sha256)}):
-                with self.assertRaisesRegex(L.LedgerError, 'no server-checked upload binds'):
+                with self.assertRaisesRegex(L.LedgerError, 'no unique server-checked upload binds'):
                     L.read_proofs(d, listing, bad)
+            with self.assertRaises(L.LedgerError):
+                L.read_proofs(d, {a.key: listing[a.key]}, uploads)
+            with mock.patch.object(L, 'VETOED_PAIRS', frozenset(zip(a.input_ids, a.input_ids[1:]))):
+                with self.assertRaisesRegex(L.LedgerError, 'vetoed original-output boundary'):
+                    L.read_proofs(d, listing, uploads)
+            p.write_bytes(proof_bytes + b' ')
+            with self.assertRaisesRegex(L.LedgerError, 'exact proof bytes'):
+                L.read_proofs(d, listing, uploads)
+            p.write_bytes(proof_bytes)
+            with self.assertRaisesRegex(L.LedgerError, 'complete upload log'):
+                L.read_proofs(d, listing, dict(uploads, extra=(1, ETAG, '0' * 64)))
 
     def test_an_unheld_live_assembly_cannot_return_through_a_proof(self):
         a = self.w.assembly(self.rec, [2, 3], live=False)
@@ -574,7 +587,7 @@ class VetoTests(unittest.TestCase):
                 p = os.path.join(d, name + '.tsv')
                 Path(p).write_text('\n'.join('\t'.join(r) for r in [L.VETO_COLUMNS] + rows) + '\n', encoding='utf-8')
                 if name == 'ok':
-                    self.assertEqual(L.read_veto(p), {good[0]})
+                    self.assertEqual(L.read_veto(p), ({good[0]}, {(1, 2)}))
                 else:
                     with self.assertRaises(L.LedgerError, msg=name):
                         L.read_veto(p)

@@ -74,6 +74,7 @@ import csv
 import dataclasses
 import datetime
 import enum
+import hashlib
 import json
 import os
 import re
@@ -129,7 +130,7 @@ VETO_COLUMNS = ('file_id', 'recording_id', 'kind', 'local_date', 'delivery_hour'
 
 
 def read_veto(path):
-    """The vetoed assembly file ids (sha256:<64 hex>), each with its evidence and reason."""
+    """The vetoed file ids and the exact original-output boundary pairs."""
     with open(path, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='\t')
         rows = list(reader)
@@ -139,10 +140,15 @@ def read_veto(path):
     bad = [r for r in rows if not re.fullmatch('sha256:[0-9a-f]{64}', r['file_id']) or not r['evidence'] or not r['reason']]
     if bad or len(set(ids)) != len(ids):
         raise LedgerError(f'{path}: every row needs a unique sha256 file_id, evidence and a reason: {bad[:1] or ids}')
-    return frozenset(ids)
+    pairs = []
+    for r in rows:
+        if not re.fullmatch(r'[1-9][0-9]*>[1-9][0-9]*', r['join_output_ids']):
+            raise LedgerError(f'{path}: every veto requires an exact original-output boundary pair')
+        pairs.append(tuple(int(i) for i in r['join_output_ids'].split('>')))
+    return frozenset(ids), frozenset(pairs)
 
 
-VETOED = read_veto(VETO_FILE)
+VETOED, VETOED_PAIRS = read_veto(VETO_FILE)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -408,35 +414,44 @@ def registry_assemblies(registry, store, listing, holds):
 
 
 def read_uploads(path):
-    """{key: (size, etag, sha256)} of the server-checked uploads (continuity_join's upload log: one JSON
-    object per line whose 'object' holds the key, size_bytes, etag and sha256 a HEAD with SHA-256
-    checksum mode returned for the create-only upload)."""
+    """Exact server-checked video AND proof receipts keyed by R2 object name."""
     out = {}
     with open(path, encoding='utf-8') as f:
         for line in f:
-            if line.strip():
-                o = json.loads(line)['object']
-                out[o['key']] = (int(o['size_bytes']), o['etag'].strip('"'), o['sha256'])
+            if not line.strip():
+                continue
+            receipt = json.loads(line)
+            for kind in ('object', 'proof'):
+                o = receipt[kind]
+                key, size, etag, sha = o['key'], int(o['size_bytes']), o['etag'].strip('"'), o['sha256']
+                if key in out or size <= 0 or not re.fullmatch('[0-9a-f]{32}', etag) or not re.fullmatch('[0-9a-f]{64}', sha):
+                    raise LedgerError(f'{key}: invalid or duplicate upload receipt')
+                out[key] = (size, etag, sha)
     return out
 
 
 def read_proofs(directory, listing, uploads):
-    """Every clock-join proof (joined/<batch>/proofs/<sha256>.json) whose video is in the listing.
-    A listed video serves only when a server-checked upload binds it: the listing's size and ETag
-    must be the upload's, and the upload's SHA-256 the proof's."""
-    out = []
+    """Bind every exact local proof AND its video to the listed, server-checked upload."""
+    out, seen = [], set()
     for p in sorted(Path(directory).rglob('*.json')):
-        proof = json.loads(p.read_text(encoding='utf-8'))
+        body = p.read_bytes()
+        proof = json.loads(body)
         o = proof['output']
-        if not o['key'].startswith(CLOCK_PREFIX):
-            raise LedgerError(f'{p}: assembly key {o["key"]} is not under {CLOCK_PREFIX}*')
-        if not in_r2(listing, o['key'], int(o['size_bytes'])):
-            continue
-        size, etag = listing[o['key']]
-        if uploads.get(o['key']) != (size, etag, o['sha256']):
-            raise LedgerError(f'{o["key"]}: no server-checked upload binds the listed object {(size, etag)} to the proof sha256 {o["sha256"]}')
-        out.append(Assembly('sha256:' + o['sha256'], o['key'], size, etag, o['sha256'],
-                            tuple(int(i['output_id']) for i in proof['inputs']), Source.CLOCK_ASSEMBLY, None))
+        sha, size = o['sha256'], int(o['size_bytes'])
+        expected = re.fullmatch(r'(joined/clock-prestitch-[^/]+)/objects/([0-9a-f]{64})\.mp4', o['key'])
+        if not expected or expected[2] != sha:
+            raise LedgerError(f'{p}: invalid clock assembly key/sha256')
+        proof_key = f'{expected[1]}/proofs/{sha}.json'
+        for key, length, digest in ((o['key'], size, sha), (proof_key, len(body), hashlib.sha256(body).hexdigest())):
+            if key in seen or key not in listing or uploads.get(key) != (length, listing[key][1], digest) or listing[key][0] != length:
+                raise LedgerError(f'{key}: no unique server-checked upload binds listed object to exact proof bytes')
+            seen.add(key)
+        ids = tuple(int(i['output_id']) for i in proof['inputs'])
+        if VETOED_PAIRS.intersection(zip(ids, ids[1:])):
+            raise LedgerError(f'{o["key"]}: contains an explicitly vetoed original-output boundary')
+        out.append(Assembly('sha256:' + sha, o['key'], size, listing[o['key']][1], sha, ids, Source.CLOCK_ASSEMBLY, None))
+    if seen != set(uploads):
+        raise LedgerError('clock proof set does not match the complete upload log')
     return out
 
 
