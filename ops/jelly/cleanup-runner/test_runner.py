@@ -2098,6 +2098,9 @@ class DayLoopTests(unittest.TestCase):
             job.run_day()
             self.assertNotIn('day-plans/77/control', job.events)
             self.assertEqual(job.status['phase'], 'day_dry_run_pass')
+            self.assertTrue(job.status['verification_only'])
+            self.assertFalse(job.status['restore_sample_minimum_met'])
+            self.assertEqual(job.status['restore_sampled'], 2)
 
     def test_failed_independent_check_never_enables(self):
         with tempfile.TemporaryDirectory() as root, patch.object(r, 'utcnow', return_value=NOW):
@@ -2219,6 +2222,7 @@ print(json.dumps({'ETag': '"' + etag + '"', 'ContentLength': len(body), 'Version
         self.assertNotIn('collation_outputs', sql)
         [line] = [json.loads(l) for l in (self.root / 'runner.jsonl').read_text().splitlines()]
         self.assertEqual((line['phase'], line['names'], line['sampled']), ('day_restore_sample', 30, 20))
+        self.assertTrue(line['minimum_met'] and line['verification_only'])
         self.assertEqual(line['verify_until'], (NOW + timedelta(seconds=r.RESTORE_TIMEOUT_SEC)).isoformat())
         self.assertEqual([e['key'] for e in line['survivors']], fetched)
         self.assertTrue(all(e['version_id'] == 'fixture-version' for e in line['survivors']))
@@ -2239,6 +2243,9 @@ print(json.dumps({'ETag': '"' + etag + '"', 'ContentLength': len(body), 'Version
         rows = [self.row(0), self.row(1)]
         fetched, _ = self.sample(rows)
         self.assertEqual(fetched, [row[0] for row in rows])
+        [line] = [json.loads(l) for l in (self.root / 'runner.jsonl').read_text().splitlines()]
+        self.assertFalse(line['minimum_met'])
+        self.assertTrue(line['verification_only'])
         for failure in ('short', 'changed', 'version', 'transport'):
             with self.subTest(failure=failure), self.assertRaises(r.Halt):
                 self.sample(rows, FAIL=failure)

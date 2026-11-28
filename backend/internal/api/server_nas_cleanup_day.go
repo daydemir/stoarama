@@ -681,7 +681,7 @@ func (s *Server) handleServiceNASCleanupDayControl(w http.ResponseWriter, r *htt
 		}
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_day_plans SET mode='paused',approval_reason=$2,updated_at=now() WHERE id=$1`, id, req.Reason)
 	} else {
-		err = s.cleanupDayEnable(ctx, tx, id, mode)
+		err = cleanupDayEnable(ctx, tx, id, mode)
 	}
 	if err != nil {
 		util.WriteError(w, 409, err.Error())
@@ -694,60 +694,36 @@ func (s *Server) handleServiceNASCleanupDayControl(w http.ResponseWriter, r *htt
 	util.WriteJSON(w, 200, map[string]any{"id": id, "plan_sha256": req.PlanSHA, "mode": req.Mode})
 }
 
-// cleanupDayEnable checks the defensive prerequisites but cannot issue execution
-// authority until all storage writers/removers share the persistent reservation.
-func (s *Server) cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode string) error {
+// Day execution is disabled. Do not hold database locks across R2 network
+// checks for an enable request that cannot issue authority; verification
+// remains on the dry-run admission path.
+func cleanupDayEnable(ctx context.Context, tx pgx.Tx, id int64, mode string) error {
 	if mode != "dry_run" && mode != "paused" {
 		return errors.New("only a dry-run or paused day cleanup plan can enable")
 	}
-	if err := cleanupMaintenanceCheck(ctx, tx); err != nil {
-		return errors.New("cleanup maintenance gate unavailable or active")
-	}
-	var busy bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans WHERE mode='enabled')
- OR EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled')
- OR EXISTS(SELECT 1 FROM nas_cleanup_day_plans WHERE mode='enabled')`).Scan(&busy); err != nil || busy {
-		return errors.New("another cleanup plan is enabled")
-	}
-	rows, err := tx.Query(ctx, `SELECT id,stream_id,relative_dir,local_date::text,files,bytes,names FROM nas_cleanup_day_units
- WHERE plan_id=$1 AND state='pending' ORDER BY ordinal FOR UPDATE`, id)
+	rows, err := tx.Query(ctx, `SELECT DISTINCT stream_id FROM nas_cleanup_day_units WHERE plan_id=$1 AND state='pending'`, id)
 	if err != nil {
 		return err
 	}
-	type pending struct {
-		id   int64
-		unit nasCleanupDayUnit
-	}
-	var units []pending
+	defer rows.Close()
+	seen := false
 	for rows.Next() {
-		var p pending
-		if err := rows.Scan(&p.id, &p.unit.StreamID, &p.unit.RelativeDir, &p.unit.LocalDate, &p.unit.Files, &p.unit.Bytes, &p.unit.Names); err != nil {
-			rows.Close()
+		var stream int64
+		if err := rows.Scan(&stream); err != nil {
 			return err
 		}
-		units = append(units, p)
+		seen = true
+		if !cleanupEmbeddedPolicyWindow(stream).KeepEverything {
+			return errors.New(nasCleanupDayNonKEBlock)
+		}
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if len(units) == 0 {
+	if !seen {
 		return errors.New("no pending unit still qualifies")
 	}
-	for _, p := range units {
-		if !cleanupEmbeddedPolicyWindow(p.unit.StreamID).KeepEverything {
-			return errors.New(nasCleanupDayNonKEBlock)
-		}
-		entries, err := cleanupDayCheck(ctx, tx, p.unit, s.r2)
-		if err != nil {
-			return err
-		}
-		if files, bytes := cleanupDayMedia(entries); files != p.unit.Files || bytes != p.unit.Bytes {
-			return errors.New("Keep Everything survivor set changed")
-		}
-	}
 	return errors.New(nasCleanupDayIntegrationBlock)
-
 }
 
 func (s *Server) handleServiceNASCleanupDayClose(w http.ResponseWriter, r *http.Request) {

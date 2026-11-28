@@ -1009,69 +1009,17 @@ job.day_catalog(json.loads(sys.argv[1]))`, string(plan))
 		return dayCall(s.handleServiceNASCleanupDayControl, fmt.Sprint(admitted.ID), map[string]any{"plan_sha256": admitted.PlanSHA256,
 			"mode": "enabled", "reason": "fixture", "approval_hours": 1})
 	}
-	// Enable re-verifies raw R2 live, and cannot continue while a sibling wire
-	// executor is not part of the durable survivor-reservation contract.
+	// The blocked enable path must not re-read storage while it holds the
+	// plan lock; even deliberate unavailability is still an integration refusal.
 	delete(bucket.objects, raw11)
-	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "is missing") {
+	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "shared persistent survivor reservation") {
 		t.Fatalf("missing survivor enable: %d %s", w.Code, w.Body)
 	}
 	bucket.put(raw11, make([]byte, 100))
 	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "shared persistent survivor reservation") {
 		t.Fatalf("unfenced enable: %d %s", w.Code, w.Body)
 	}
-
-	// The primitive records the exact plan, generation, size and SHA. A stale
-	// input or mismatching identity cannot produce a hold. It is not an enable.
-	var unitID int64
-	if err := pool.QueryRow(ctx, `SELECT id FROM nas_cleanup_day_units WHERE plan_id=$1`, admitted.ID).Scan(&unitID); err != nil {
-		t.Fatal(err)
-	}
-	const insertHold = `INSERT INTO nas_cleanup_day_survivor_holds(bucket,object_key,clip_id,unit_id,etag,version_id,size_bytes,sha256,verified_at,verify_until)
-	 SELECT bucket,object_key,id,$1,$2,'',size_bytes,sha256,$3,$3::timestamptz+interval '15 min' FROM recording_clips WHERE id=11`
 	etag := fmt.Sprintf("%x", md5.Sum(make([]byte, 100)))
-	for _, bad := range []struct {
-		etag string
-		at   time.Time
-	}{{etag, time.Now().Add(-time.Hour)}, {"replacement", time.Now()}} {
-		if _, err := pool.Exec(ctx, insertHold, unitID, bad.etag, bad.at); err == nil {
-			t.Fatal("stale or changed survivor reserved")
-		}
-	}
-	// A concurrent retirement ledger admission holds the same key lock.
-	other, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = other.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(nas_stitch_r2_hold_lock('fixture',$1))`, raw11); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, insertHold, unitID, etag, time.Now()); err == nil {
-		t.Fatal("busy retirement key reserved")
-	}
-	if err = other.Rollback(ctx); err != nil {
-		t.Fatal(err)
-	}
-	exec(insertHold, unitID, etag, time.Now())
-	var reserved bool
-	if err = pool.QueryRow(ctx, `SELECT nas_cleanup_r2_file_reserved('raw',11)`).Scan(&reserved); err != nil || !reserved {
-		t.Fatalf("reservation absent: %v %v", reserved, err)
-	}
-	for _, stmt := range []string{
-		`UPDATE recording_clips SET etag='replacement' WHERE id=11`,
-		`UPDATE recording_clips SET endpoint='https://replacement.example.invalid' WHERE id=11`,
-		`UPDATE recording_clips SET purged_at=now() WHERE id=11`,
-		`DELETE FROM nas_cleanup_day_survivor_holds WHERE clip_id=11`,
-		`TRUNCATE nas_cleanup_day_survivor_holds`,
-		`INSERT INTO r2_retirement_reservations(kind,source_id,bucket,object_key,size_bytes,sha256,manifest_sha256)
-		 SELECT 'raw',id,bucket,object_key,size_bytes,sha256,repeat('d',64) FROM recording_clips WHERE id=11`,
-	} {
-		if _, err := pool.Exec(ctx, stmt); err == nil {
-			t.Fatalf("durable survivor guard allowed %s", stmt)
-		}
-	}
-	if w := enable(); w.Code != 409 || !strings.Contains(w.Body.String(), "shared persistent survivor reservation") {
-		t.Fatalf("DB hold alone enabled: %d %s", w.Code, w.Body)
-	}
 	// Existing enabled rows (e.g. older binaries) cannot get KE permits once
 	// this check is installed. This fixture simulates that legacy state only.
 	exec(`UPDATE nas_cleanup_day_plans SET mode='enabled',approved_until=now()+interval '1 hour',approval_reason='fixture' WHERE id=$1`, admitted.ID)

@@ -339,7 +339,7 @@ class DayPlanTests(unittest.TestCase):
             ke_clip(out, 1, raw_key='managed/a/1.mp4'),                         # raw listed, same size and sha: named
             ke_clip(out, 2, hhmmss='113000'),                                   # no raw (a stitched output is not a copy): stays
             ke_clip(out, 3, hhmmss='123000', raw_key='managed/a/3.mp4'),        # raw listed with another size: stays
-            ke_clip(out, 4, hhmmss='133000', raw_key='managed/a/4.mp4'),        # raw not listed: stays
+            ke_clip(out, 4, hhmmss='133000', raw_key='managed/a/4.mp4', nas_sha=None),  # raw not listed and hashless: stays
             ke_clip(out, 5, hhmmss='143000', raw_key='managed/a/5.mp4', nas_sha=None),   # no NAS hash: stays, counted hashless
             ke_clip(out, 6, hhmmss='153000', raw_key='managed/a/6.mp4', catalogued=11),  # NAS size differs from the clip
             ke_clip(out, 7, hhmmss='163000', size=-1, raw_key='managed/a/7.mp4'),        # not on the NAS
@@ -352,7 +352,9 @@ class DayPlanTests(unittest.TestCase):
         [unit] = units
         self.assertEqual([n['name'] for n in unit['names']], [plaza(out, h, SEOUL).rsplit('/', 1)[1] for h in ('103000',)])
         self.assertEqual((unit['files'], unit['bytes'], unit['names'][0]['size_bytes']), (1, 10, 10))
-        self.assertEqual(excluded, {'files': 4, 'bytes': 40, 'hash_mismatch_files': 1, 'hash_mismatch_bytes': 10, 'hashless_files': 2, 'hashless_bytes': 20})
+        self.assertEqual(excluded, {'files': 4, 'bytes': 40, 'hash_mismatch_files': 1, 'hash_mismatch_bytes': 10,
+                                    'hashless_files': 2, 'hashless_bytes': 20, 'observed_hashless_files': 3,
+                                    'observed_hashless_bytes': 30})
         self.assertEqual(len(asked), 1)
         self.assertEqual(asked[0], {'managed/a/%d.mp4' % n for n in (1, 3, 4, 5, 6, 8, 9)})
         # A deleted KE unit's name stays out until the NAS reports the file again after the deletion

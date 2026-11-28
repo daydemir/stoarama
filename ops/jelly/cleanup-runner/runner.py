@@ -1607,6 +1607,7 @@ class Runner:
         with (self.root / 'runner.jsonl').open('a') as output:
             output.write(json.dumps(dict(at=utcnow().isoformat(), phase='day_restore_sample', day_plan=p['id'],
                                          plan_sha256=p['plan_sha256'], names=names, sampled=len(sample),
+                                         minimum_met=len(sample) >= RESTORE_SAMPLE, verification_only=True,
                                          verify_until=verified_until.isoformat(), survivors=evidence)) + '\n')
             output.flush(); os.fsync(output.fileno())
 
@@ -1793,7 +1794,9 @@ class Runner:
             if size is None:
                 continue
             if self.dry_run:
-                self.save('day_dry_run_pass', proposed_bytes=size)
+                names = sum(len(u.get('names') or ()) for u in p['units'])
+                self.save('day_dry_run_pass', proposed_bytes=size, verification_only=True,
+                          restore_sampled=min(RESTORE_SAMPLE, names), restore_sample_minimum_met=names >= RESTORE_SAMPLE)
                 return
             raise Halt(DAY_INTEGRATION_BLOCK)
         self.save('stopped')

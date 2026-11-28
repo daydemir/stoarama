@@ -76,8 +76,9 @@ is named only when all of these hold:
 - the catalogue and the present NAS inventory record the same valid sha256.
 A stitched output is not the same content and never counts. Every other file
 stays on the NAS and is counted as excluded (`excluded_no_r2_*`, or
-`excluded_hash_mismatch_*`). Files without both valid hashes stay on the NAS and are counted separately as
-`excluded_hashless_files` and `excluded_hashless_bytes`.
+`excluded_hash_mismatch_*`). `excluded_hashless_*` counts missing hashes among
+otherwise matching listed copies; `observed_hashless_*` counts all eligible
+present files without both valid hashes, including ones with no listed copy.
 
 Environment: DATABASE_URL (read-only use) and, for --submit, SERVICE_TOKEN.
 """
@@ -463,7 +464,8 @@ def day_units(w, folders, facts, listed=None):
     media excluded for lacking a listed raw R2 copy (files, bytes) or for a sha256 that differs from it
     (hash_mismatch_*), and excluded files without both valid hashes (hashless_*): (units, excluded)."""
     sid, ke = w['stream_id'], w['keep_everything']
-    excluded = {'files': 0, 'bytes': 0, 'hash_mismatch_files': 0, 'hash_mismatch_bytes': 0, 'hashless_files': 0, 'hashless_bytes': 0}
+    excluded = {'files': 0, 'bytes': 0, 'hash_mismatch_files': 0, 'hash_mismatch_bytes': 0,
+                'hashless_files': 0, 'hashless_bytes': 0, 'observed_hashless_files': 0, 'observed_hashless_bytes': 0}
     if not facts['keep20_active']:
         return [], excluded
     zone = zoneinfo.ZoneInfo(w['tz'])
@@ -502,6 +504,9 @@ def day_units(w, folders, facts, listed=None):
         present = [c for c in clips if c[3] >= 0]
         names = present
         if ke:
+            hashless = [c for c in present if not all(re.fullmatch('[0-9a-f]{64}', h or '') for h in c[8:10])]
+            excluded['observed_hashless_files'] += len(hashless)
+            excluded['observed_hashless_bytes'] += sum(c[3] for c in hashless)
             copied = [c for c in present if c[3] == c[6] and c[7] and sizes.get(c[7]) == c[6]]
             hashed = [c for c in copied if all(re.fullmatch('[0-9a-f]{64}', h or '') for h in c[8:10])]
             names = sorted((c for c in hashed if c[8] == c[9]), key=lambda c: c[5])
@@ -526,7 +531,8 @@ def redundancy_counts(excluded):
     get = lambda k: excluded.get(k, 0)
     return {'excluded_no_r2_files': get('files'), 'excluded_no_r2_bytes': get('bytes'),
             'excluded_hash_mismatch_files': get('hash_mismatch_files'), 'excluded_hash_mismatch_bytes': get('hash_mismatch_bytes'),
-            'excluded_hashless_files': get('hashless_files'), 'excluded_hashless_bytes': get('hashless_bytes')}
+            'excluded_hashless_files': get('hashless_files'), 'excluded_hashless_bytes': get('hashless_bytes'),
+            'observed_hashless_files': get('observed_hashless_files'), 'observed_hashless_bytes': get('observed_hashless_bytes')}
 
 
 def day_plans(units, prefix, max_units):
