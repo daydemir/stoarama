@@ -2,16 +2,11 @@
 #        /usr/bin/python3 -I manual_apply.py receipts WORKDIR
 #        /usr/bin/python3 -I manual_apply.py backfill WORKDIR --manifest M --ledger L
 #        /usr/bin/python3 -I manual_apply.py status ROOT [ROOT ...]
-# The only way to run a manual `r2prune delete`: every acknowledged delete gets its
-# r2_object_retirements receipt (and raw purged_at) through receipt-apply.sql, the
-# R2 prune lane's receipt path, in the same invocation. Fails closed: a key without
-# a catalog identity, or one the receipt path would refuse, stops the run before any
-# DELETE, and a receipt write that fails exits non-zero with the intent still open.
+# New R2 deletes are disabled. Existing acknowledged deletes can still be
+# reconciled through the historical receipt and backfill commands.
 import argparse
-import concurrent.futures
 import csv
 import datetime
-import email.utils
 import enum
 import fcntl
 import gzip
@@ -40,14 +35,12 @@ DEFAULTS = {
     'gss_protect': str(Path.home() / 'stoarama-gss-freeze/gss-protect.tsv'),
     'cycle': str(LANE / 'cycle.py'),
 }
-BUCKET = 'stoarama'
 COLLATED = ('joined/goodplus-', 'joined/nightly-collation-v2/', 'joined/best14-20261021/')
 LEGACY_KE_CLASS = 'delete_ke_raw_stitched'  # historical receipt/manifest value, never admitted for delete
 BEST14_CLASS = 'delete_best14_raw_stitched'  # class (b): best-14 raw inside a stitched output the GSS page serves
 OUTCOMES = {'deleted', 'failed', 'skipped_protected', 'skipped_changed'}
 FINAL = OUTCOMES - {'failed'}  # a failed DELETE may still have removed the object
 ABSENT = 'absent_from_fresh_listing'
-CHUNK = 5000
 # Rows per catalog statement (source lookup, receipt dry run). One literal of every
 # row of a 293k-key backfill dropped the production connection; each statement's
 # checks are per row, so splitting changes no result.
@@ -304,18 +297,6 @@ class State:
         self.unresolved = manifest.keys() - self.final
 
 
-def compact_ledger(path, listing, intent, manifest):
-    """Drops a chunk ledger's deferred rows (keys outside its listing, which r2prune logs
-    as absent): one manifest-sized ledger per chunk would not fit on disk. Header and every
-    row inside the listing stay byte for byte."""
-    header, scope, rows = read_ledger(path, listing, intent, manifest)
-    if header is None:
-        return
-    with open(path, 'rb') as f:
-        first = f.readline()
-    durable_write(path, (first + b''.join(line for row, line in rows if row['key'] in scope)).decode('utf-8'))
-
-
 def receipt_rows(deleted, manifest, sources, manifest_sha, policy_sha):
     """cycle.py's receipt_tsv rows: reason r2prune_ledger_<class>, choice none."""
     out = []
@@ -369,19 +350,6 @@ def dry_run(cfg, W, tsv, refuse=True):
         key, size = by_seq[seq]
         keys[key] = (action, reasons, size)
     return actions, keys
-
-
-def refuse_ke_manifest(manifest):
-    """Keep Everything is absolute; historical manifests are evidence, not deletion authority."""
-    if any(row['class'] == LEGACY_KE_CLASS for row in manifest.values()):
-        raise SystemExit('Keep Everything is protected: historical delete_ke_raw_stitched manifests cannot be deleted')
-
-
-def preflight(cfg, W, keys, manifest, sources, manifest_sha):
-    """The receipt path's checks on every key this r2prune call may delete, as if deleted now."""
-    refuse_ke_manifest(manifest)
-    at = now_utc().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-    dry_run(cfg, W, receipt_rows({k: at for k in keys}, manifest, sources, manifest_sha, '0' * 64))
 
 
 def apply_receipts(cfg, W, total):
@@ -438,23 +406,6 @@ def finish_receipts(cfg, W, only=None, skip=frozenset(), deferred=frozenset()):
     return st
 
 
-def options(args, name):
-    """Every value Go's flag package would read for -name or --name."""
-    values = []
-    for i, a in enumerate(args):
-        flag, eq, value = a.partition('=')
-        if flag in ('-' + name, '--' + name):
-            values.append(value if eq else args[i + 1] if i + 1 < len(args) else '')
-    return values
-
-
-def one_option(args, name):
-    values = options(args, name)
-    if len(values) != 1 or not values[0]:
-        raise SystemExit(f'pass --{name} exactly once')
-    return values[0]
-
-
 def open_intents(roots):
     """(workdir, manifest path) of every intent under roots without a complete receipt result.
     Lane cycles keep their manifest at plan/delete-manifest.jsonl."""
@@ -465,7 +416,7 @@ def open_intents(roots):
                 yield path.parent, Path(intent.get('manifest') or path.parent / 'plan/delete-manifest.jsonl')
 
 
-# ---- covered best-14 raws: live re-verify of each chunk before its r2prune call ----
+# ---- read-only served-generation registry access ----
 
 def r2_store(path):
     e = env_file(path)
@@ -474,8 +425,9 @@ def r2_store(path):
             'bucket': e['R2_BUCKET']}
 
 
-def r2_request(store, method, key):
-    """(headers, body) of one signed R2 request, or None when the key is absent. SigV4, region auto, path style."""
+def r2_get(store, key):
+    """(headers, body) of one signed read-only R2 GET, or None when absent."""
+    method = 'GET'
     path = urllib.parse.quote(f'/{store["bucket"]}/{key}', safe='/')
     for attempt in range(8):
         at = now_utc()
@@ -493,7 +445,7 @@ def r2_request(store, method, key):
         headers['authorization'] = f'AWS4-HMAC-SHA256 Credential={store["access"]}/{scope}, SignedHeaders={signed}, Signature={sig}'
         try:
             with urllib.request.urlopen(urllib.request.Request(store['endpoint'] + path, method=method, headers=headers), timeout=60) as r:
-                return r.headers, r.read() if method == 'GET' else b''
+                return r.headers, r.read()
         except urllib.error.HTTPError as err:
             if err.code == 404:
                 return None
@@ -505,16 +457,7 @@ def r2_request(store, method, key):
         time.sleep(2 ** attempt)
 
 
-def r2_head(store, key):
-    """(size, etag, mtime) of a live R2 object, or None when absent."""
-    got = r2_request(store, 'HEAD', key)
-    if got is None:
-        return None
-    h = got[0]
-    return int(h['Content-Length']), h['ETag'].strip('"'), int(email.utils.parsedate_to_datetime(h['Last-Modified']).timestamp())
-
-
-# ---- served-generation gate: before the plan is used and before every delete chunk ----
+# ---- read-only served-generation gate on a plan ----
 
 GSS_PREFIX = 'datasets/global-street-scores-delivery/47/'
 PIN_SQL = """BEGIN READ ONLY;
@@ -530,7 +473,7 @@ def served_keys(cfg, store):
     if [len(r) for r in rows] != [1] or not re.fullmatch('[0-9a-f]{32}', rows[0][0]):
         raise SystemExit(f'gate: gss_public_generation_pin reads {rows}, want one generation')
     gen = rows[0][0]
-    got = r2_request(store, 'GET', f'{GSS_PREFIX}public/generations/{gen}.json')
+    got = r2_get(store, f'{GSS_PREFIX}public/generations/{gen}.json')
     if got is None:
         raise SystemExit(f'gate: the registry of pinned generation {gen} is not in R2')
     body = got[1]
@@ -567,209 +510,14 @@ def gate(cfg, store, delete_keys, protect_path, classified_path):
     return gen, len(served)
 
 
-def load_coverage(path, manifest):
-    """{raw key: [(output key, output size)]}: the coverage rows r2prune would match for each
-    manifest raw (raw_size equal to the planned size)."""
-    cover = {}
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            raw, raw_size, out, out_size = line.rstrip('\n').split('\t')
-            if raw in manifest and int(raw_size) == manifest[raw]['size']:
-                cover.setdefault(raw, []).append((out, int(out_size)))
-    missing = [k for k in manifest if k not in cover]
-    if missing:
-        raise SystemExit(f'{len(missing)} manifest keys have no coverage row at their size, e.g. {missing[0]}')
-    return cover
-
-
-# A covering output is registered (one catalog row at its HEAD size), in a collated hour, keep-held
-# (an exact, unexempted delivery keep hold or an owner keep), named by no receipt, reservation or
-# nonraw intent, and not a NAS restore left unverified; each raw's clip is in its source_clip_ids
-# and its catalog time span lies inside the output's.
-VERIFY_SQL = """BEGIN READ ONLY;
-SET LOCAL statement_timeout='300s';
-COPY (
- WITH r AS (SELECT * FROM jsonb_to_recordset(:'raws'::jsonb) AS x(key text, clip bigint)),
-      p AS (SELECT * FROM jsonb_to_recordset(:'pairs'::jsonb) AS x(raw text, clip bigint, output text)),
-      o AS (SELECT DISTINCT output AS key FROM p)
- SELECT 'raw', r.key, c.size_bytes::text, (c.purged_at IS NULL)::text, r2_owner_keep_held('stoarama',r.key)::text,
-  NULL, NULL, NULL, NULL, NULL, NULL
- FROM r JOIN recording_clips c ON c.id=r.clip AND c.bucket='stoarama' AND c.object_key=r.key
- UNION ALL
- SELECT 'output', o.key, count(x.id)::text, min(x.size_bytes)::text,
-  EXISTS(SELECT FROM r2_object_retirements z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
-  EXISTS(SELECT FROM r2_retirement_reservations z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
-  EXISTS(SELECT FROM r2_nonraw_intents z WHERE z.bucket='stoarama' AND z.object_key=o.key)::text,
-  coalesce(bool_and(h.status='collated'), false)::text,
-  coalesce((SELECT d.size_bytes::text||':'||btrim(d.etag,'"') FROM delivery_keep_holds d
-            WHERE d.bucket='stoarama' AND d.object_key=o.key AND NOT r2_delivery_exempt('stoarama',o.key)), ''),
-  r2_owner_keep_held('stoarama',o.key)::text,
-  (SELECT CASE WHEN count(*)=0 THEN 'none' WHEN bool_or(q.state='verified') THEN 'verified' ELSE 'unverified' END
-   FROM recording_collation_outputs y JOIN nas_restore_requests q ON q.output_id=y.id AND q.target='output' WHERE y.object_key=o.key)
- FROM o LEFT JOIN recording_collation_outputs x ON x.object_key=o.key LEFT JOIN recording_collation_hours h ON h.id=x.collation_hour_id
- GROUP BY o.key
- UNION ALL
- SELECT 'pair', p.raw, p.output, EXISTS(SELECT FROM recording_collation_outputs x JOIN recording_clips c ON c.id=p.clip
-   WHERE x.object_key=p.output AND p.clip=ANY(x.source_clip_ids)
-    AND c.clip_start_at>=x.start_at AND c.clip_start_at<c.clip_end_at AND c.clip_end_at<=x.end_at)::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL
- FROM p
-) TO STDOUT WITH (FORMAT csv, DELIMITER E'\\t');
-ROLLBACK;
-"""
-
-
-def verify_chunk(cfg, store, batch, manifest, sources, cover, attempted, held):
-    """The listing rows for one chunk, each proven live right now; stops on the first mismatch.
-    A raw an earlier chunk already sent to DELETE (failed or unlogged) may be absent: it is
-    listed at its planned identity so r2prune's idempotent DELETE acknowledges it."""
-    outputs = sorted({o for k in batch for o, _ in cover[k]})
-    for o in outputs:
-        if o in held:
-            raise SystemExit(f'verify: covering output {o} is in another open intent\'s manifest')
-    with concurrent.futures.ThreadPoolExecutor(16) as ex:
-        heads = dict(zip(batch + outputs, ex.map(lambda k: r2_head(store, k), batch + outputs)))
-    rows = []
-    for k in batch:
-        m = manifest[k]
-        planned = (m['size'], m['etag'].strip('"'), m['mtime'])
-        if heads[k] != planned and not (heads[k] is None and k in attempted):
-            raise SystemExit(f'verify: R2 HEAD of {k} is {heads[k]}, planned {planned}')
-        rows.append((k,) + planned)
-    for o in outputs:
-        sizes = {size for k in batch for out, size in cover[k] if out == o}
-        if heads[o] is None or {heads[o][0]} != sizes:
-            raise SystemExit(f'verify: R2 HEAD of covering output {o} is {heads[o]}, coverage sizes {sorted(sizes)}')
-        rows.append((o,) + heads[o])
-    db = {}
-    for row in read_only_copy(cfg, VERIFY_SQL, raws=[{'key': k, 'clip': sources[k]['source_id']} for k in batch],
-                              pairs=[{'raw': k, 'clip': sources[k]['source_id'], 'output': o} for k in batch for o, _ in cover[k]]):
-        db[(row[0], row[1]) if row[0] != 'pair' else ('pair', row[1], row[2])] = row
-    for k in batch:
-        got = db.get(('raw', k))
-        if got is None or got[2:5] != [str(manifest[k]['size']), 'true', 'false']:
-            raise SystemExit(f'verify: recording_clips row for {k} [size, purged_at NULL, owner keep] is {got and got[2:5]}, '
-                             f'want size {manifest[k]["size"]}, purged_at NULL and no owner keep')
-    # A covering output's owner keep (such as collation_v2_recovery_held) is the protection a sole copy
-    # must have, so it is required: a delivery keep hold alone blocks no retirement since 0244. A raw's
-    # owner keep refuses above.
-    for o in outputs:
-        got = db[('output', o)]
-        size = heads[o][0]
-        if got[2:8] != ['1', str(size), 'false', 'false', 'false', 'true'] or got[9] != 'true' or got[10] == 'unverified':
-            raise SystemExit(f'verify: covering output {o} catalog [rows, size, receipt, reservation, nonraw intent, collated, '
-                             f'delivery hold, owner keep, NAS restore] is {got[2:11]}, want one collated row at size {size}, '
-                             f'none of the others, an owner keep, and no unverified restore')
-    for k in batch:
-        for o, _ in cover[k]:
-            if db[('pair', k, o)][3] != 'true':
-                raise SystemExit(f'verify: {k} is no longer in source_clip_ids of {o} with its time span inside it')
-    return ''.join('\t'.join(map(str, r)) + '\n' for r in sorted(rows))
-
-
 # ---- commands ----
 
-def run_r2prune(cfg, W, args, lock_fd, listing):
-    """One r2prune call with a new ledger (and, in verify mode, the chunk's own listing);
-    returns (its exit code, the ledger path, the listing path or None)."""
-    stamp = now_utc().strftime('%Y%m%dT%H%M%S%fZ')
-    ledger, listing_path = Path(W, f'ledger-{stamp}.jsonl'), None
-    if listing is not None:
-        listing_path = Path(W, f'listing-{stamp}.tsv')
-        durable_write(listing_path, listing)
-        args = args + ['--fresh-listing', str(listing_path)]
-    Path(W, 'receipt-result.json').unlink(missing_ok=True)
-    run = subprocess.run([cfg.r2prune, 'delete', '--ledger', str(ledger)] + args, env=env_file(cfg.r2_env), pass_fds=(lock_fd,))
-    return run.returncode, ledger, listing_path
+DELETE_HELD = 'legacy R2 deletion is disabled: exact surviving copy verification and permanent cross-store protection are required'
 
 
 def delete(cfg, W, args, lock_fd):
-    if options(args, 'ke-coverage'):
-        raise SystemExit('Keep Everything is protected: --ke-coverage is no longer supported')
-    if options(args, 'ledger'):
-        raise SystemExit('the wrapper owns --ledger; do not pass it')
-    manifest_path, expected = str(Path(one_option(args, 'manifest')).resolve()), one_option(args, 'expected-sha256')
-    if sha(manifest_path) != expected:
-        raise SystemExit('manifest digest differs from --expected-sha256')
-    manifest = read_manifest(manifest_path)
-    refuse_ke_manifest(manifest)
-    classes = {row['class'] for row in manifest.values()}
-    mode = Mode.VERIFY if BEST14_CLASS in classes else Mode.LISTING
-    if mode is Mode.VERIFY:
-        if len(classes) != 1:
-            raise SystemExit(f'a {BEST14_CLASS} manifest must hold only that class; plan it separately')
-        if options(args, 'fresh-listing') or options(args, 'limit'):
-            raise SystemExit(f'for {BEST14_CLASS} the wrapper owns --fresh-listing and chunks with --chunk/--chunks; drop --fresh-listing and --limit')
-        listing_sha = None
-    else:
-        if cfg.chunk is not None or cfg.chunks is not None:
-            raise SystemExit(f'--chunk and --chunks apply only to {BEST14_CLASS} manifests')
-        listing_sha = sha(one_option(args, 'fresh-listing'))
-    Path(W).mkdir(parents=True, exist_ok=True)
-    intent_path = Path(W, 'delete-intent.json')
-    if intent_path.exists():
-        intent, _, sources = load_intent(W)
-        if intent['manifest_sha256'] != expected or Mode(intent['mode']) is not mode:
-            raise SystemExit(f'{W} is bound to another manifest; use a new workdir')
-        if is_complete(W):
-            print(json.dumps({'workdir': W, 'complete': True}))
-            return
-        if intent.get('fresh_listing_sha256') != listing_sha:
-            raise SystemExit(f'{W}: the open intent pins fresh listing {intent["fresh_listing_sha256"]}; '
-                             'rerun with that same --fresh-listing until it closes')
-        finish_receipts(cfg, W)
-    else:
-        sources = resolve_sources(cfg, manifest)
-        durable_write(Path(W, 'receipt-sources.json'), json.dumps(sources, sort_keys=True) + '\n')
-        intent = {'mode': mode.value, 'manifest': manifest_path, 'manifest_sha256': expected,
-                  'sources_sha256': sha(Path(W, 'receipt-sources.json')), 'fresh_listing_sha256': listing_sha}
-
-    store = r2_store(cfg.r2_env)
-    protect_path = one_option(args, 'db-protect')
-    classified_path = str(Path(one_option(args, 'summary')).parent / 'classified.tsv')
-
-    def call(keys, listing):
-        """Served-generation gate, preflight, bind the intent, one r2prune call, then its receipts."""
-        gen = gate(cfg, store, keys, protect_path, classified_path)[0]
-        preflight(cfg, W, keys, manifest, sources, expected)
-        if not intent_path.exists():
-            durable_write(intent_path, json.dumps(intent) + '\n')
-        rc, ledger, listing_path = run_r2prune(cfg, W, args, lock_fd, listing)
-        if listing_path:
-            compact_ledger(ledger, listing_path, intent, manifest)
-        st = finish_receipts(cfg, W, only=ledger)
-        if rc:
-            raise SystemExit(f'r2prune delete exited {rc}; receipts for its acknowledged deletes are written')
-        now = served_keys(cfg, store)[0]
-        if now != gen:  # a publish during the call: its keys were not gated; stop loudly
-            raise SystemExit(f'the pinned generation moved from {gen} to {now} during this chunk; receipts are written, rerun to gate')
-        return st
-
-    if mode is Mode.LISTING:
-        st = call(sorted(manifest.keys() - State(W, intent, manifest).deleted.keys()), None)
-        if st.unresolved and options(args, 'limit') in ([], ['0']):
-            raise SystemExit(f'{len(st.unresolved)} planned keys have no final ledger outcome (unlogged or failed); '
-                             'rerun the same command with the same --fresh-listing')
-        return
-
-    cover = load_coverage(one_option(args, 'best14-coverage'), manifest)
-    held = set()
-    for other, path in open_intents({Path(W).parent, Path(cfg.lane_cycles)}):
-        if other != Path(W):
-            held |= read_manifest(path).keys()
-    if not 1 <= (CHUNK if cfg.chunk is None else cfg.chunk) <= CHUNK or (cfg.chunks is not None and cfg.chunks < 1):
-        raise SystemExit(f'--chunk is 1 to {CHUNK} (one live verify covers one chunk) and --chunks at least 1')
-    if cfg.chunks is None and not State(W, intent, manifest).final:
-        raise SystemExit('run the canary first: --chunks 1, then check it, then rerun without --chunks')
-    for n in range(cfg.chunks or sys.maxsize):
-        st = State(W, intent, manifest)
-        batch = (sorted(st.unresolved & st.attempted) + [k for k in manifest if k not in st.attempted])[:cfg.chunk or CHUNK]
-        if not batch:
-            return
-        st = call(batch, verify_chunk(cfg, store, batch, manifest, sources, cover, st.attempted, held))
-        left = st.unresolved & set(batch)
-        if left:
-            raise SystemExit(f'chunk {n + 1}: {len(left)} keys have no final ledger outcome (unlogged or failed); '
-                             'rerun the same command to settle them first')
+    # Refuse before reading inputs, resolving sources, or creating any execution intent.
+    raise SystemExit(DELETE_HELD)
 
 
 def backfill(cfg, W, manifest_path, ledger_path, defer_blocked):
@@ -884,15 +632,15 @@ def status(roots):
 
 
 def main(argv):
-    p = argparse.ArgumentParser(description='Manual r2prune delete that writes its retirement receipts at apply time.')
+    p = argparse.ArgumentParser(description='Historical r2prune receipt reconciliation and read-only gates; new deletes disabled.')
     for k, v in DEFAULTS.items():
         p.add_argument('--' + k.replace('_', '-'), default=v)
     sub = p.add_subparsers(dest='cmd', required=True)
-    d = sub.add_parser('delete', help='resolve receipt sources, preflight, run r2prune delete, write receipts')
-    d.add_argument('--chunk', type=int, help=f'covered best-14 raws: live-verified per r2prune call (default {CHUNK})')
-    d.add_argument('--chunks', type=int, help='covered best-14 raws: stop after this many chunks (a canary)')
+    d = sub.add_parser('delete', help='disabled: no new delete execution')
+    d.add_argument('--chunk', type=int, help='legacy option; deletion is disabled')
+    d.add_argument('--chunks', type=int, help='legacy option; deletion is disabled')
     d.add_argument('workdir')
-    d.add_argument('args', nargs=argparse.REMAINDER, help='-- then the r2prune delete arguments (not --ledger)')
+    d.add_argument('args', nargs=argparse.REMAINDER, help='legacy delete arguments; deletion is disabled')
     r = sub.add_parser('receipts', help='write the receipts of a workdir whose intent is still open')
     r.add_argument('workdir')
     b = sub.add_parser('backfill', help='receipts for a run made without this wrapper; never deletes')
@@ -924,6 +672,8 @@ def main(argv):
                       Path(cfg.plan, 'classified.tsv'))
         print(json.dumps({'gate': 'pass', 'generation': gen, 'served_keys': n}))
         return
+    if cfg.cmd == 'delete':
+        return delete(cfg, cfg.workdir, cfg.args, None)
     W = str(Path(cfg.workdir).resolve())
     with open(cfg.lock, 'a') as lock:
         try:
@@ -934,8 +684,6 @@ def main(argv):
             finish_receipts(cfg, W)
         elif cfg.cmd == 'backfill':
             backfill(cfg, W, cfg.manifest, cfg.ledger, cfg.defer_blocked)
-        else:
-            delete(cfg, W, cfg.args[1:] if cfg.args[:1] == ['--'] else cfg.args, lock.fileno())
 
 
 if __name__ == '__main__':

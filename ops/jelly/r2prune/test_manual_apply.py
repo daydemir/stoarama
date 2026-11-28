@@ -1,8 +1,7 @@
 # /usr/bin/python3 -I ops/jelly/r2prune/test_manual_apply.py -q
 # Offline: stub psql and r2prune executables record their calls, and a local HTTP server
-# answers R2 HEADs; nothing reaches a DB or R2.
+# answers registry GETs; nothing reaches a DB or R2.
 import contextlib
-import email.utils
 import fcntl
 import gzip
 import hashlib
@@ -30,7 +29,6 @@ KE = [f'managed/acct-47/ke/{i}.mp4' for i in (1, 2, 3)]
 GEN = 'b' * 32
 ASSET = 'datasets/global-street-scores-delivery/47/assets/a.json'
 SERVED = 'joined/recovery-best14-20261125/objects/served.mp4'
-OUT1, OUT2 = 'joined/goodplus-20260821-generation-1/objects/o1.mp4', 'joined/goodplus-20260821-generation-1/objects/o2.mp4'
 
 # psql stub: answers the catalog lookup from sources.json, the chunk verify from db.json, the
 # dry run from dry-run.out, and the receipt apply with apply.rc; every call (with the receipt
@@ -42,7 +40,7 @@ script = sys.stdin.read()
 args = sys.argv[1:]
 f = args[args.index('-f') + 1] if '-f' in args else ''
 tsv = open('receipt-backfill.tsv').read() if f and os.path.exists('receipt-backfill.tsv') else None
-kind = 'pin' if 'gss_public_generation_pin' in script else 'verify' if 'jsonb_to_recordset' in script else 'stdin'
+kind = 'pin' if 'gss_public_generation_pin' in script else 'stdin'
 with open(S + '/calls.jsonl', 'a') as c:
     c.write(json.dumps({'psql': os.path.basename(f) or kind, 'args': args,
                         'cwd': os.getcwd(), 'ro': 'default_transaction_read_only=on' in os.environ['PGOPTIONS'], 'tsv': tsv, 'script_bytes': len(script)}) + '\n')
@@ -72,65 +70,24 @@ if f.endswith('dry-run.sql'):
         if act(r) != 'insert':
             print(f'{r[0]}|{act(r)}||{r[1]}|{r[2]}|{r[5]}')
     sys.exit(0)
-if 'jsonb_to_recordset' in script:
-    raws, pairs = [json.loads(p) for p in script.split('$k$')[1::2]]
-    db = json.load(open(S + '/db.json'))
-    for r in raws:
-        if r['key'] in db['clips']:
-            print('\t'.join(['raw', r['key']] + db['clips'][r['key']] + [str(r['key'] in db.get('kept', [])).lower(), '', '']))
-    for o in sorted({p['output'] for p in pairs}):
-        print('\t'.join(['output', o] + db['outputs'].get(o, ['0', '', 'false', 'false', 'false', 'false', '', 'false', 'none'])))
-    for p in pairs:
-        print('\t'.join(['pair', p['raw'], p['output'], 'true' if p['raw'] in db['contains'].get(p['output'], []) else 'false', '', '', '']))
-    sys.exit(0)
 wanted = set(json.loads(script.split('$k$')[1]))
 for key, s in json.load(open(S + '/sources.json')).items():
     if key in wanted:
         print('\t'.join(map(str, (key, s['kind'], s['source_id'], s['stream_id'], s['size'], s['sha256'], s['etag'] or ''))))
 '''
 
-# r2prune stub: like delete.go, logs every manifest key (or the first --limit): absent from
-# --fresh-listing is skipped_changed, a key in r2prune.fail is failed, the rest deleted (and
-# removed from r2.json). r2prune.drop leaves the last row unlogged, r2prune.partial half-writes
-# it, r2prune.dup logs the first row twice. Exits with r2prune.rc.
+# An old binary would accept delete. This recording stub must never be called.
 R2PRUNE = r'''#!/usr/bin/env python3
-import hashlib, json, os, sys
-S = os.environ['STUB']
-a = sys.argv[1:]
-opt = lambda n, d=None: a[a.index(n) + 1] if n in a else d
-flag = lambda n: os.path.exists(S + '/r2prune.' + n)
-with open(S + '/calls.jsonl', 'a') as c:
-    c.write(json.dumps({'r2prune': a}) + '\n')
-keys = [json.loads(l) for l in open(opt('--manifest'))]
-limit = int(opt('--limit', 0))
-listing = {l.split('\t')[0] for l in open(opt('--fresh-listing'))}
-fail = json.load(open(S + '/r2prune.fail')) if flag('fail') else []
-at = open(S + '/r2prune.at').read().strip()
-r2 = json.load(open(S + '/r2.json'))
-rows = []
-for k in keys[:limit or None]:
-    out = ('skipped_changed', 'absent_from_fresh_listing') if k['key'] not in listing else ('failed', 'x') if k['key'] in fail else ('deleted', None)
-    rows.append(json.dumps(dict({'key': k['key'], 'size': k['size'], 'outcome': out[0], 'at': at}, **({'detail': out[1]} if out[1] else {}))) + '\n')
-    if out[0] == 'deleted':
-        r2.pop(k['key'], None)
-json.dump(r2, open(S + '/r2.json', 'w'))
-if flag('drop'):
-    rows = rows[:-1]
-if flag('partial'):
-    rows[-1] = rows[-1][:-12]
-if flag('dup'):
-    rows.append(rows[0])
-with open(opt('--ledger'), 'w') as f:
-    f.write(json.dumps({'type': 'run', 'manifest_sha256': opt('--expected-sha256'), 'inputs_sha256': {'picks': 'p'},
-                        'recent_from': '2026-11-18T18:00:00Z', 'fresh_listing_sha256': hashlib.sha256(open(opt('--fresh-listing'), 'rb').read()).hexdigest(),
-                        'limit': limit, 'started_at': at}) + '\n')
-    f.write(''.join(rows))
-sys.exit(int(open(S + '/r2prune.rc').read()) if flag('rc') else 0)
+import json, os, sys
+with open(os.environ['STUB'] + '/calls.jsonl', 'a') as c:
+    c.write(json.dumps({'r2prune': sys.argv[1:]}) + '\n')
+sys.exit(1)
 '''
 
 
 class Head(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        self.server.requests.append(self.path)
         body = Path(os.environ['STUB'], 'bodies', self.path.split('/', 2)[2])
         if not body.exists():
             self.send_response(404)
@@ -142,20 +99,12 @@ class Head(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_HEAD(self):
-        objects = json.loads(Path(os.environ['STUB'], 'r2.json').read_text())
-        key = self.path.split('/', 2)[2]
-        self.server.auth.append(self.headers['Authorization'].startswith('AWS4-HMAC-SHA256 Credential=ak/'))
-        if key not in objects:
-            self.send_response(404)
-            self.end_headers()
-            return
-        size, etag, mtime = objects[key]
-        self.send_response(200)
-        self.send_header('Content-Length', str(size))
-        self.send_header('ETag', f'"{etag}"')
-        self.send_header('Last-Modified', email.utils.formatdate(mtime, usegmt=True))
+    def unexpected(self):
+        self.server.requests.append((self.command, self.path))
+        self.send_response(405)
         self.end_headers()
+
+    do_HEAD = do_POST = do_DELETE = do_PUT = unexpected
 
     def log_message(self, *_):
         pass
@@ -172,13 +121,11 @@ class Base(unittest.TestCase):
             p.write_text(body.replace('#!/usr/bin/env python3', '#!' + sys.executable + ' -I'))
             p.chmod(0o755)
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Head)
-        self.server.auth = []
+        self.server.requests = []
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         (self.d / 'db.env').write_text('DATABASE_URL=postgres://u:secretpw@db.invalid:5432/stoarama?sslmode=require\n')
         (self.d / 'r2.env').write_text(f'R2_ENDPOINT=http://127.0.0.1:{self.server.server_port}\nR2_ACCESS_KEY_ID=ak\n'
                                        'R2_SECRET_ACCESS_KEY=sk\nR2_BUCKET=stoarama\n')
-        (self.d / 'r2prune.at').write_text('2026-11-25T10:00:00.5Z')
-        (self.d / 'r2.json').write_text('{}')
         self.root = self.d / 'manual'
         self.W = self.root / 'work'
         self.manifest = self.d / 'delete-manifest.jsonl'
@@ -213,12 +160,6 @@ class Base(unittest.TestCase):
     def sources(self, rows):
         (self.d / 'sources.json').write_text(json.dumps({k: {'kind': kind, 'source_id': sid, 'stream_id': 7, 'size': 100,
                                                              'sha256': SHA, 'etag': etag} for k, (kind, sid, etag) in rows.items()}))
-
-    def flag(self, name, value=''):
-        (self.d / ('r2prune.' + name)).write_text(value)
-
-    def unflag(self, name):
-        (self.d / ('r2prune.' + name)).unlink()
 
     def run_cli(self, *args):
         base = ['--psql', str(self.d / 'psql'), '--r2prune', str(self.d / 'r2prune'), '--lock', str(self.d / 'lock'),
@@ -255,154 +196,129 @@ class ListingMode(Base):
         return self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
                             *self.rule_args(), '--fresh-listing', str(self.listing), *extra)
 
-    def test_apply_writes_receipts_through_receipt_apply(self):
-        self.delete()
-        rows = [l.split('\t') for l in (self.W / 'receipt-backfill.tsv').read_text().splitlines()]
-        self.assertEqual([(r[0], r[1], r[2], r[4], r[8], r[9], r[10], r[11], r[13]) for r in rows], [
-            ('1', 'collated', '22', COL, '2026-11-25T10:00:00.5Z', 'r2prune_ledger_delete_collated_outside_window', 'none', self.digest, r'\N'),
-            ('2', 'raw', '11', RAW, '2026-11-25T10:00:00.5Z', 'r2prune_ledger_delete_raw_outside_window', 'none', self.digest, r'\N')])
-        policy = hashlib.sha256(b'{"inputs_sha256":{"picks":"p"},"recent_from":"2026-11-18T18:00:00Z"}').hexdigest()
-        self.assertEqual({r[12] for r in rows}, {policy})
-        self.assertEqual(self.calls(), ['stdin', 'dry-run.sql', 'r2prune', 'receipt-apply.sql'])
-        calls = [json.loads(l) for l in (self.d / 'calls.jsonl').read_text().splitlines()]
-        self.assertEqual([(c['psql'], c['ro']) for c in calls if 'psql' in c],
-                         [('stdin', True), ('pin', True), ('dry-run.sql', True), ('receipt-apply.sql', False), ('pin', True)])
-        apply = [c for c in calls if c.get('psql') == 'receipt-apply.sql'][-1]
-        self.assertEqual((apply['cwd'], apply['args'][apply['args'].index('total=2') - 1]), (str(self.W), '-v'))
-        self.assertNotIn('secretpw', json.dumps(calls))
+    def historical(self, outcomes, *, stamp='20261125T100000Z', at='2026-11-25T10:00:00.5Z',
+                   partial=False, mode='listing', listing=None, fresh_sha=None):
+        """Make synthetic historical intent and ledger, without invoking any delete code."""
+        self.W.mkdir(parents=True, exist_ok=True)
+        source_path = self.W / 'receipt-sources.json'
+        source_path.write_bytes((self.d / 'sources.json').read_bytes())
+        pinned_sha = ma.sha(self.listing) if mode == 'listing' else None
+        (self.W / 'delete-intent.json').write_text(json.dumps({
+            'mode': mode, 'manifest': str(self.manifest), 'manifest_sha256': self.digest,
+            'sources_sha256': ma.sha(source_path), 'fresh_listing_sha256': pinned_sha}))
+        if listing is not None:
+            path = self.W / f'listing-{stamp}.tsv'
+            path.write_text(listing)
+            pinned_sha = ma.sha(path)
+        ledger = self.W / f'ledger-{stamp}.jsonl'
+        rows = [{'type': 'run', 'manifest_sha256': self.digest, 'inputs_sha256': {'picks': 'p'},
+                 'recent_from': '2026-11-18T18:00:00Z', 'fresh_listing_sha256': fresh_sha or pinned_sha,
+                 'limit': 0, 'started_at': at}]
+        rows += [dict({'key': k, 'size': 100, 'outcome': outcome, 'at': at}, **detail)
+                 for k, outcome, detail in outcomes]
+        body = ''.join(json.dumps(r) + '\n' for r in rows)
+        ledger.write_text(body[:-12] if partial else body)
+        return ledger
+
+    def assert_blocked(self, *extra):
+        with self.assertRaisesRegex(SystemExit, 'legacy R2 deletion is disabled'):
+            self.delete(*extra)
+
+    def test_new_and_stale_inputs_are_refused_before_any_intent_or_call(self):
+        for extra in ((), ('--limit', '1'), ('--ledger', 'x'), ('--ke-coverage', 'old.tsv')):
+            self.assert_blocked(*extra)
+        self.digest = '0' * 64
+        self.listing.unlink()
+        self.assert_blocked()
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.W.exists())
+        self.assertFalse((self.d / 'lock').exists())
+        self.assertEqual(self.server.requests, [])
+
+    def test_receipts_for_historical_acknowledgements(self):
+        self.historical([(RAW, 'deleted', {}), (COL, 'deleted', {})])
+        self.run_cli('receipts', str(self.W))
+        self.assertEqual(self.calls(), ['receipt-apply.sql'])
+        self.assertEqual(self.applied(), {RAW: '2026-11-25T10:00:00.5Z', COL: '2026-11-25T10:00:00.5Z'})
         self.assertTrue(self.result()['complete'])
-        intent = json.loads((self.W / 'delete-intent.json').read_text())
-        self.assertEqual((intent['mode'], intent['fresh_listing_sha256']), ('listing', ma.sha(self.listing)))
-        self.assertEqual(self.delete(), [{'workdir': str(self.W), 'complete': True}])
-
-    def test_key_without_catalog_identity_stops_before_delete(self):
-        self.write_manifest([(RAW, 'delete_raw_outside_window'), ('experimental/stitching-confident-repairs/1/a.mp4', 'delete_owner_break_link')])
-        with self.assertRaisesRegex(SystemExit, '1 manifest keys have no receipt identity'):
-            self.delete()
-        self.assertNotIn('r2prune', self.calls())
-        self.assertFalse((self.W / 'delete-intent.json').exists())
-
-    def test_catalog_identity_drift_stops_before_delete(self):
-        self.sources({RAW: ('raw', 11, 'other-etag'), COL: ('collated', 22, None)})
-        with self.assertRaisesRegex(SystemExit, 'no receipt identity'):
-            self.delete()
-        self.assertNotIn('r2prune', self.calls())
-
-    def test_receipt_refusal_in_preflight_stops_before_delete(self):
-        (self.d / 'dry-run.out').write_text('blocked|raw|trigger_nas_cleanup_source_hold|1|100|1\n')
-        with self.assertRaisesRegex(SystemExit, 'would refuse'):
-            self.delete()
-        self.assertNotIn('r2prune', self.calls())
-        self.assertFalse((self.W / 'delete-intent.json').exists())
 
     def test_failed_receipt_write_fails_closed_and_replays(self):
+        self.historical([(RAW, 'deleted', {}), (COL, 'deleted', {})])
         (self.d / 'apply.rc').write_text('3')
         with self.assertRaisesRegex(SystemExit, 'receipt apply failed'):
-            self.delete()
+            self.run_cli('receipts', str(self.W))
         self.assertFalse((self.W / 'receipt-result.json').exists())
         (self.d / 'apply.rc').write_text('0')
         self.run_cli('receipts', str(self.W))
         self.assertEqual(self.result()['deleted_receipts'], 2)
 
-    def test_failed_outcome_keeps_the_intent_open_until_a_rerun_settles_it(self):
-        self.flag('fail', json.dumps([RAW]))
-        self.flag('rc', '1')
-        with self.assertRaisesRegex(SystemExit, 'r2prune delete exited 1'):
-            self.delete()
+    def test_failed_outcome_stays_open_without_retrying_old_delete(self):
+        self.historical([(RAW, 'failed', {}), (COL, 'deleted', {})])
+        self.run_cli('receipts', str(self.W))
         self.assertEqual(set(self.applied()), {COL})
         self.assertEqual((self.result()['complete'], self.result()['unresolved']), (False, 1))
-        self.unflag('fail')
-        self.unflag('rc')
-        (self.d / 'r2prune.at').write_text('2026-11-25T11:00:00Z')
-        self.delete()
-        self.assertEqual(self.applied(), {COL: '2026-11-25T10:00:00.5Z', RAW: '2026-11-25T11:00:00Z'})
+        before = {p: p.read_bytes() for p in self.W.iterdir() if p.is_file()}
+        self.assert_blocked()
+        self.assertEqual(before, {p: p.read_bytes() for p in self.W.iterdir() if p.is_file()})
+        self.assertNotIn('r2prune', self.calls())
+
+    def test_multiple_historical_ledgers_keep_first_acknowledgement(self):
+        self.historical([(RAW, 'deleted', {})])
+        self.historical([(RAW, 'deleted', {}), (COL, 'deleted', {})],
+                        stamp='20261125T110000Z', at='2026-11-25T11:00:00Z')
+        self.run_cli('receipts', str(self.W))
+        self.assertEqual(self.applied(), {RAW: '2026-11-25T10:00:00.5Z', COL: '2026-11-25T11:00:00Z'})
         self.assertTrue(self.result()['complete'])
 
-    def test_canary_then_full_keeps_the_first_acknowledgement(self):
-        self.delete('--limit', '1')
-        self.assertEqual((self.result()['complete'], self.result()['unresolved']), (False, 1))
-        (self.d / 'r2prune.at').write_text('2026-11-25T11:00:00Z')
-        self.delete()
-        self.assertEqual(self.applied(), {RAW: '2026-11-25T10:00:00.5Z', COL: '2026-11-25T11:00:00Z'})
-        self.assertEqual(len(self.calls('dry-run.sql')), 2)
-        self.assertEqual(len(list(self.W.glob('ledger-*.jsonl'))), 2)
-
-    def test_rerun_with_another_fresh_listing_is_refused(self):
-        self.delete('--limit', '1')
-        self.listing.write_text(f'{COL}\t100\te1\t1\n')  # RAW would read as absent_from_fresh_listing: final, no receipt
-        with self.assertRaisesRegex(SystemExit, 'the open intent pins fresh listing'):
-            self.delete()
-        self.assertEqual(self.calls().count('r2prune'), 1)
-
     def test_ledger_run_against_another_listing_is_refused(self):
-        self.delete('--limit', '1')
-        ledger = next(self.W.glob('ledger-*.jsonl'))
-        header, rest = ledger.read_text().split('\n', 1)
-        ledger.write_text(json.dumps(dict(json.loads(header), fresh_listing_sha256='0' * 64)) + '\n' + rest)
+        self.historical([(RAW, 'deleted', {})], fresh_sha='0' * 64)
         with self.assertRaisesRegex(SystemExit, 'another fresh listing'):
             self.run_cli('receipts', str(self.W))
 
     def test_half_written_last_ledger_line_is_unlogged(self):
-        self.flag('partial')
-        with self.assertRaisesRegex(SystemExit, '1 planned keys have no final ledger outcome'):
-            self.delete()
+        self.historical([(RAW, 'deleted', {}), (COL, 'deleted', {})], partial=True)
+        self.run_cli('receipts', str(self.W))
         self.assertEqual((self.result()['deleted_receipts'], self.result()['unresolved']), (1, 1))
-        self.unflag('partial')
-        self.delete()
-        self.assertTrue(self.result()['complete'])
-
-    def test_unlogged_key_keeps_a_full_run_open(self):
-        self.flag('drop')
-        with self.assertRaisesRegex(SystemExit, '1 planned keys have no final ledger outcome'):
-            self.delete()
-        self.unflag('drop')
-        self.delete()
-        self.assertTrue(self.result()['complete'])
 
     def test_duplicate_key_in_one_ledger_is_refused(self):
-        self.flag('dup')
+        self.historical([(RAW, 'deleted', {}), (RAW, 'deleted', {})])
         with self.assertRaisesRegex(SystemExit, 'duplicate or unexpected ledger row'):
-            self.delete()
+            self.run_cli('receipts', str(self.W))
         self.assertEqual(self.calls('receipt-apply.sql'), [])
 
-    def test_busy_lock_refuses_before_anything(self):
+    def test_busy_lock_refuses_historical_receipt_replay(self):
         with open(self.d / 'lock', 'a') as held:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(SystemExit, 'is held'):
-                self.delete()
+                self.run_cli('receipts', str(self.W))
         self.assertEqual(self.calls(), [])
-
-    def test_wrapper_owns_the_ledger(self):
-        for flag in (['--ledger', 'x.jsonl'], ['-ledger', 'x.jsonl'], ['-ledger=x.jsonl']):
-            with self.assertRaisesRegex(SystemExit, 'owns --ledger'):
-                self.delete(*flag)
-        with self.assertRaisesRegex(SystemExit, 'exactly once'):
-            self.delete('-manifest', str(self.manifest))
-        self.assertEqual(self.calls(), [])
-
-    def test_manifest_digest_must_match(self):
-        self.digest = '0' * 64
-        with self.assertRaisesRegex(SystemExit, 'differs from --expected-sha256'):
-            self.delete()
 
     def test_receipt_sources_are_rechecked_on_reentry(self):
-        self.delete('--limit', '1')
+        self.historical([(RAW, 'deleted', {})])
         (self.W / 'receipt-sources.json').write_text('{}\n')
         with self.assertRaisesRegex(SystemExit, 'receipt sources changed'):
-            self.delete()
-        self.assertEqual(self.calls().count('r2prune'), 1)
+            self.run_cli('receipts', str(self.W))
+        self.assertEqual(self.calls(), [])
 
     def test_status_lists_open_intents(self):
-        self.delete('--limit', '1')
+        self.historical([(RAW, 'deleted', {})])
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(SystemExit, '1 open delete intents'):
             ma.main(['status', str(self.root)])
         self.assertEqual(json.loads(out.getvalue())['workdir'], str(self.W))
-        self.delete()
+        self.historical([(RAW, 'deleted', {}), (COL, 'deleted', {})])
+        self.run_cli('receipts', str(self.W))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             ma.main(['status', str(self.root)])
         self.assertEqual(json.loads(out.getvalue()), {'open': 0})
+
+    def test_historical_chunk_ledger_defers_out_of_scope_rows(self):
+        self.historical([(RAW, 'deleted', {}), (COL, 'skipped_changed', {'detail': ma.ABSENT})],
+                        mode='verify', listing=f'{RAW}\t100\te1\t1\n')
+        self.run_cli('receipts', str(self.W))
+        self.assertEqual(set(self.applied()), {RAW})
+        self.assertEqual((self.result()['complete'], self.result()['unresolved']), (False, 1))
 
 
 class Backfill(Base):
@@ -508,221 +424,28 @@ class Backfill(Base):
         self.assertFalse((self.W / 'delete-intent.json').exists())
 
 
-class Best14ChunkVerify(Base):
-    CLS, FLAG = ma.BEST14_CLASS, '--best14-coverage'
+class BlockedManifests(Base):
+    def test_old_mixed_and_best14_manifests_refuse_without_catalog_or_r2_calls(self):
+        for rows in ([(KE[0], ma.LEGACY_KE_CLASS)], [(RAW, ma.BEST14_CLASS), (KE[0], ma.LEGACY_KE_CLASS)],
+                     [(KE[0], ma.BEST14_CLASS)], [(RAW, 'delete_raw_outside_window')]):
+            self.write_manifest(rows)
+            for extra in ([], ['--ke-coverage', 'legacy.tsv'], ['-ke-coverage=legacy.tsv']):
+                with self.assertRaisesRegex(SystemExit, 'legacy R2 deletion is disabled'):
+                    self.run_cli('delete', '--chunk', '1', '--chunks', '1', str(self.W), '--',
+                                 '--manifest', str(self.manifest), '--expected-sha256', self.digest, *self.rule_args(), *extra)
+            self.assertFalse(self.W.exists())
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.calls('pin'), [])
+        self.assertEqual(self.server.requests, [])
+
+
+class Gate(Base):
+    """The served-generation read-only gate remains available."""
 
     def setUp(self):
         super().setUp()
-        self.write_manifest([(k, self.CLS) for k in KE])
-        self.sources({k: ('raw', 11 + i, 'e1') for i, k in enumerate(KE)})
-        self.coverage = self.d / 'best14-coverage.tsv'
-        self.coverage.write_text(f'{KE[0]}\t100\t{OUT1}\t500\n{KE[1]}\t100\t{OUT1}\t500\n{KE[2]}\t100\t{OUT2}\t600\n'
-                                 f'{KE[2]}\t999\t{OUT1}\t500\n')
-        self.r2({**{k: [100, 'e1', 1] for k in KE}, OUT1: [500, 'o1', 5], OUT2: [600, 'o2', 6]})
-        # [rows, size, receipt, reservation, nonraw intent, collated, delivery hold size:etag, owner keep, NAS restore]
-        self.db({'clips': {k: ['100', 'true'] for k in KE},
-                 'outputs': {OUT1: ['1', '500', 'false', 'false', 'false', 'true', '500:o1', 'true', 'none'],
-                             OUT2: ['1', '600', 'false', 'false', 'false', 'true', '', 'true', 'verified']},
-                 'contains': {OUT1: KE[:2], OUT2: KE[2:]}})
-
-    def r2(self, objects):
-        (self.d / 'r2.json').write_text(json.dumps(objects))
-
-    def db(self, db):
-        (self.d / 'db.json').write_text(json.dumps(db))
-
-    def delete(self, *wrapper, extra=(), full=False):
-        # A bounded run unless full: an unbounded one needs a canary first (test_an_unbounded_run_needs_a_canary).
-        if not full and '--chunks' not in wrapper:
-            wrapper += ('--chunks', '99')
-        return self.run_cli('delete', *wrapper, str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
-                            *self.rule_args(), self.FLAG, str(self.coverage), *extra)
-
-    def listings(self):
-        return [sorted(l.split('\t')[0] for l in p.read_text().splitlines()) for p in sorted(self.W.glob('listing-*.tsv'))]
-
-    def test_each_chunk_is_verified_then_deleted_with_its_own_listing(self):
-        self.delete('--chunk', '2')
-        self.assertEqual(self.calls(), ['stdin', 'verify', 'dry-run.sql', 'r2prune', 'receipt-apply.sql',
-                                        'verify', 'dry-run.sql', 'r2prune', 'receipt-apply.sql'])
-        self.assertEqual(self.listings(), [sorted(KE[:2] + [OUT1]), sorted([KE[2], OUT2])])
-        self.assertEqual(sorted(self.W.glob('listing-*.tsv'))[1].read_text(), f'{OUT2}\t600\to2\t6\n{KE[2]}\t100\te1\t1\n')
-        for call in self.calls('r2prune'):
-            self.assertEqual(call['r2prune'].count('--fresh-listing'), 1)
-        self.assertEqual(set(self.applied()), set(KE))
-        self.assertEqual([len(p.read_text().splitlines()) for p in sorted(self.W.glob('ledger-*.jsonl'))], [3, 2])
-        self.assertTrue(self.result()['complete'])
-        self.assertTrue(self.server.auth and all(self.server.auth))
-
-    def test_a_cover_under_owner_keep_still_covers(self):
-        # collation_v2_recovery_held keeps every cover of the 2026-11-25 canary: the protection a sole copy needs
-        db = json.loads((self.d / 'db.json').read_text())
-        owner = ['1', '500', 'false', 'false', 'false', 'true', '', 'true', 'none']
-        self.db({**db, 'outputs': {OUT1: owner, OUT2: owner[:1] + ['600'] + owner[2:]}})
-        self.delete('--chunk', '2')
-        self.assertEqual(set(self.applied()), set(KE))
-        self.assertTrue(self.result()['complete'])
-
-    def test_keys_outside_the_chunk_are_deferred_not_final(self):
-        self.delete('--chunk', '1', '--chunks', '1')
-        self.assertEqual((self.result()['complete'], self.result()['deleted_receipts'], self.result()['unresolved']), (False, 1, 2))
-        self.assertEqual(set(self.applied()), {KE[0]})
-        self.delete('--chunk', '1')
-        self.assertEqual(self.listings(), [sorted([KE[0], OUT1]), sorted([KE[1], OUT1]), sorted([KE[2], OUT2])])
-        self.assertEqual(set(self.applied()), set(KE))
-        self.assertTrue(self.result()['complete'])
-
-    def test_a_failed_key_is_settled_first_by_the_next_chunk_even_once_gone(self):
-        self.flag('fail', json.dumps([KE[0]]))
-        self.flag('rc', '1')
-        with self.assertRaisesRegex(SystemExit, 'r2prune delete exited 1'):
-            self.delete('--chunk', '2')
-        self.assertEqual(set(self.applied()), {KE[1]})
-        self.unflag('fail')
-        self.unflag('rc')
-        objects = json.loads((self.d / 'r2.json').read_text())
-        del objects[KE[0]]  # the failed DELETE did remove it
-        self.r2(objects)
-        (self.d / 'r2prune.at').write_text('2026-11-25T11:00:00Z')
-        self.delete('--chunk', '2')
-        self.assertEqual(self.listings()[1], sorted([KE[0], KE[2], OUT1, OUT2]))
-        self.assertEqual(self.applied(), {KE[1]: '2026-11-25T10:00:00.5Z', KE[0]: '2026-11-25T11:00:00Z', KE[2]: '2026-11-25T11:00:00Z'})
-        self.assertTrue(self.result()['complete'])
-
-    def test_first_mismatch_stops_before_that_chunks_r2prune(self):
-        def other_intent():
-            other = self.root / 'other'
-            other.mkdir(parents=True)
-            (other / 'm.jsonl').write_text(json.dumps({'key': OUT2}) + '\n')
-            (other / 'delete-intent.json').write_text(json.dumps({'manifest': str(other / 'm.jsonl'), 'manifest_sha256': SHA}))
-        objects = json.loads((self.d / 'r2.json').read_text())
-        db = json.loads((self.d / 'db.json').read_text())
-        cases = {
-            'raw etag': (lambda: self.r2({**objects, KE[2]: [100, 'e2', 1]}), 'R2 HEAD of ' + KE[2]),
-            'raw absent, never sent': (lambda: self.r2({k: v for k, v in objects.items() if k != KE[2]}), 'R2 HEAD of ' + KE[2]),
-            'output size': (lambda: self.r2({**objects, OUT2: [601, 'o2', 6]}), 'covering output ' + OUT2),
-            'raw owner keep': (lambda: self.db({**db, 'kept': [KE[2]]}), 'recording_clips row for ' + KE[2]),
-            'clip purged': (lambda: self.db({**db, 'clips': {**db['clips'], KE[2]: ['100', 'false']}}), 'recording_clips row for ' + KE[2]),
-            'clip size': (lambda: self.db({**db, 'clips': {**db['clips'], KE[2]: ['101', 'true']}}), 'recording_clips row for ' + KE[2]),
-            'output receipted': (lambda: out2(2, 'true'), OUT2),
-            'output reserved': (lambda: out2(3, 'true'), OUT2),
-            'output nonraw intent': (lambda: out2(4, 'true'), OUT2),
-            'output catalog size': (lambda: out2(1, '599'), OUT2),
-            'output two catalog rows': (lambda: out2(0, '2'), OUT2),
-            'output hour not collated': (lambda: out2(5, 'false'), OUT2),
-            'output unheld': (lambda: out2(7, 'false'), OUT2),
-            'output with only a delivery keep hold': (lambda: self.db({**db, 'outputs': {**db['outputs'], OUT2: db['outputs'][OUT2][:6] + ['600:o2', 'false', 'none']}}), OUT2),
-            'output restore unverified': (lambda: out2(8, 'unverified'), OUT2),
-            'clip left the output or its span': (lambda: self.db({**db, 'contains': {OUT1: KE[:2], OUT2: []}}), 'source_clip_ids of ' + OUT2),
-            'output in another open intent': (other_intent, "another open intent's manifest"),
-        }
-        def out2(i, value):
-            row = list(db['outputs'][OUT2])
-            row[i] = value
-            self.db({**db, 'outputs': {**db['outputs'], OUT2: row}})
-        for name, (break_it, message) in cases.items():
-            with self.subTest(name):
-                self.tearDown()
-                self.setUp()
-                objects = json.loads((self.d / 'r2.json').read_text())
-                db = json.loads((self.d / 'db.json').read_text())
-                self.delete('--chunk', '2', '--chunks', '1')
-                break_it()
-                with self.assertRaisesRegex(SystemExit, 'verify: .*' + message.replace('.', r'\.')):
-                    self.delete('--chunk', '2')
-                self.assertEqual(self.calls().count('r2prune'), 1)
-                self.assertEqual(len(self.listings()), 1)
-                self.assertFalse(self.result()['complete'])
-
-    def test_wrapper_owns_the_fresh_listing_for_covered_classes(self):
-        for extra in (['--fresh-listing', 'f.tsv'], ['--limit', '1']):
-            with self.assertRaisesRegex(SystemExit, 'wrapper owns --fresh-listing'):
-                self.delete(extra=extra)
-        self.write_manifest([(KE[0], self.CLS), (RAW, 'delete_raw_outside_window')])
-        with self.assertRaisesRegex(SystemExit, 'only that class'):
-            self.delete()
-        self.assertEqual(self.calls(), [])
-
-    def test_an_unbounded_run_needs_a_canary_and_chunks_are_capped(self):
-        with self.assertRaisesRegex(SystemExit, 'run the canary first'):
-            self.delete('--chunk', '2', full=True)
-        for bad in (('--chunk', str(ma.CHUNK + 1), '--chunks', '1'), ('--chunk', '-1', '--chunks', '1'),
-                    ('--chunk', '0', '--chunks', '1'), ('--chunk', '2', '--chunks', '0')):
-            with self.assertRaisesRegex(SystemExit, '--chunk is 1 to'):
-                self.delete(*bad)
-        self.assertNotIn('r2prune', self.calls())
-        self.delete('--chunk', '2', '--chunks', '1')
-        self.delete('--chunk', '2', full=True)
-        self.assertTrue(self.result()['complete'])
-
-    def test_a_pin_move_during_a_chunk_stops_after_its_receipts(self):
-        real = ma.run_r2prune
-
-        def publish_during(*a, **k):
-            out = real(*a, **k)
-            self.serve('c' * 32, [SERVED])
-            return out
-        with unittest.mock.patch.object(ma, 'run_r2prune', publish_during):
-            with self.assertRaisesRegex(SystemExit, 'pinned generation moved'):
-                self.delete('--chunk', '2')
-        self.assertEqual(set(self.applied()), set(KE[:2]))
-
-    def test_legacy_coverage_flag_is_refused_even_on_best14_manifest(self):
-        with self.assertRaisesRegex(SystemExit, 'Keep Everything is protected: --ke-coverage'):
-            self.delete(extra=['--ke-coverage', str(self.coverage)])
-        self.assertEqual(self.calls(), [])
-
-
-class LegacyKeepEverythingManifest(Base):
-    def test_historical_manifest_is_refused_before_any_catalog_or_r2_call(self):
-        self.write_manifest([(KE[0], ma.LEGACY_KE_CLASS)])
-        with self.assertRaisesRegex(SystemExit, 'historical delete_ke_raw_stitched'):
-            self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest),
-                         '--expected-sha256', self.digest, *self.rule_args())
-        self.assertEqual(self.calls(), [])
-        self.assertFalse(self.W.exists())
-        self.assertEqual(self.calls('pin'), [])
-
-    def test_mixed_manifest_is_refused_before_any_catalog_or_r2_call(self):
-        self.write_manifest([(RAW, ma.BEST14_CLASS), (KE[0], ma.LEGACY_KE_CLASS)])
-        with self.assertRaisesRegex(SystemExit, 'historical delete_ke_raw_stitched'):
-            self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest),
-                         '--expected-sha256', self.digest, *self.rule_args())
-        self.assertEqual(self.calls(), [])
-        self.assertFalse(self.W.exists())
-
-    def test_preflight_refuses_historical_class_even_without_a_legacy_flag(self):
-        self.write_manifest([(KE[0], ma.LEGACY_KE_CLASS)])
-        with unittest.mock.patch.object(ma, 'dry_run') as dry_run:
-            with self.assertRaisesRegex(SystemExit, 'historical delete_ke_raw_stitched'):
-                ma.preflight(None, self.W, [KE[0]], ma.read_manifest(self.manifest), {}, self.digest)
-            dry_run.assert_not_called()
-
-    def test_legacy_flag_is_refused_in_all_go_flag_forms(self):
-        self.write_manifest([(RAW, 'delete_raw_outside_window')])
-        for flag in ('--ke-coverage', '-ke-coverage'):
-            for args in ([flag, 'a.tsv'], [flag + '=a.tsv'], [flag + '=']):
-                with self.subTest(args=args), self.assertRaisesRegex(SystemExit, 'Keep Everything is protected: --ke-coverage'):
-                    self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest),
-                                 '--expected-sha256', self.digest, *self.rule_args(), *args)
-        self.assertEqual(self.calls(), [])
-        self.assertFalse(self.W.exists())
-
-
-class Gate(Best14ChunkVerify):
-    """The served-generation gate: before every chunk, from the generation pinned now."""
-
-    def test_the_pin_is_read_before_and_after_every_chunk(self):
-        self.delete('--chunk', '2')
-        self.assertEqual(len(self.calls('pin')), 4)
-        self.assertTrue(self.result()['complete'])
-
-    def test_a_generation_swap_mid_run_is_caught_before_the_next_chunk(self):
-        self.delete('--chunk', '2', '--chunks', '1')
-        self.serve('c' * 32, [SERVED, 'joined/recovery-best14nas-20261126/objects/new.mp4'])
-        with self.assertRaisesRegex(SystemExit, 'gate: 1 keys served by c{32} have no page_link row'):
-            self.delete('--chunk', '2')
-        self.assertEqual(self.calls().count('r2prune'), 1)
+        self.write_manifest([(k, ma.BEST14_CLASS) for k in KE])
+        (self.plan / 'delete-manifest.jsonl').write_text(self.manifest.read_text())
 
     def test_fails_closed(self):
         def other_registry():
@@ -744,7 +467,7 @@ class Gate(Best14ChunkVerify):
                 self.setUp()
                 break_it()
                 with self.assertRaisesRegex(SystemExit, 'gate: .*' + message):
-                    self.delete('--chunk', '2')
+                    self.run_cli('gate', str(self.plan), '--db-protect', str(self.protect))
                 self.assertNotIn('r2prune', self.calls())
                 self.assertFalse((self.W / 'delete-intent.json').exists())
 
