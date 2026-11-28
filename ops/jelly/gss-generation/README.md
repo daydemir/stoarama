@@ -67,16 +67,21 @@ The cycle also holds a Mooney-local lock across the build, swaps, gates, and
 ledger publication. It arms rollback before invoking the remote swap, so a
 lost SSH response is treated as an uncertain write. It checks the preview,
 viewer, download, ledger and availability gates, then verifies both pointers
-again before and after copying the ledger. Ledger record copies are backed up
-before replacement and restored if publication fails.
+again before and after copying the ledger. Before replacing ledger records,
+the cycle persists a manifest of which originals existed and hashes of the
+original and candidate bytes. Copies are verified and atomically replaced.
+Recovery restores recorded originals from verified backups; a missing or
+unreadable backup is an error, never evidence that the original did not exist.
+If restoration cannot be verified, return 8 and retain the backups, manifest,
+and Mooney lock until reconciliation.
 
 | Cycle exit | Meaning |
 | --- | --- |
 | 0 | Candidate and ledger published; both pointers verified. |
 | 3 | Forward precondition/availability refused; no forward write attempted. |
-| 4 | Publication failed; both parent pointers verified after rollback. |
-| 8 | Unresolved divergence: pointer rollback or ledger restoration could not be verified. |
-| Other nonzero | Pre-swap failure, e.g. build, stage, lock or offline check. |
+| 4 | Publication failed; both parent pointers verified and any replaced ledger restored. |
+| 8 | Unresolved divergence or unavailable publication lock: pointer or ledger state requires reconciliation before retry. |
+| Other nonzero | Pre-swap failure, e.g. build, stage or offline check. |
 
 An exit 8 is not a successful rollback. Stop publication attempts until the
 actual pointer identities, any outstanding request, and ledger status are

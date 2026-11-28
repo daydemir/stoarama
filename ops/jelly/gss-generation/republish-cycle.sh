@@ -10,12 +10,93 @@ REPO=$1; G=$HOME/Build/stoarama/records/finish-plan-20261117/gss-delivery
 S=$REPO/backend/scripts/gss
 API='https://stoarama-api.onrender.com/api/v1/global-street-scores-delivery/asset?path=/public/metadata.json'
 LOCK=$HOME/.stoarama-gss-cycle.lock
-mkdir "$LOCK" || { echo "REFUSED: another republish cycle holds $LOCK" >&2; exit 6; }
+mkdir "$LOCK" || { echo "UNRESOLVED: publication lock unavailable at $LOCK; reconcile any prior cycle before retrying" >&2; exit 8; }
 armed=0
 ledger_tmp=
 ledger_started=0
 remote() {
   ssh -o BatchMode=yes jelly@jellys-mac-mini "cd ~/stoarama-gss-freeze && /usr/bin/python3 -I gss_gen.py $*"
+}
+ledger_records() {
+  python3 -I - "$1" "$ledger_tmp" "$G" <<'PY'
+import hashlib, json, os, pathlib, shutil, stat, sys, tempfile
+
+action, temp, dest = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+manifest = temp / 'manifest.json'
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+def digest(path):
+    try: mode = path.lstat().st_mode
+    except FileNotFoundError: return None
+    if not stat.S_ISREG(mode): raise OSError('ledger is not a regular file: ' + str(path))
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''): h.update(chunk)
+    return h.hexdigest()
+
+def copy_verified(source, target, expected):
+    # Copy into a sibling scratch file; a read/copy failure must not truncate
+    # the destination. Verify exact backup/candidate bytes before replace.
+    if expected is None: raise ValueError('missing expected ledger digest')
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix='.ledger-copy-')
+    os.close(fd)
+    scratch = pathlib.Path(name)
+    try:
+        shutil.copy2(source, scratch)
+        if digest(scratch) != expected: raise OSError('ledger copy differs: ' + str(source))
+        with scratch.open('rb') as f: os.fsync(f.fileno())
+        os.replace(scratch, target)
+        sync_dir(target.parent)
+    finally:
+        try: scratch.unlink()
+        except FileNotFoundError: pass
+
+if action == 'prepare':
+    records = {}
+    for source in sorted((temp / 'new').iterdir()):
+        name = source.name
+        candidate, original = digest(source), digest(dest / name)
+        if candidate is None: raise OSError('candidate ledger disappeared: ' + name)
+        if original is not None: copy_verified(dest / name, temp / 'old' / name, original)
+        records[name] = {'original': original, 'candidate': candidate}
+    if not records: raise ValueError('empty ledger manifest')
+    with manifest.open('x') as f:
+        json.dump(records, f, sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
+    sync_dir(temp)
+else:
+    records = json.loads(manifest.read_text())
+    if not records or set(records) != {x.name for x in (temp / 'new').iterdir()}:
+        raise ValueError('ledger manifest differs from prepared files')
+    failed = False
+    for name, record in records.items():
+        target = dest / name
+        try:
+            original, candidate = record['original'], record['candidate']
+            current = digest(target)
+            if action == 'publish':
+                if current != original: raise OSError('original ledger changed: ' + name)
+                copy_verified(temp / 'new' / name, target, candidate)
+            elif action == 'restore':
+                if current not in (None, original, candidate):
+                    raise OSError('unrelated ledger replacement: ' + name)
+                if original is not None:
+                    # Existence came from the durable manifest, not a
+                    # possibly unreadable backup directory at recovery time.
+                    copy_verified(temp / 'old' / name, target, original)
+                elif current is not None:
+                    target.unlink()
+                    sync_dir(dest)
+            else: raise ValueError('unknown ledger action')
+        except (OSError, ValueError, KeyError) as error:
+            print('ledger %s failed: %s' % (name, error), file=sys.stderr)
+            failed = True
+            if action == 'publish': break
+    if failed: sys.exit(1)
+PY
 }
 finish() {
   status=$1
@@ -27,7 +108,7 @@ finish() {
     done
     echo "PUBLISH FAILED; attempting conditional rollback $GEN -> $PREV" >&2
     if remote rollback "$ATTEMPT" "$GEN" "$PREV"; then
-      echo "ROLLBACK VERIFIED $PREV" >&2
+      echo "POINTER ROLLBACK VERIFIED $PREV" >&2
       status=4
     else
       echo "UNRESOLVED DIVERGENCE: unable to verify rollback $GEN -> $PREV" >&2
@@ -35,17 +116,12 @@ finish() {
     fi
   fi
   if [ "$ledger_started" = 1 ]; then
-    for f in "$ledger_tmp"/new/*; do
-      name=${f##*/}
-      if [ -e "$ledger_tmp/old/$name" ]; then
-        cp -p "$ledger_tmp/old/$name" "$G/$name" || status=8
-      else
-        rm -f "$G/$name" || status=8
-      fi
-    done
+    ledger_records restore || status=8
     if [ "$status" = 8 ]; then
       echo "Ledger recovery may be needed; backup retained at $ledger_tmp" >&2
-      ledger_tmp=
+      # Keep the local lock as well: pointer verification alone cannot
+      # establish that the previous ledger was recovered.
+      exit 8
     fi
   fi
   [ -z "$ledger_tmp" ] || rm -rf "$ledger_tmp"
@@ -159,12 +235,9 @@ else
   printf '%s\n' "$LINE" > "$ledger_tmp/new/best14-ledger-summary.txt"
 fi
 printf '%s\n' "Ledger status ($(date -u +%FT%TZ)): ledger files describe live gen $GEN, $AV/60 available (all post-swap gates passed)." > "$ledger_tmp/new/best14-ledger-STATUS.txt"
-for f in "$ledger_tmp"/new/*; do
-  name=${f##*/}
-  [ ! -e "$G/$name" ] || cp -p "$G/$name" "$ledger_tmp/old/$name"
-done
+ledger_records prepare
 ledger_started=1
-for f in "$ledger_tmp"/new/*; do cp "$f" "$G/${f##*/}"; done
+ledger_records publish
 remote verify "$GEN"
 # No fallible publication step after this point. Unarm together so a signal
 # cannot restore the ledger without also rolling back the pointers.

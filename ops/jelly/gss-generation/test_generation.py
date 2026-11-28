@@ -388,8 +388,18 @@ case "$command" in
   *"gss_gen.py verify "*)
     [ "$SCENARIO" != pending_at_start ] || exit 8
     [ "$SCENARIO" != preflight_disconnected ] || exit 255
-    if [ "$SCENARIO" = final_verify_failed ] && [ "$(grep -c 'gss_gen.py verify ' "$CALLS")" = 3 ]; then
-      exit 1
+    if [ "$(grep -c 'gss_gen.py verify ' "$CALLS")" = 3 ]; then
+      case "$SCENARIO" in
+        final_verify_failed) exit 1 ;;
+        backup_unavailable)
+          # Preserve the original backup, but make its expected directory
+          # inaccessible to file lookup even if the test runs as root.
+          for ledger in "$HOME"/Build/stoarama/records/finish-plan-20261117/gss-delivery/.gss-ledger.*; do
+            mv "$ledger/old" "$ledger/old-preserved"
+            : > "$ledger/old"
+          done
+          exit 1 ;;
+      esac
     fi
     test "$(cat "$STATE")" = "${command##* }" ;;
   *"gss_gen.py stage "*)
@@ -545,10 +555,25 @@ esac
         self.assertFalse((self.records / 'best14-ledger-STATUS.txt').exists())
         self.assertFalse((self.records / 'best14-ledger-summary.txt').exists())
 
+    def test_unavailable_backup_retains_ledger_and_requires_reconciliation(self):
+        p = self.run_cycle('backup_unavailable')
+        self.assertEqual(p.returncode, 8, p.stderr)
+        self.assertIn('backup retained', p.stderr)
+        self.assertEqual(self.state.read_text(), PARENT)
+        self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'new ledger')
+        backups = list(self.records.glob('.gss-ledger.*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / 'old-preserved/best14-ledger.tsv').read_text(), 'old ledger')
+        self.assertTrue((backups[0] / 'manifest.json').is_file())
+        self.assertTrue((self.home / '.stoarama-gss-cycle.lock').is_dir())
+        # A new cycle must not proceed while the ledger is unreconciled.
+        p = self.run_cycle('success')
+        self.assertEqual(p.returncode, 8, p.stderr)
+
     def test_lock_refuses_second_cycle(self):
         (self.home / '.stoarama-gss-cycle.lock').mkdir()
         p = self.run_cycle('success')
-        self.assertEqual(p.returncode, 6, p.stderr)
+        self.assertEqual(p.returncode, 8, p.stderr)
         self.assertFalse(self.calls.exists())
 
 
