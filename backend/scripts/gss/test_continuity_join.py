@@ -213,6 +213,7 @@ class ExactPlanTests(unittest.TestCase):
         self.assertFalse(C.verdict(dict(e, clock_after_raw=()))[0])
         self.assertFalse(C.verdict(dict(e, clock_before_raw=[BEFORE_RAW[0],['2026-09-19 2026-09-20 16:45:38']*3,BEFORE_RAW[-1]],clock_before_dates=(DATES[0],None,DATES[-1])))[0])
         self.assertFalse(C.verdict(dict(e, clock_before_raw=[BEFORE_RAW[0],['2026-09-19 16:45:38','2026-09-19 16:45:38','2026-09-20 16:45:38'],BEFORE_RAW[-1]]))[0])
+        self.assertFalse(C.verdict(dict(e, clock_before_raw=[BEFORE_RAW[0],BEFORE_RAW[1][:2],BEFORE_RAW[-1]]))[0])
         self.assertFalse(C.verdict(dict(e, clock_before_raw=[[t.replace('16:','04:')+' PM2.5' for t in texts] for texts in BEFORE_RAW]))[0])
         self.assertFalse(C.verdict(dict(e, clock_before=(BEFORE[0],None,BEFORE[-1]),
             clock_before_dates=(DATES[0],None,DATES[-1]),

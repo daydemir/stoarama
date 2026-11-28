@@ -380,7 +380,7 @@ def clock_frame_consensus(texts):
     """A contributing frame requires >=2 matching complete readings.
     Nonblank partial or contradictory OCR is retained and cannot be treated as absent.
     """
-    if not isinstance(texts, (list, tuple)) or not all(isinstance(t, str) for t in texts):
+    if not isinstance(texts, (list, tuple)) or len(texts) != len(CLOCK_THRESHOLDS) or not all(isinstance(t, str) for t in texts):
         return None, None, False
     nonblank = [t for t in texts if t.strip()]
     if len(nonblank) < 2:
@@ -476,7 +476,7 @@ def raw_clock_evidence_matches(ev):
         if not len(readings) == len(dates) == len(raw) == len(READ_AT_S):
             return False
         for pos, offset, date, texts in zip(READ_AT_S, readings, dates, raw):
-            if not isinstance(texts, (tuple,list)) or not all(isinstance(t,str) for t in texts):
+            if not isinstance(texts, (tuple,list)) or (texts and len(texts) != len(CLOCK_THRESHOLDS)) or not all(isinstance(t,str) for t in texts):
                 return False
             if offset is None:
                 if date is not None or any(t.strip() for t in texts):
