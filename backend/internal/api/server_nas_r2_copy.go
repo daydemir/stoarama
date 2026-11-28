@@ -374,7 +374,7 @@ func (s *Server) handleNASR2CopyLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	version, _ := nasRequestWorkVersion(r, nasConnectionCopy)
-	if nasFastCopyLine(version) {
+	if nasR2FastCopyLine(version) {
 		s.handleNASR2FastCopyLease(w, r, cid, req.VerifyExisting)
 		return
 	}
@@ -600,7 +600,7 @@ func (s *Server) nasR2CopyActive(w http.ResponseWriter, r *http.Request, purpose
 		util.WriteError(w, 409, "copy lease or policy expired")
 		return nil, t, version, req, false
 	}
-	if !allowStitchReplay && nasFastCopyLine(clientVersion) {
+	if !allowStitchReplay && nasR2FastCopyLine(clientVersion) {
 		fail()
 		util.WriteError(w, 409, "fast copy uses whole-object leases")
 		return nil, t, version, req, false

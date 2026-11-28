@@ -92,13 +92,18 @@ var nasCleanupDayModeVersions = []string{nasCleanupDayModesClientVersion, nasCle
 // Only these releases receive Keep Everything day permits (names mode).
 var nasCleanupDayKEVersions = []string{nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion, nasDayInventoryClientVersion}
 
-var nasFastCopyVersions = []string{nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion, nasDayInventoryClientVersion, nasInstalledReceiptClientVersion}
+var nasFastCopyVersions = []string{nasFastCopyClientVersion, nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion, nasDayInventoryClientVersion}
 
 // Only these releases receive day-directory permits.
 var nasCleanupDayVersions = []string{nasTunableCopyClientVersion, nasTunableDayClientVersion, nasCleanupDayModesClientVersion, nasCleanupDayKEClientVersion, nasOutputRestoreClientVersion, nasDayInventoryClientVersion}
 
 func nasFastCopyLine(version string) bool {
 	return slices.Contains(nasFastCopyVersions, version)
+}
+
+// Raw-copy protocol compatibility is separate from cleanup evidence eligibility.
+func nasR2FastCopyLine(version string) bool {
+	return nasFastCopyLine(version) || version == nasInstalledReceiptClientVersion
 }
 
 // These releases have raw-copy authority only.

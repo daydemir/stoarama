@@ -160,7 +160,7 @@ func (s *Server) handleNASR2FastCopyLease(w http.ResponseWriter, r *http.Request
 	var expires time.Time
 	var workers int
 	if err = tx.QueryRow(ctx, `SELECT client_version,clock_timestamp()+$2::integer*interval '1 second',r2_fast_copy_workers
- FROM connections WHERE id=$1`, cid, int(nasR2FastCopyLeaseTTL/time.Second)).Scan(&version, &expires, &workers); err != nil || !nasFastCopyLine(version) {
+ FROM connections WHERE id=$1`, cid, int(nasR2FastCopyLeaseTTL/time.Second)).Scan(&version, &expires, &workers); err != nil || !nasR2FastCopyLine(version) {
 		util.WriteError(w, 409, "copy session changed during admission")
 		return
 	}
@@ -235,7 +235,7 @@ func (s *Server) handleNASR2FastCopyResults(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	version, _ := nasRequestWorkVersion(r, nasConnectionCopy)
-	if !nasFastCopyLine(version) {
+	if !nasR2FastCopyLine(version) {
 		util.WriteError(w, 409, "fast copy release required")
 		return
 	}

@@ -535,10 +535,10 @@ func TestNASClientAdmissionModernNativeIdentity(t *testing.T) {
 
 func TestInstalledReceiptVersionReadOnlyAdmission(t *testing.T) {
 	v := nasInstalledReceiptClientVersion
-	if nasCleanupSupportsExecution(v) || nasCleanupSupportsGroupedExecution(v) || nasClientSupportsStitchProof(v) || slices.Contains(nasCleanupDayVersions, v) || slices.Contains(nasCleanupDayModeVersions, v) || slices.Contains(nasCleanupDayKEVersions, v) {
+	if nasCleanupSupportsExecution(v) || nasCleanupSupportsGroupedExecution(v) || nasClientSupportsStitchProof(v) || nasFastCopyLine(v) || SupportsNASStorageBudget(v) || slices.Contains(nasCleanupDayVersions, v) || slices.Contains(nasCleanupDayModeVersions, v) || slices.Contains(nasCleanupDayKEVersions, v) {
 		t.Fatal("receipt release gained cleanup or stitch capability")
 	}
-	if !nasFastCopyLine(v) || !nasLowMemoryRawCopyOnly(v) || !nasCopySupportsVersion(v) || !SupportsNASStorageBudget(v) || !slices.Contains(nasDayInventoryVersions, v) {
+	if !nasR2FastCopyLine(v) || !nasLowMemoryRawCopyOnly(v) || !nasCopySupportsVersion(v) || nasStorageBudgetVersion(v) != v || !slices.Contains(nasDayInventoryVersions, v) {
 		t.Fatal("receipt release lost existing read-only/copy eligibility")
 	}
 }
