@@ -124,7 +124,7 @@ func TestHeartbeatDropsInvalidHostFactsKeepsTelemetry(t *testing.T) {
 		t.Fatalf("release stability telemetry not persisted: %s", host)
 	}
 	receipt := strings.Repeat("b", 64)
-	call(fmt.Sprintf(`{"client_version":%q,"host":{"machine":"x86_64","release":{"candidate":false,"stable":true,"artifact_sha256":%q}}}`, nasInstalledReceiptClientVersion, receipt))
+	call(fmt.Sprintf(`{"client_version":%q,"client_phase":"idle","client_previous_exit":"self_update","host":{"machine":"x86_64","release":{"candidate":false,"stable":true,"artifact_sha256":%q}}}`, nasInstalledReceiptClientVersion, receipt))
 	_, _, host = read()
 	facts = nasHostFacts{}
 	if err := json.Unmarshal(host, &facts); err != nil || facts.Release == nil || facts.Release.ArtifactSHA256 != receipt {
