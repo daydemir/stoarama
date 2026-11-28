@@ -1664,6 +1664,27 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(final.stat().st_ino, before.st_ino)
             self.assertEqual(list(final.parent.iterdir()), [final])
 
+    def test_directory_conflict_refuses_without_leaking_descriptors(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg, final, clip = self.raw_publication_fixture(raw)
+            final.mkdir()
+            retained = final / "retained"
+            retained.write_bytes(b"retained")
+            before = final.stat()
+            descriptors = len(os.listdir("/dev/fd"))
+            with mock.patch.object(pull, "request_json") as request, mock.patch.object(
+                pull, "release_clip"
+            ) as release:
+                for _ in range(32):
+                    with self.assertRaises(pull.ExistingFileMismatch):
+                        pull.process_clip(cfg, clip)
+                    self.assertEqual(len(os.listdir("/dev/fd")), descriptors)
+            request.assert_not_called()
+            release.assert_not_called()
+            self.assertEqual(final.stat().st_ino, before.st_ino)
+            self.assertEqual(retained.read_bytes(), b"retained")
+            self.assertEqual(list(final.parent.iterdir()), [final])
+
     def test_ordinary_raw_download_preserves_retained_legacy_partial_links(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg, final, clip = self.raw_publication_fixture(raw)

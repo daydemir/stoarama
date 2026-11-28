@@ -25404,14 +25404,14 @@ def verify_raw_entry(parent, name, expected_bytes, expected_sha):
         descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     except FileNotFoundError:
         return None
-    with os.fdopen(descriptor, "rb") as source:
+    try:
         before = os.fstat(descriptor)
         if not stat_module.S_ISREG(before.st_mode) or before.st_size != expected_bytes:
             raise ExistingFileMismatch("existing raw file conflicts; preserved: %s" % name)
         digest = hashlib.sha256()
         written = 0
         while True:
-            chunk = source.read(1024 * 1024)
+            chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
@@ -25424,7 +25424,9 @@ def verify_raw_entry(parent, name, expected_bytes, expected_sha):
                 or certification_identity(after) != certification_identity(named)
                 or written != expected_bytes or digest.hexdigest() != expected_sha):
             raise ExistingFileMismatch("existing raw file conflicts; preserved: %s" % name)
-    return after
+        return after
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
