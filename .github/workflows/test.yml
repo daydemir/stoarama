@@ -59,6 +59,8 @@ jobs:
         run: python -m unittest discover -s ops/rolly/finish-deadman -p 'test_*.py' -q
       - name: Test Mooney GSS uptime probe against a local server
         run: python -m unittest discover -s ops/mooney/gss-uptime -p 'test_*.py' -q
+      - name: Test GSS publication and conditional rollback without production access
+        run: python -I -B ops/jelly/gss-generation/test_generation.py -v
       - name: Test supervised Jelly cleanup runner without production access
         run: python -m unittest discover -s ops/jelly/cleanup-runner -p 'test_*.py' -q
       - name: Test operator R2 conditional-delete probe without production access
