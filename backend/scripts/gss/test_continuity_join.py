@@ -250,6 +250,13 @@ class BuildTests(unittest.TestCase):
             with mock.patch.object(C.subprocess,'run',side_effect=with_ocr):
                 self.assertEqual(C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d),(45296,'2026-09-19','2026-09-19 12:34:56'))
                 self.assertEqual(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d),(None,None,None))
+            def date_only(args, **kwargs):
+                if args[0] == 'tesseract':
+                    return subprocess.CompletedProcess(args,0,stdout='27.Sep 2026',stderr='')
+                return actual_run(args, **kwargs)
+            with mock.patch.object(C.subprocess,'run',side_effect=date_only):
+                got=C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d)
+                self.assertIsNone(got[0]); self.assertEqual(got[1],'2026-09-27'); self.assertIn('27.Sep 2026',got[2])
 
     def test_join_keeps_audio_and_duration_and_the_ledger_reads_its_proof(self):
         with tempfile.TemporaryDirectory() as d:

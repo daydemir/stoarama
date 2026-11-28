@@ -318,18 +318,28 @@ def read_clock(src, t, crop, tmp, etag=None):
                        capture_output=True, timeout=300, check=True)
         if not os.path.exists(raw):
             return None, None, None
-        only_time = (None, None, None)
+        observed_times, observed_days, texts = set(), set(), []
         for th in CLOCK_THRESHOLDS:
             png = f'{raw}.{th}.png'
             subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-i', raw, '-vf', f'lutyuv=y=if(gt(val\\,{th})\\,0\\,255)', '-y', png],
                            capture_output=True, timeout=60, check=True)
             text = subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True, text=True, timeout=60, check=True).stdout
+            if text.strip():
+                texts.append(text)
             c, day = parse_clock(text), parse_display_date(text)
+            if c is not None:
+                observed_times.add(c)
+            if day is not None:
+                observed_days.add(day)
+            if len(observed_times) > 1 or len(observed_days) > 1:
+                return None, None, '\n'.join(texts)
             if c is not None and day is not None:
                 return c, day, text
-            if only_time[0] is None and c is not None:
-                only_time = (c, day, text)
-        return only_time
+        # A date-only (or other nonblank) observation is not a blank frame.
+        # Preserve it so a later positive cannot silently discard a contrary day.
+        return (next(iter(observed_times),None), next(iter(observed_days),None),
+                '\n'.join(texts) if texts else None)
+
 
 def parse_clock_token(txt):
     """(seconds, unambiguous hour mode). Preserve token boundaries and AM/PM."""
