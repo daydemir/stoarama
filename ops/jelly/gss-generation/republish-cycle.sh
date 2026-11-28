@@ -195,7 +195,7 @@ for smoke in viewer_smoke.py download_smoke.py; do
 done
 D8=gen-ledger-$(echo "$GEN" | cut -c1-8)
 rsync -a "$OUT/generation/" "jelly@jellys-mac-mini:stoarama-gss-freeze/$D8/"
-if ssh -o BatchMode=yes jelly@jellys-mac-mini "cd ~/stoarama-gss-freeze || exit 1; /usr/bin/python3 -I gss_gen.py stage $D8 > stage-$D8.log 2>&1; status=\$?; tail -3 stage-$D8.log || :; exit \"\$status\""; then
+if ssh -o BatchMode=yes jelly@jellys-mac-mini "cd ~/stoarama-gss-freeze || exit 1; /usr/bin/python3 -I gss_gen.py stage $D8 > stage-$D8.log 2>&1; stage_rc=\$?; tail -3 stage-$D8.log || :; exit \"\$stage_rc\""; then
   :
 else
   status=$?
