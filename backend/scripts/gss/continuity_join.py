@@ -105,8 +105,10 @@ def read_clock_profiles(path):
 PROFILE_WIDTH = 1920
 CLOCK_CROPS = read_clock_profiles(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clock-profiles.tsv'))
 CLOCK_THRESHOLDS = (190, 150, 220)
-CLOCK_RX = (re.compile(r'([0-2]?\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)(?!\d)(AM|PM)?'),
-            re.compile(r'([0-2]?\d):([0-5]\d)([0-5]\d)(?!\d)(AM|PM)?'))
+CLOCK_RX = (
+    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?)?', re.IGNORECASE),
+    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?)?', re.IGNORECASE),
+)
 
 # Collation split reasons that are themselves a time or stream discontinuity.
 JOINABLE_REASONS = frozenset({'frame_jump', 'packet_replay', 'frame_overlap', 'frame_low_motion'})
@@ -310,8 +312,8 @@ def read_clock(src, t, crop, tmp, etag=None):
                         '-vf', f'scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray', '-y', raw],
                        capture_output=True, timeout=300, check=True)
         if not os.path.exists(raw):
-            return None, None
-        only_time = None
+            return None, None, None
+        only_time = (None, None, None)
         for th in CLOCK_THRESHOLDS:
             png = f'{raw}.{th}.png'
             subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-i', raw, '-vf', f'lutyuv=y=if(gt(val\\,{th})\\,0\\,255)', '-y', png],
@@ -319,21 +321,31 @@ def read_clock(src, t, crop, tmp, etag=None):
             text = subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True, text=True, timeout=60, check=True).stdout
             c, day = parse_clock(text), parse_display_date(text)
             if c is not None and day is not None:
-                return c, day
-            if only_time is None and c is not None:
-                only_time = c
-        return only_time, None
+                return c, day, text
+            if only_time[0] is None and c is not None:
+                only_time = (c, day, text)
+        return only_time
+
+def parse_clock_token(txt):
+    """(seconds, unambiguous hour mode). Preserve token boundaries and AM/PM."""
+    txt = txt.replace('O', '0').replace('o', '0')
+    got = []
+    for rx in CLOCK_RX:
+        for h, mi, sec, period in rx.findall(txt):
+            h = int(h)
+            if period:
+                if not 1 <= h <= 12:
+                    continue
+                h = h % 12 + (12 if period.lower() == 'p' else 0)
+                got.append((h * 3600 + int(mi) * 60 + int(sec), True))
+            elif h < 24:
+                got.append((h * 3600 + int(mi) * 60 + int(sec), h == 0 or h >= 13))
+    return got[0] if len(got) == 1 else (None, False)
+
 
 def parse_clock(txt):
-    """Seconds of day of the last H:MM:SS or HH:MM:SS (12-hour with AM/PM, or 24-hour) in OCR text, or None."""
-    txt = txt.replace(' ', '').replace('O', '0').replace('o', '0').strip()
-    for rx in CLOCK_RX:
-        m = rx.findall(txt)
-        if m:
-            h, mi, sec, ap = m[-1]
-            h = int(h) % 12 + (12 if ap == 'PM' else 0) if ap else int(h)
-            return h * 3600 + int(mi) * 60 + int(sec) if h < 24 else None
-    return None
+    """Time-of-day discovery; clock proof additionally requires an exact mode."""
+    return parse_clock_token(txt)[0]
 
 
 def parse_display_date(text):
@@ -401,11 +413,13 @@ def seam_evidence(row):
         with tempfile.TemporaryDirectory() as tmp:
             br = [read_clock(prev_src, pm.duration_s - d, crop, tmp, pe) for d in READ_AT_S]
             ar = [read_clock(next_src, d, crop, tmp, ne) for d in READ_AT_S]
-            before = [None if c is None else round(c+d,3) for (c,_),d in zip(br,READ_AT_S)]
-            after = [None if c is None else round(c-d,3) for (c,_),d in zip(ar,READ_AT_S)]
-            bd, ad = tuple(day for _,day in br), tuple(day for _,day in ar)
-        out.update(clock_before=before, clock_after=after, clock_before_dates=bd, clock_after_dates=ad)
-        if clock_check(Seam('', 0.0, 0.0, before=tuple(before), after=tuple(after), before_dates=bd, after_dates=ad))[0] is None:
+            before = [None if c is None else round(c+d,3) for (c,_,_),d in zip(br,READ_AT_S)]
+            after = [None if c is None else round(c-d,3) for (c,_,_),d in zip(ar,READ_AT_S)]
+            bd, ad = tuple(day for _,day,_ in br), tuple(day for _,day,_ in ar)
+        out.update(clock_before=before, clock_after=after, clock_before_dates=bd, clock_after_dates=ad,
+                   clock_before_raw=[raw for _,_,raw in br], clock_after_raw=[raw for _,_,raw in ar])
+        if (clock_check(Seam('', 0.0, 0.0, before=tuple(before), after=tuple(after), before_dates=bd, after_dates=ad))[0] is None
+                and raw_clock_evidence_matches(out)):
             out['frame_ratio'] = frame_ratio(gray_frames(prev_src, pm.duration_s - FRAME_DIFF_HALF_S, FRAME_DIFF_HALF_S + 1, pe),
                                              gray_frames(next_src, 0, FRAME_DIFF_HALF_S, ne))
     except Exception as e:  # recorded, and decide() keeps the seam split
@@ -426,6 +440,27 @@ def seam_of(ev):
                 tuple(ev.get('clock_before_dates', ())), tuple(ev.get('clock_after_dates', ())))
 
 
+def raw_clock_evidence_matches(ev):
+    """A positive decision is reproducible from the exact OCR strings, not an inferred hour mode."""
+    for side, sign in (('before', 1), ('after', -1)):
+        readings = ev.get('clock_' + side, ())
+        dates = ev.get('clock_' + side + '_dates', ())
+        raw = ev.get('clock_' + side + '_raw', ())
+        if not len(readings) == len(dates) == len(raw) == len(READ_AT_S):
+            return False
+        for pos, offset, date, text in zip(READ_AT_S, readings, dates, raw):
+            if offset is None:
+                if date is not None:
+                    return False
+                continue
+            if not isinstance(text, str):
+                return False
+            seconds, mode = parse_clock_token(text)
+            if seconds is None or not mode or parse_display_date(text) != date or round(seconds + sign*pos,3) != offset:
+                return False
+    return True
+
+
 def verdict(ev):
     if ev['recording_id'] not in CLOCK_CROPS:
         return False, KeepReason.NO_CLOCK_PROFILE, None
@@ -435,7 +470,10 @@ def verdict(ev):
         return False, KeepReason.EVIDENCE_FAILED, None
     if keep is None and (seam.prev is None or seam.next is None):
         return False, KeepReason.EVIDENCE_FAILED, None
-    return decide(seam)
+    join, why, delta = decide(seam)
+    if join and not raw_clock_evidence_matches(ev):
+        return False, KeepReason.CLOCK_INCONSISTENT, None
+    return join, why, delta
 
 
 # ---- plan --------------------------------------------------------------------
