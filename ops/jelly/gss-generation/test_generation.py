@@ -379,6 +379,7 @@ class CycleTests(unittest.TestCase):
         self.calls = self.home / 'calls'
         self.state = self.home / 'state'
         self.state.write_text(PARENT)
+        (self.home / 'stoarama-gss-freeze').mkdir()
         # Every network command is replaced, and mock Python delegates only
         # the pure inline JSON parsing to the real interpreter.
         self.fake('ssh', '''
@@ -391,7 +392,15 @@ case "$command" in
       exit 1
     fi
     test "$(cat "$STATE")" = "${command##* }" ;;
-  *"gss_gen.py stage "*) echo staged ;;
+  *"gss_gen.py stage "*)
+    case "$SCENARIO" in
+      stage_unresolved|stage_failed)
+        # Run the actual remote shell status handling, substituting only
+        # its external Python command with a disposable fixture executable.
+        printf '%s\n' "$4" | sed 's#/usr/bin/python3#remote-stage-python3#g' | sh ;;
+      stage_disconnected) exit 255 ;;
+      *) echo staged ;;
+    esac ;;
   *"gss_gen.py swap "*)
     [ "$SCENARIO" != refused ] || exit 3
     [ "$SCENARIO" != delayed ] || exit 255
@@ -404,6 +413,14 @@ case "$command" in
 esac
 ''')
         self.fake('curl', '''printf '%s' '{"streams":[{"availability":"available"}]}'\n''')
+        self.fake('remote-stage-python3', '''
+if [ "$SCENARIO" = stage_unresolved ]; then
+  echo 'UNRESOLVED DIVERGENCE: publication lock unavailable'
+  exit 8
+fi
+echo 'fixture stage failed before swap'
+exit 2
+''')
         self.fake('rsync', 'exit 0\n')
         self.fake('sleep', 'exit 0\n')
         self.fake('python3', f'''
@@ -500,6 +517,17 @@ esac
                 self.assertEqual(p.returncode, 8, p.stderr)
                 self.assertIn('UNRESOLVED DIVERGENCE', p.stderr)
                 self.assertNotIn('gss_gen.py swap', self.calls.read_text())
+                self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
+
+    def test_stage_status_survives_both_shell_layers(self):
+        for scenario, expected in (('stage_unresolved', 8), ('stage_disconnected', 8), ('stage_failed', 5)):
+            with self.subTest(scenario=scenario):
+                p = self.run_cycle(scenario)
+                self.assertEqual(p.returncode, expected, p.stderr)
+                if expected == 8:
+                    self.assertIn('UNRESOLVED DIVERGENCE', p.stderr)
+                self.assertNotIn('gss_gen.py swap', self.calls.read_text())
+                self.assertEqual(self.state.read_text(), PARENT)
                 self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
 
     def test_success_publishes_ledger(self):

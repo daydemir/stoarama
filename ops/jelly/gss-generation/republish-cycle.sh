@@ -115,7 +115,17 @@ for smoke in viewer_smoke.py download_smoke.py; do
 done
 D8=gen-ledger-$(echo "$GEN" | cut -c1-8)
 rsync -a "$OUT/generation/" "jelly@jellys-mac-mini:stoarama-gss-freeze/$D8/"
-ssh -o BatchMode=yes jelly@jellys-mac-mini "cd ~/stoarama-gss-freeze && /usr/bin/python3 -I gss_gen.py stage $D8 > stage-$D8.log 2>&1 || { tail -3 stage-$D8.log; exit 1; }; tail -1 stage-$D8.log" || { echo "STAGE FAILED $GEN; nothing swapped"; exit 5; }
+if ssh -o BatchMode=yes jelly@jellys-mac-mini "cd ~/stoarama-gss-freeze || exit 1; /usr/bin/python3 -I gss_gen.py stage $D8 > stage-$D8.log 2>&1; status=\$?; tail -3 stage-$D8.log || :; exit \"\$status\""; then
+  :
+else
+  status=$?
+  if [ "$status" = 8 ] || [ "$status" = 255 ]; then
+    echo "UNRESOLVED DIVERGENCE: staging could not establish a safe publication state" >&2
+    exit 8
+  fi
+  echo "STAGE FAILED $GEN; nothing swapped" >&2
+  exit 5
+fi
 # Arm BEFORE SSH: a disconnect may happen after a successful remote write.
 armed=1
 if remote swap "$ATTEMPT" "$PREV" "$GEN"; then
