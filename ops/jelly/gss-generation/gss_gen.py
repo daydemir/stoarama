@@ -193,8 +193,12 @@ def record_attempt(attempt, parent, candidate, *, cancel):
     sync_directory(H)
     path = directory / (generation_id(attempt) + '.json')
     identity = {'parent': generation_id(parent), 'candidate': generation_id(candidate)}
-    if path.exists():
-        prior = json.loads(path.read_text())
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        raw = None
+    if raw is not None:
+        prior = json.loads(raw)
         if (not isinstance(prior, dict) or type(prior.get('cancelled')) is not bool
                 or prior not in (dict(identity, cancelled=False), dict(identity, cancelled=True))):
             raise RuntimeError('publication attempt belongs to a different pair or is invalid')
@@ -208,9 +212,11 @@ def record_attempt(attempt, parent, candidate, *, cancel):
 
 def transition_state():
     path = Path(H) / 'generation-transition.json'
-    if not path.exists():
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
         return None
-    value = json.loads(path.read_text())
+    value = json.loads(raw)
     if (not isinstance(value, dict) or set(value) != {'attempt', 'parent', 'candidate', 'pending'}
             or value['pending'] not in (None, 'current', 'pin')):
         raise RuntimeError('invalid publication transition state')
@@ -264,7 +270,7 @@ def guarded_pointer_write(owner, kind, write):
     return result
 
 
-def rollback(attempt, candidate, parent):
+def rollback(attempt, candidate, parent, *, initialize=None):
     try:
         record_attempt(attempt, parent, candidate, cancel=True)
     except FAILURES as error:
@@ -272,6 +278,12 @@ def rollback(attempt, candidate, parent):
         return 8
     try:
         require_no_pending_write()
+        if initialize is not None:
+            initialize()
+    except FAILURES as error:
+        print('UNRESOLVED DIVERGENCE: rollback cannot initialize or prove an idle transition:', error, file=sys.stderr)
+        return 8
+    try:
         bodies = {candidate: staged(candidate), parent: staged(parent)}
         if registry(bodies[candidate]).get('parent_generation') != parent:
             raise RuntimeError('candidate was not built from expected parent')
@@ -371,8 +383,14 @@ def stage(directory):
     print(json.dumps({'generation': gen, 'uploaded_or_present': len(ups), 'holds_added': len(vals), 'objects_held': len(objs)}))
 
 
-def main(args):
+def initialize_clients():
     global E, B, EP
+    E = r2env()
+    B = E['R2_BUCKET']
+    EP = 'https://%s.r2.cloudflarestorage.com' % E['R2_ACCOUNT_ID']
+
+
+def main(args):
     if len(args) == 2 and args[0] in ('stage', 'verify'):
         step, arg = args
         if step == 'verify':
@@ -388,19 +406,28 @@ def main(args):
         raise SystemExit('usage: gss_gen.py stage DIR | verify ID | swap ATTEMPT PARENT CANDIDATE | rollback ATTEMPT CANDIDATE PARENT')
     # All supported Jelly operations share a lock; it is released by the OS
     # even if the process dies. Never unlink the lock file.
-    with open(os.path.join(H, 'generation.lock'), 'a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        lock = open(os.path.join(H, 'generation.lock'), 'a')
+    except OSError as error:
+        print('UNRESOLVED DIVERGENCE: publication lock unavailable:', error, file=sys.stderr)
+        return 8
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError as error:
+            print('UNRESOLVED DIVERGENCE: publication lock unavailable:', error, file=sys.stderr)
+            return 8
+        # Cancellation must be durable even if the credentials are missing.
+        if step == 'rollback':
+            return rollback(attempt, arg, target, initialize=initialize_clients)
         # Read local uncertainty before initializing any external client. A
         # missing credential cannot disguise an already-recorded unsafe state.
-        if step != 'rollback':
-            try:
-                require_no_pending_write()
-            except UnresolvedWrite as error:
-                print(error, file=sys.stderr)
-                return 8
-        E = r2env()
-        B = E['R2_BUCKET']
-        EP = 'https://%s.r2.cloudflarestorage.com' % E['R2_ACCOUNT_ID']
+        try:
+            require_no_pending_write()
+        except UnresolvedWrite as error:
+            print(error, file=sys.stderr)
+            return 8
+        initialize_clients()
         if step == 'stage':
             stage(arg)
         elif step == 'verify':
@@ -409,10 +436,8 @@ def main(args):
             except UnresolvedWrite as error:
                 print(error, file=sys.stderr)
                 return 8
-        elif step == 'swap':
-            return swap(attempt, arg, target)
         else:
-            return rollback(attempt, arg, target)
+            return swap(attempt, arg, target)
     return 0
 
 

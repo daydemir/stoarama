@@ -35,7 +35,9 @@ write.
 The controller supplies a fresh UUID (32 lowercase hex characters) for each
 attempt. Under `generation.lock`, Jelly durably records the exact parent and
 candidate before a swap can write either pointer. A rollback first durably
-cancels that attempt, **even if both pointers still name the parent**. An
+cancels that attempt, before initializing external clients and **even if
+both pointers still name the parent**. A failed client initialization is
+unresolved, not a successful rollback. An
 original SSH command delayed behind the rollback cannot start later. The
 `generation-attempts/` records must be retained; IDs cannot be reused, and a
 cancelled ID cannot be rebound to a different pair. Mooney records each ID and
@@ -58,7 +60,8 @@ request has drained. Verification, rollback and subsequent publication
 remain blocked while the pending marker exists. A delayed write could still
 arrive and change a pointer; recovery must account for that uncertainty at
 the destination, not restore the old ETag or report success based on a
-point-in-time read.
+point-in-time read. Durable records are read directly: only a missing file
+counts as absent, not a filesystem I/O or permission error.
 
 The cycle also holds a Mooney-local lock across the build, swaps, gates, and
 ledger publication. It arms rollback before invoking the remote swap, so a

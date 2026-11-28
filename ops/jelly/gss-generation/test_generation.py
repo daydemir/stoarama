@@ -1,6 +1,7 @@
 """Offline tests: object storage and SQL are in-memory, shell commands are fakes."""
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import gzip
 import hashlib
 import importlib.util
@@ -249,6 +250,63 @@ class PointerTests(unittest.TestCase):
             self.assertEqual(gss.main(['swap', ATTEMPT, PARENT, CANDIDATE]), 8)
         self.assertEqual(self.store.state(), (PARENT, PARENT))
 
+    def test_filesystem_error_cannot_hide_pending_write(self):
+        self.store.delay_put = True
+        self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
+        original_stat, original_read = Path.stat, Path.read_text
+
+        def bad_stat(path, *args, **kwargs):
+            if path.name == 'generation-transition.json':
+                raise OSError(errno.EIO, 'fixture stat failure')
+            return original_stat(path, *args, **kwargs)
+
+        def bad_read(path, *args, **kwargs):
+            if path.name == 'generation-transition.json':
+                raise OSError(errno.EIO, 'fixture read failure')
+            return original_read(path, *args, **kwargs)
+
+        with patch.object(gss, 'r2env', side_effect=AssertionError('unresolved must not initialize storage')):
+            with patch.object(Path, 'stat', bad_stat):
+                self.assertEqual(gss.main(['verify', PARENT]), 8)
+            with patch.object(Path, 'read_text', bad_read):
+                self.assertEqual(gss.main(['verify', PARENT]), 8)
+                self.assertEqual(gss.main(['swap', ATTEMPT, PARENT, CANDIDATE]), 8)
+        self.store.finish_outstanding_put()
+        self.assertEqual(self.store.state(), (CANDIDATE, PARENT))
+        self.assertEqual(gss.transition_state()['pending'], 'current')
+
+    def test_unreadable_attempt_record_cannot_be_replaced(self):
+        self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 0)
+        original_read = Path.read_text
+
+        def bad_read(path, *args, **kwargs):
+            if path.name == ATTEMPT + '.json':
+                raise OSError(errno.EIO, 'fixture attempt read failure')
+            return original_read(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', bad_read):
+            self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 8)
+            self.assertEqual(gss.rollback(ATTEMPT, CANDIDATE, PARENT), 8)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
+        self.assertTrue(json.loads((Path(gss.H) / 'generation-attempts' / (ATTEMPT + '.json')).read_text())['cancelled'])
+
+    def test_rollback_cancels_delayed_swap_even_if_client_init_fails(self):
+        with patch.object(gss, 'r2env', side_effect=OSError('fixture credential unavailable')):
+            self.assertEqual(gss.main(['rollback', ATTEMPT, CANDIDATE, PARENT]), 8)
+        self.assertTrue(json.loads((Path(gss.H) / 'generation-attempts' / (ATTEMPT + '.json')).read_text())['cancelled'])
+        with patch.object(gss, 'r2env', return_value={'R2_BUCKET': 'fake', 'R2_ACCOUNT_ID': 'fake'}):
+            self.assertEqual(gss.main(['swap', ATTEMPT, PARENT, CANDIDATE]), 3)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
+
+    def test_unavailable_lock_cannot_report_clean_verification(self):
+        with patch.object(gss.fcntl, 'flock', side_effect=OSError(errno.EIO, 'fixture lock failure')), \
+             patch.object(gss, 'r2env', side_effect=AssertionError('unavailable lock must block initialization')):
+            self.assertEqual(gss.main(['verify', PARENT]), 8)
+            self.assertEqual(gss.main(['swap', ATTEMPT, PARENT, CANDIDATE]), 8)
+            self.assertEqual(gss.main(['rollback', ATTEMPT, CANDIDATE, PARENT]), 8)
+        self.assertEqual(self.store.state(), (PARENT, PARENT))
+
     def test_current_body_must_match_staged(self):
         self.store.objects[gss.CURRENT] = body(PARENT, OTHER)
         self.assertEqual(gss.swap(ATTEMPT, PARENT, CANDIDATE), 3)
@@ -328,6 +386,7 @@ command=$*
 case "$command" in
   *"gss_gen.py verify "*)
     [ "$SCENARIO" != pending_at_start ] || exit 8
+    [ "$SCENARIO" != preflight_disconnected ] || exit 255
     if [ "$SCENARIO" = final_verify_failed ] && [ "$(grep -c 'gss_gen.py verify ' "$CALLS")" = 3 ]; then
       exit 1
     fi
@@ -435,11 +494,13 @@ esac
         self.assertNotIn('gss_gen.py rollback', self.calls.read_text())
 
     def test_pending_remote_preflight_keeps_unresolved_exit_status(self):
-        p = self.run_cycle('pending_at_start')
-        self.assertEqual(p.returncode, 8, p.stderr)
-        self.assertIn('UNRESOLVED DIVERGENCE', p.stderr)
-        self.assertNotIn('gss_gen.py swap', self.calls.read_text())
-        self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
+        for scenario in ('pending_at_start', 'preflight_disconnected'):
+            with self.subTest(scenario=scenario):
+                p = self.run_cycle(scenario)
+                self.assertEqual(p.returncode, 8, p.stderr)
+                self.assertIn('UNRESOLVED DIVERGENCE', p.stderr)
+                self.assertNotIn('gss_gen.py swap', self.calls.read_text())
+                self.assertEqual((self.records / 'best14-ledger.tsv').read_text(), 'old ledger')
 
     def test_success_publishes_ledger(self):
         p = self.run_cycle('success')

@@ -100,7 +100,7 @@ if remote verify "$PREV"; then
   :
 else
   status=$?
-  if [ "$status" = 8 ]; then
+  if [ "$status" = 8 ] || [ "$status" = 255 ]; then
     echo "UNRESOLVED DIVERGENCE: prior publication requires reconciliation" >&2
     exit 8
   fi
