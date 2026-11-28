@@ -19,10 +19,11 @@ VIDEO = ('h264', 'High', '1920', '1080', 'yuv420p', '25/1', '1/12800', 'SHA256:a
 AUDIO = ('aac', '44100', '1', '1/44100', 'SHA256:bb')
 MEDIA = C.Media(VIDEO, AUDIO, 0.0, 300.0, 0.04)
 CLOCK = (60338.5, 60338.5, 60338.5)
+DATES = ("2026-09-19",) * 3
 
 
-def seam(reason='frame_jump', gap=0.0, before=CLOCK, after=CLOCK, ratio=0.9, prev=MEDIA, nxt=MEDIA, span=300.0):
-    return C.Seam(reason, gap, span, prev, nxt, tuple(before), tuple(after), ratio)
+def seam(reason='frame_jump', gap=0.0, before=CLOCK, after=CLOCK, ratio=0.9, prev=MEDIA, nxt=MEDIA, span=300.0, before_dates=DATES, after_dates=DATES):
+    return C.Seam(reason, gap, span, prev, nxt, tuple(before), tuple(after), ratio, before_dates, after_dates)
 
 
 class RuleTests(unittest.TestCase):
@@ -62,6 +63,15 @@ class RuleTests(unittest.TestCase):
         self.assertFalse(C.decide(seam(before=frozen_before, after=frozen_after))[0])
         self.assertFalse(C.decide(seam(before=(60350.5, 60338.5, 60338.5)))[0])
         self.assertTrue(C.decide(seam(before=(60338.5, None, 60338.5)))[0])
+
+    def test_date_skip_and_unreadable_date_cannot_join(self):
+        self.assertEqual(C.parse_display_date('2026-09-19 16:45:38'),'2026-09-19')
+        self.assertEqual(C.parse_display_date('19/09/26 16:45:38'),'2026-09-19')
+        self.assertEqual(C.parse_display_date('09-19-2026 16:45:38'),'2026-09-19')
+        self.assertIsNone(C.parse_display_date('08-05-2026 16:45:38'))
+        self.assertIsNone(C.parse_display_date('16:45:38'))
+        self.assertEqual(C.decide(seam(after_dates=('2026-09-20',)*3))[:2], (False,K.CLOCK_DATE_UNPROVEN))
+        self.assertEqual(C.decide(seam(after_dates=(None,)*3))[:2], (False,K.CLOCK_DATE_UNPROVEN))
 
     def test_media_and_timing_must_match(self):
         other = C.Media(VIDEO[:7] + ('SHA256:cc',), AUDIO, 0.0, 300.0, 0.04)
@@ -156,7 +166,7 @@ class ExactPlanTests(unittest.TestCase):
                    'order_ok': 'True', 'wall_span_seconds': '300'} for i in (1, 2, 3)]
         rows = C.plan(ledger, seams, source, 433, registry)
         decisions = [dict(r, prev_media=dataclasses.asdict(MEDIA), next_media=dataclasses.asdict(MEDIA),
-                          clock_before=CLOCK, clock_after=CLOCK, frame_ratio=.5, join=True,
+                          clock_before=CLOCK, clock_after=CLOCK, clock_before_dates=DATES, clock_after_dates=DATES, frame_ratio=.5, join=True,
                           keep_reason=None, clock_delta_s=0.0) for r in rows]
         return rows, decisions, ledger, seams, source, registry
 
@@ -204,11 +214,11 @@ class BuildTests(unittest.TestCase):
             actual_run = subprocess.run
             def with_ocr(args, **kwargs):
                 if args[0] == 'tesseract':
-                    return subprocess.CompletedProcess(args, 0, stdout='12:34:56', stderr='')
+                    return subprocess.CompletedProcess(args, 0, stdout='2026-09-19 12:34:56', stderr='')
                 return actual_run(args, **kwargs)
             with mock.patch.object(C.subprocess,'run',side_effect=with_ocr):
-                self.assertEqual(C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d),45296)
-                self.assertIsNone(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d))
+                self.assertEqual(C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d),(45296,'2026-09-19'))
+                self.assertEqual(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d),(None,None))
 
     def test_join_keeps_audio_and_duration_and_the_ledger_reads_its_proof(self):
         with tempfile.TemporaryDirectory() as d:
@@ -233,7 +243,7 @@ class BuildTests(unittest.TestCase):
                 row = {'generation': 'a' * 32, 'recording_id': 433, 'local_date': '2026-09-19', 'delivery_hour': 3,
                        'hour_id': 'h-1', 'seam': i+1, 'served': 3, 'collation_reason': 'frame_jump', 'db_gap_s': 0,
                        'prev_span_s': 300, 'prev_media': dataclasses.asdict(MEDIA), 'next_media': dataclasses.asdict(MEDIA),
-                       'clock_before': CLOCK, 'clock_after': CLOCK, 'frame_ratio': .5, 'join': True,
+                       'clock_before': CLOCK, 'clock_after': CLOCK, 'clock_before_dates': DATES, 'clock_after_dates': DATES, 'frame_ratio': .5, 'join': True,
                        'keep_reason': None, 'clock_delta_s': 0.0}
                 for side, x in (('prev', prev), ('next', nxt)):
                     row.update({f'{side}_{k}': v for k, v in C.source_identity(registry, x['file_id'], x['key'], 433).items()})

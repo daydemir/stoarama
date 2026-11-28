@@ -8,7 +8,7 @@ time.. but otherwise do relaly want things as stitched as possible". The rule
 ALL of these hold:
   - the burned-in clock offset (clock reading minus seam-relative file time) agrees
     within CLOCK_TOLERANCE_S across the seam, each side must have readable nearest and farthest frames showing an advancing
-    clock with all readable offsets agreeing; nearest offsets also agree;
+    clock with all readable offsets agreeing and same unambiguous displayed day; nearest offsets also agree;
   - codec, resolution, fps, timebase (and the codec extradata, which stream copy
     needs) match;
   - there is no PTS/duration discontinuity: the DB gap is within one frame, the
@@ -120,6 +120,7 @@ class KeepReason(str, enum.Enum):
     DURATION_DISCONTINUITY = 'duration_discontinuity'
     MEDIA_MISMATCH = 'media_mismatch'
     NO_CLOCK_PROFILE = 'no_clock_profile'
+    CLOCK_DATE_UNPROVEN = 'clock_date_unproven'
     CLOCK_UNREADABLE = 'clock_unreadable'          # fewer than MIN_READS reads on a side
     CLOCK_INCONSISTENT = 'clock_inconsistent'      # a side's reads disagree
     CLOCK_DISAGREES = 'clock_disagrees'            # a real time skip (or overlap)
@@ -152,6 +153,8 @@ class Seam:
     before: tuple = ()  # clock offsets read before the seam (None = unreadable)
     after: tuple = ()
     frame_ratio: float = None
+    before_dates: tuple = ()
+    after_dates: tuple = ()
 
 
 def side_offset(reads):
@@ -181,6 +184,19 @@ def clock_check(seam):
     a, why_a = side_offset(seam.after)
     if why or why_a:
         return why or why_a, None
+    # The same time of day can recur after a whole-day skip. Dates must be
+    # readable at both endpoints and agree throughout the observed window.
+    bd, ad = seam.before_dates, seam.after_dates
+    if len(bd) != len(READ_AT_S) or len(ad) != len(READ_AT_S) or not all((bd[0], bd[-1], ad[0], ad[-1])):
+        return KeepReason.CLOCK_DATE_UNPROVEN, None
+    days = {d for d in bd + ad if d is not None}
+    if len(days) != 1:
+        return KeepReason.CLOCK_DATE_UNPROVEN, None
+    try:
+        if datetime.date.fromisoformat(next(iter(days))).isoformat() not in days:
+            return KeepReason.CLOCK_DATE_UNPROVEN, None
+    except (TypeError, ValueError):
+        return KeepReason.CLOCK_DATE_UNPROVEN, None
     # The evidence offsets were formed from integer displayed seconds, plus or
     # minus the exact fixed sample position. A stationary display is not a clock.
     before = [round(c - t, 3) for c, t in zip(seam.before, READ_AT_S) if c is not None][::-1]
@@ -287,22 +303,26 @@ def probe(src, etag=None):
 
 
 def read_clock(src, t, crop, tmp, etag=None):
-    """Burned-in clock seconds-of-day at file time t, or None."""
+    """Burned-in clock seconds and unambiguous displayed day at file time t."""
     with tempfile.TemporaryDirectory(dir=tmp, prefix="clock-read-") as fresh:
         raw = os.path.join(fresh, "frame.png")
         subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src, '-frames:v', '1',
                         '-vf', f'scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray', '-y', raw],
                        capture_output=True, timeout=300, check=True)
         if not os.path.exists(raw):
-            return None
+            return None, None
+        only_time = None
         for th in CLOCK_THRESHOLDS:
             png = f'{raw}.{th}.png'
             subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-i', raw, '-vf', f'lutyuv=y=if(gt(val\\,{th})\\,0\\,255)', '-y', png],
                            capture_output=True, timeout=60, check=True)
-            c = parse_clock(subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True, text=True, timeout=60, check=True).stdout)
-            if c is not None:
-                return c
-        return None
+            text = subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True, text=True, timeout=60, check=True).stdout
+            c, day = parse_clock(text), parse_display_date(text)
+            if c is not None and day is not None:
+                return c, day
+            if only_time is None and c is not None:
+                only_time = c
+        return only_time, None
 
 def parse_clock(txt):
     """Seconds of day of the last H:MM:SS or HH:MM:SS (12-hour with AM/PM, or 24-hour) in OCR text, or None."""
@@ -314,6 +334,26 @@ def parse_clock(txt):
             h = int(h) % 12 + (12 if ap == 'PM' else 0) if ap else int(h)
             return h * 3600 + int(mi) * 60 + int(sec) if h < 24 else None
     return None
+
+
+def parse_display_date(text):
+    """Return one unambiguous displayed ISO day; never guess month/day order."""
+    text = text.replace('O','0').replace('o','0')
+    dates = set()
+    def add(y, m, d):
+        try:
+            dates.add(datetime.date(y,m,d).isoformat())
+        except ValueError:
+            pass
+    iso = re.compile(r'(?<!\d)(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)')
+    for match in iso.finditer(text):
+        add(*(int(x) for x in match.groups()))
+    rest = iso.sub(' ', text)
+    for first, second, year in re.findall(r'(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(20\d{2}|\d{2})(?!\d)',rest):
+        d,m,y = int(first),int(second),int(year)
+        if y < 100: y += 2000
+        add(y,m,d); add(y,d,m)
+    return next(iter(dates)) if len(dates)==1 else None
 
 
 GRID_W, GRID_H = 96, 64
@@ -359,10 +399,13 @@ def seam_evidence(row):
         if abs(row['db_gap_s']) > max(pm.frame_s, nm.frame_s):
             return out
         with tempfile.TemporaryDirectory() as tmp:
-            before = [(lambda c: None if c is None else round(c + d, 3))(read_clock(prev_src, pm.duration_s - d, crop, tmp, pe)) for d in READ_AT_S]
-            after = [(lambda c: None if c is None else round(c - d, 3))(read_clock(next_src, d, crop, tmp, ne)) for d in READ_AT_S]
-        out.update(clock_before=before, clock_after=after)
-        if clock_check(Seam('', 0.0, 0.0, before=tuple(before), after=tuple(after)))[0] is None:
+            br = [read_clock(prev_src, pm.duration_s - d, crop, tmp, pe) for d in READ_AT_S]
+            ar = [read_clock(next_src, d, crop, tmp, ne) for d in READ_AT_S]
+            before = [None if c is None else round(c+d,3) for (c,_),d in zip(br,READ_AT_S)]
+            after = [None if c is None else round(c-d,3) for (c,_),d in zip(ar,READ_AT_S)]
+            bd, ad = tuple(day for _,day in br), tuple(day for _,day in ar)
+        out.update(clock_before=before, clock_after=after, clock_before_dates=bd, clock_after_dates=ad)
+        if clock_check(Seam('', 0.0, 0.0, before=tuple(before), after=tuple(after), before_dates=bd, after_dates=ad))[0] is None:
             out['frame_ratio'] = frame_ratio(gray_frames(prev_src, pm.duration_s - FRAME_DIFF_HALF_S, FRAME_DIFF_HALF_S + 1, pe),
                                              gray_frames(next_src, 0, FRAME_DIFF_HALF_S, ne))
     except Exception as e:  # recorded, and decide() keeps the seam split
@@ -379,7 +422,8 @@ def seam_of(ev):
     return Seam(ev['collation_reason'], ev['db_gap_s'], ev['prev_span_s'],
                 media_of(ev['prev_media']) if 'prev_media' in ev else None,
                 media_of(ev['next_media']) if 'next_media' in ev else None,
-                tuple(ev.get('clock_before', ())), tuple(ev.get('clock_after', ())), ev.get('frame_ratio'))
+                tuple(ev.get('clock_before', ())), tuple(ev.get('clock_after', ())), ev.get('frame_ratio'),
+                tuple(ev.get('clock_before_dates', ())), tuple(ev.get('clock_after_dates', ())))
 
 
 def verdict(ev):
