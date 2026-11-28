@@ -836,6 +836,7 @@ def main_ledger(a):
     lost = regressions(live, new_coverage(chosen, inputs.records))
     report = {'windows': {w.value: sum(v is w for v in windows.values()) for w in Window},
               'regressed_slots': len(lost),
+              'regressed_stream_days': len({slot[:2] for slot in lost}),
               'regressions': {f'{r} {d} {h}': v for (r, d, h), v in lost.items()}}
     if lost and not a.dry_run:
         print(json.dumps(report, indent=1))
