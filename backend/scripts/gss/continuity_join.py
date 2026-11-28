@@ -106,8 +106,8 @@ PROFILE_WIDTH = 1920
 CLOCK_CROPS = read_clock_profiles(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clock-profiles.tsv'))
 CLOCK_THRESHOLDS = (190, 150, 220)
 CLOCK_RX = (
-    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?(?![A-Za-z0-9.]))?', re.IGNORECASE),
-    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?(?![A-Za-z0-9.]))?', re.IGNORECASE),
+    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)\s*:\s*([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?(?=\s*$))?', re.IGNORECASE),
+    re.compile(r'(?<![\d:])([0-2]?\d)\s*:\s*([0-5]\d)([0-5]\d)(?![\d:])(?:\s*([ap])\s*\.?\s*m\.?(?=\s*$))?', re.IGNORECASE),
 )
 DATE_ISO_RX = re.compile(r'(?<!\d)(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)')
 DATE_DMY_RX = re.compile(r'(?<!\d)(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(20\d{2}|\d{2})(?!\d)')
@@ -310,35 +310,23 @@ def probe(src, etag=None):
 
 
 def read_clock(src, t, crop, tmp, etag=None):
-    """Burned-in clock seconds and unambiguous displayed day at file time t."""
+    """Read one exact frame with all OCR thresholds; preserve every raw attempt."""
     with tempfile.TemporaryDirectory(dir=tmp, prefix="clock-read-") as fresh:
         raw = os.path.join(fresh, "frame.png")
         subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-ss', f'{t:.3f}', *http_headers(etag), '-i', src, '-frames:v', '1',
                         '-vf', f'scale={PROFILE_WIDTH}:-2,{crop},scale=iw*3:ih*3,format=gray', '-y', raw],
                        capture_output=True, timeout=300, check=True)
         if not os.path.exists(raw):
-            return None, None, None
-        observed_times, observed_days, texts = set(), set(), []
+            return None, None, []
+        texts = []
         for th in CLOCK_THRESHOLDS:
             png = f'{raw}.{th}.png'
             subprocess.run([FFMPEG, '-v', 'error', '-nostdin', '-i', raw, '-vf', f'lutyuv=y=if(gt(val\\,{th})\\,0\\,255)', '-y', png],
                            capture_output=True, timeout=60, check=True)
-            text = subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True, text=True, timeout=60, check=True).stdout
-            if text.strip():
-                texts.append(text)
-            c, day = parse_clock(text), parse_display_date(text)
-            if c is not None:
-                observed_times.add(c)
-            if day is not None:
-                observed_days.add(day)
-            if len(observed_times) > 1 or len(observed_days) > 1:
-                return None, None, '\n'.join(texts)
-            if c is not None and day is not None:
-                return c, day, text
-        # A date-only (or other nonblank) observation is not a blank frame.
-        # Preserve it so a later positive cannot silently discard a contrary day.
-        return (next(iter(observed_times),None), next(iter(observed_days),None),
-                '\n'.join(texts) if texts else None)
+            texts.append(subprocess.run(['tesseract', png, '-', '--psm', '7'], capture_output=True,
+                                        text=True, timeout=60, check=True).stdout)
+        c, day, _ = clock_frame_consensus(texts)
+        return c, day, texts
 
 
 def parse_clock_token(txt):
@@ -386,6 +374,25 @@ def parse_display_date(text):
         if y < 100: y += 2000
         add(y,m,d); add(y,d,m)
     return next(iter(dates)) if len(dates)==1 else None
+
+
+def clock_frame_consensus(texts):
+    """A contributing frame requires >=2 matching complete readings.
+    Nonblank partial or contradictory OCR is retained and cannot be treated as absent.
+    """
+    if not isinstance(texts, (list, tuple)) or not all(isinstance(t, str) for t in texts):
+        return None, None, False
+    nonblank = [t for t in texts if t.strip()]
+    if len(nonblank) < 2:
+        return None, None, False
+    got = []
+    for text in nonblank:
+        c, mode = parse_clock_token(text)
+        day = parse_display_date(text)
+        if c is None or day is None:
+            return None, None, False
+        got.append((c, day, mode))
+    return got[0] if len(set(got)) == 1 else (None, None, False)
 
 
 GRID_W, GRID_H = 96, 64
@@ -468,15 +475,15 @@ def raw_clock_evidence_matches(ev):
         raw = ev.get('clock_' + side + '_raw', ())
         if not len(readings) == len(dates) == len(raw) == len(READ_AT_S):
             return False
-        for pos, offset, date, text in zip(READ_AT_S, readings, dates, raw):
+        for pos, offset, date, texts in zip(READ_AT_S, readings, dates, raw):
+            if not isinstance(texts, (tuple,list)) or not all(isinstance(t,str) for t in texts):
+                return False
             if offset is None:
-                if date is not None or text is not None:
+                if date is not None or any(t.strip() for t in texts):
                     return False
                 continue
-            if not isinstance(text, str):
-                return False
-            seconds, mode = parse_clock_token(text)
-            if seconds is None or not mode or parse_display_date(text) != date or round(seconds + sign*pos,3) != offset:
+            seconds, derived_date, mode = clock_frame_consensus(texts)
+            if seconds is None or not mode or date is None or derived_date != date or round(seconds + sign*pos,3) != offset:
                 return False
     return True
 

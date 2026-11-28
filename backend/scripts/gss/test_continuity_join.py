@@ -21,8 +21,8 @@ MEDIA = C.Media(VIDEO, AUDIO, 0.0, 300.0, 0.04)
 CLOCK = (60338.5, 60338.5, 60338.5)
 DATES = ("2026-09-19",) * 3
 BEFORE, AFTER = (60338.2,60338.7,60338.2),(60338.8,60338.3,60338.8)
-BEFORE_RAW = ('2026-09-19 16:45:38','2026-09-19 16:45:38','2026-09-19 16:45:37')
-AFTER_RAW = ('2026-09-19 16:45:39','2026-09-19 16:45:39','2026-09-19 16:45:40')
+BEFORE_RAW = tuple([t]*3 for t in ('2026-09-19 16:45:38','2026-09-19 16:45:38','2026-09-19 16:45:37'))
+AFTER_RAW = tuple([t]*3 for t in ('2026-09-19 16:45:39','2026-09-19 16:45:39','2026-09-19 16:45:40'))
 
 
 def seam(reason='frame_jump', gap=0.0, before=CLOCK, after=CLOCK, ratio=0.9, prev=MEDIA, nxt=MEDIA, span=300.0, before_dates=DATES, after_dates=DATES):
@@ -88,6 +88,8 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(C.parse_clock_token('2026-09-19 01:00:06 am'), (3606, True))
         self.assertEqual(C.parse_clock_token('2026-09-19 01:00:06 p.m.'), (46806, True))
         self.assertEqual(C.parse_clock_token('2026-09-19 04:00:06 PM2.5'), (14406,False))
+        for label in ('PM 2.5','PM: 2.5','PM₂.₅'):
+            self.assertEqual(C.parse_clock_token('2026-09-19 04:00:06 '+label),(14406,False))
         self.assertEqual(C.parse_clock_token('2026-09-19 04:00:06 amsterdam'), (14406,False))
         self.assertEqual(C.parse_clock_token('2026-09-19 01:00:06'), (3606, False))
 
@@ -206,13 +208,15 @@ class ExactPlanTests(unittest.TestCase):
         _, decisions, *_ = self.fixture()
         e = decisions[0]
         self.assertEqual(C.verdict(e), (True,None,.6))
-        self.assertFalse(C.verdict(dict(e, clock_after_raw=['2026-09-19 01:45:39 am']*3))[0])
-        self.assertFalse(C.verdict(dict(e, clock_after_raw=['2026-09-19 04:45:39']*3))[0])
+        self.assertFalse(C.verdict(dict(e, clock_after_raw=[['2026-09-19 01:45:39 am']*3]*3))[0])
+        self.assertFalse(C.verdict(dict(e, clock_after_raw=[['2026-09-19 04:45:39']*3]*3))[0])
         self.assertFalse(C.verdict(dict(e, clock_after_raw=()))[0])
-        self.assertFalse(C.verdict(dict(e, clock_before_raw=[t.replace('16:','04:')+' PM2.5' for t in BEFORE_RAW]))[0])
+        self.assertFalse(C.verdict(dict(e, clock_before_raw=[BEFORE_RAW[0],['2026-09-19 2026-09-20 16:45:38']*3,BEFORE_RAW[-1]],clock_before_dates=(DATES[0],None,DATES[-1])))[0])
+        self.assertFalse(C.verdict(dict(e, clock_before_raw=[BEFORE_RAW[0],['2026-09-19 16:45:38','2026-09-19 16:45:38','2026-09-20 16:45:38'],BEFORE_RAW[-1]]))[0])
+        self.assertFalse(C.verdict(dict(e, clock_before_raw=[[t.replace('16:','04:')+' PM2.5' for t in texts] for texts in BEFORE_RAW]))[0])
         self.assertFalse(C.verdict(dict(e, clock_before=(BEFORE[0],None,BEFORE[-1]),
             clock_before_dates=(DATES[0],None,DATES[-1]),
-            clock_before_raw=[BEFORE_RAW[0],'2026-09-19 23:24:15',BEFORE_RAW[-1]]))[0])
+            clock_before_raw=[BEFORE_RAW[0],['2026-09-19 23:24:15']*3,BEFORE_RAW[-1]]))[0])
 
     def test_revoked_run_cannot_reuse_receipt(self):
         plan, decisions, *rest = self.fixture()
@@ -248,15 +252,15 @@ class BuildTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, stdout='2026-09-19 12:34:56', stderr='')
                 return actual_run(args, **kwargs)
             with mock.patch.object(C.subprocess,'run',side_effect=with_ocr):
-                self.assertEqual(C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d),(45296,'2026-09-19','2026-09-19 12:34:56'))
-                self.assertEqual(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d),(None,None,None))
+                self.assertEqual(C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d),(45296,'2026-09-19',['2026-09-19 12:34:56']*3))
+                self.assertEqual(C.read_clock(os.path.join(d,'short.mp4'),1.2,'crop=100:50:0:0',d),(None,None,[]))
             def date_only(args, **kwargs):
                 if args[0] == 'tesseract':
                     return subprocess.CompletedProcess(args,0,stdout='27.Sep 2026',stderr='')
                 return actual_run(args, **kwargs)
             with mock.patch.object(C.subprocess,'run',side_effect=date_only):
                 got=C.read_clock(os.path.join(d,'long.mp4'),1.2,'crop=100:50:0:0',d)
-                self.assertIsNone(got[0]); self.assertEqual(got[1],'2026-09-27'); self.assertIn('27.Sep 2026',got[2])
+                self.assertIsNone(got[0]); self.assertIsNone(got[1]); self.assertIn('27.Sep 2026',got[2])
 
     def test_join_keeps_audio_and_duration_and_the_ledger_reads_its_proof(self):
         with tempfile.TemporaryDirectory() as d:
