@@ -408,7 +408,7 @@ class ListingMode(Base):
 class Backfill(Base):
     def setUp(self):
         super().setUp()
-        self.write_manifest([(KE[0], ma.KE_CLASS), (KE[1], ma.KE_CLASS)])
+        self.write_manifest([(KE[0], ma.LEGACY_KE_CLASS), (KE[1], ma.LEGACY_KE_CLASS)])
         self.sources({KE[0]: ('raw', 11, 'e1'), KE[1]: ('raw', 12, 'e1')})
         self.ledger = self.d / 'ledger.jsonl'
         self.ledger.write_text(''.join(json.dumps(r) + '\n' for r in [
@@ -435,7 +435,7 @@ class Backfill(Base):
     def test_a_large_backfill_runs_in_bounded_statements_with_one_shot_results(self):
         n = 12001
         keys = [f'managed/acct-47/ke/{i:06d}.mp4' for i in range(n)]
-        self.write_manifest([(k, ma.KE_CLASS) for k in keys])
+        self.write_manifest([(k, ma.LEGACY_KE_CLASS) for k in keys])
         self.sources({k: ('raw', 100 + i, 'e1') for i, k in enumerate(keys)})
         self.ledger.write_text(''.join(json.dumps(r) + '\n' for r in [
             {'type': 'run', 'manifest_sha256': self.digest, 'inputs_sha256': {}, 'recent_from': '2026-11-18T18:00:00Z', 'limit': 0}] + [
@@ -495,7 +495,7 @@ class Backfill(Base):
         self.assertEqual(self.backfill(), [{'workdir': str(self.W), 'already_applied': 2}])
 
     def test_ledger_for_another_manifest_is_refused(self):
-        self.write_manifest([(KE[0], ma.KE_CLASS)])
+        self.write_manifest([(KE[0], ma.LEGACY_KE_CLASS)])
         with self.assertRaisesRegex(SystemExit, 'ledger header does not describe'):
             self.backfill()
         self.assertEqual(self.calls(), [])
@@ -508,14 +508,14 @@ class Backfill(Base):
         self.assertFalse((self.W / 'delete-intent.json').exists())
 
 
-class ChunkVerify(Base):
-    CLS, FLAG = ma.KE_CLASS, '--ke-coverage'
+class Best14ChunkVerify(Base):
+    CLS, FLAG = ma.BEST14_CLASS, '--best14-coverage'
 
     def setUp(self):
         super().setUp()
         self.write_manifest([(k, self.CLS) for k in KE])
         self.sources({k: ('raw', 11 + i, 'e1') for i, k in enumerate(KE)})
-        self.coverage = self.d / 'ke-coverage.tsv'
+        self.coverage = self.d / 'best14-coverage.tsv'
         self.coverage.write_text(f'{KE[0]}\t100\t{OUT1}\t500\n{KE[1]}\t100\t{OUT1}\t500\n{KE[2]}\t100\t{OUT2}\t600\n'
                                  f'{KE[2]}\t999\t{OUT1}\t500\n')
         self.r2({**{k: [100, 'e1', 1] for k in KE}, OUT1: [500, 'o1', 5], OUT2: [600, 'o2', 6]})
@@ -638,10 +638,9 @@ class ChunkVerify(Base):
         for extra in (['--fresh-listing', 'f.tsv'], ['--limit', '1']):
             with self.assertRaisesRegex(SystemExit, 'wrapper owns --fresh-listing'):
                 self.delete(extra=extra)
-        for other in ('delete_raw_outside_window', ma.KE_CLASS if self.CLS == ma.BEST14_CLASS else ma.BEST14_CLASS):
-            self.write_manifest([(KE[0], self.CLS), (RAW, other)])
-            with self.assertRaisesRegex(SystemExit, 'only that class'):
-                self.delete()
+        self.write_manifest([(KE[0], self.CLS), (RAW, 'delete_raw_outside_window')])
+        with self.assertRaisesRegex(SystemExit, 'only that class'):
+            self.delete()
         self.assertEqual(self.calls(), [])
 
     def test_an_unbounded_run_needs_a_canary_and_chunks_are_capped(self):
@@ -668,17 +667,46 @@ class ChunkVerify(Base):
                 self.delete('--chunk', '2')
         self.assertEqual(set(self.applied()), set(KE[:2]))
 
-    def test_the_coverage_flag_must_be_the_classs_own(self):
-        other = '--best14-coverage' if self.FLAG == '--ke-coverage' else '--ke-coverage'
-        with self.assertRaisesRegex(SystemExit, 'pass ' + self.FLAG + ' exactly once'):
-            self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest), '--expected-sha256', self.digest,
-                         *self.rule_args(), other, str(self.coverage))
-        self.assertNotIn('r2prune', self.calls())
+    def test_legacy_coverage_flag_is_refused_even_on_best14_manifest(self):
+        with self.assertRaisesRegex(SystemExit, 'Keep Everything is protected: --ke-coverage'):
+            self.delete(extra=['--ke-coverage', str(self.coverage)])
+        self.assertEqual(self.calls(), [])
 
 
-class Best14ChunkVerify(ChunkVerify):
-    """Class (b), best-14 raws inside a served stitched output: the same verify, its own coverage flag."""
-    CLS, FLAG = ma.BEST14_CLASS, '--best14-coverage'
+class LegacyKeepEverythingManifest(Base):
+    def test_historical_manifest_is_refused_before_any_catalog_or_r2_call(self):
+        self.write_manifest([(KE[0], ma.LEGACY_KE_CLASS)])
+        with self.assertRaisesRegex(SystemExit, 'historical delete_ke_raw_stitched'):
+            self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest),
+                         '--expected-sha256', self.digest, *self.rule_args())
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.W.exists())
+        self.assertEqual(self.calls('pin'), [])
+
+    def test_mixed_manifest_is_refused_before_any_catalog_or_r2_call(self):
+        self.write_manifest([(RAW, ma.BEST14_CLASS), (KE[0], ma.LEGACY_KE_CLASS)])
+        with self.assertRaisesRegex(SystemExit, 'historical delete_ke_raw_stitched'):
+            self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest),
+                         '--expected-sha256', self.digest, *self.rule_args())
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.W.exists())
+
+    def test_preflight_refuses_historical_class_even_without_a_legacy_flag(self):
+        self.write_manifest([(KE[0], ma.LEGACY_KE_CLASS)])
+        with unittest.mock.patch.object(ma, 'dry_run') as dry_run:
+            with self.assertRaisesRegex(SystemExit, 'historical delete_ke_raw_stitched'):
+                ma.preflight(None, self.W, [KE[0]], ma.read_manifest(self.manifest), {}, self.digest)
+            dry_run.assert_not_called()
+
+    def test_legacy_flag_is_refused_in_all_go_flag_forms(self):
+        self.write_manifest([(RAW, 'delete_raw_outside_window')])
+        for flag in ('--ke-coverage', '-ke-coverage'):
+            for args in ([flag, 'a.tsv'], [flag + '=a.tsv'], [flag + '=']):
+                with self.subTest(args=args), self.assertRaisesRegex(SystemExit, 'Keep Everything is protected: --ke-coverage'):
+                    self.run_cli('delete', str(self.W), '--', '--manifest', str(self.manifest),
+                                 '--expected-sha256', self.digest, *self.rule_args(), *args)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.W.exists())
 
 
 class Gate(Best14ChunkVerify):

@@ -7,16 +7,18 @@ Two manual `r2prune delete` runs (2026-11-21 outside-window, 2026-11-22 delivery
 videos) deleted R2 objects whose `r2_object_retirements` receipts were never
 written, because they were run as a bare binary from a shell. Any `r2prune delete`
 outside the R2 prune lane now goes through `manual_apply.py`, on Jelly. It has two
-delete modes, chosen by the manifest's classes:
+delete modes, chosen by the manifest's classes. Keep Everything keys stay in R2
+regardless of stitched coverage. The retired class `delete_ke_raw_stitched` and
+legacy `--ke-coverage` flag are refused for deletion; historical manifests remain
+readable for receipt reconciliation only.
 
 ```sh
-# listing: any manifest without delete_ke_raw_stitched rows
+# listing: ordinary manifests without covered best-14 rows
 /usr/bin/python3 -I ops/jelly/r2prune/manual_apply.py delete WORKDIR -- \
   --manifest plan/delete-manifest.jsonl --expected-sha256 HEX --summary plan/summary.json \
   --fresh-listing snapshot.tsv <the plan's rule flags> [--limit N] [--workers 8]
 
-# verify: a manifest of one covered class only, delete_ke_raw_stitched (class (a), --ke-coverage)
-# or delete_best14_raw_stitched (class (b), --best14-coverage); the wrapper owns --fresh-listing
+# verify: only delete_best14_raw_stitched rows, --best14-coverage; the wrapper owns --fresh-listing
 /usr/bin/python3 -I ops/jelly/r2prune/manual_apply.py delete [--chunk 5000] [--chunks K] WORKDIR -- \
   --manifest plan/delete-manifest.jsonl --expected-sha256 HEX --summary plan/summary.json \
   <the plan's rule flags, including the class's coverage flag> [--workers 8]
@@ -80,7 +82,7 @@ key an earlier attempt really deleted would close without a receipt. A full run
 same command so r2prune settles them. A canary leaves the intent open without
 failing.
 
-### Verify mode (covered classes (a) `delete_ke_raw_stitched` and (b) `delete_best14_raw_stitched`)
+### Verify mode (`delete_best14_raw_stitched`)
 
 The owner's condition for the covered deletes: every chunk is re-verified live
 right before its own `r2prune` call. A chunk is the previous chunks' unsettled raws
@@ -114,7 +116,7 @@ its planned identity so r2prune's idempotent DELETE acknowledges it and it gets
 its receipt. A chunk that leaves any of its keys unsettled stops the run; rerun the
 same command. `--chunks K` stops after K chunks (a canary) with the intent open.
 
-### Class (b): best-14 raws the public GSS page serves stitched
+### Covered best-14 raws the public GSS page serves stitched
 
 Owner, Nov 26: "ok lets just make sure we're deleting the raw clips that we know
 are already stitched. we dont need both". `best14/` builds the `--best14-coverage`

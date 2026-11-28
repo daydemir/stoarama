@@ -22,7 +22,6 @@ const (
 	deleteCollatedOutsideWindow class = "delete_collated_outside_window"
 	deleteWindowOnNAS           class = "delete_window_20d_on_nas"
 	deleteDuplicateOfPageLink   class = "delete_duplicate_of_page_link"
-	deleteKeRawStitched         class = "delete_ke_raw_stitched"
 	deleteBest14RawStitched     class = "delete_best14_raw_stitched"
 
 	protectKeepEverything class = "protect_keep_everything"
@@ -38,8 +37,7 @@ const (
 
 func (c class) deletes() bool {
 	switch c {
-	case deleteRawOutsideWindow, deleteCollatedOutsideWindow, deleteWindowOnNAS, deleteDuplicateOfPageLink, deleteKeRawStitched,
-		deleteBest14RawStitched:
+	case deleteRawOutsideWindow, deleteCollatedOutsideWindow, deleteWindowOnNAS, deleteDuplicateOfPageLink, deleteBest14RawStitched:
 		return true
 	}
 	return false
@@ -81,12 +79,12 @@ type identity struct {
 
 type window struct{ Start, End int64 } // [Start, End) unix seconds
 
-// keManifestPrefix holds collation manifests, which this class never touches.
-const keManifestPrefix = "joined/nightly-collation-v2/manifests"
+// collationManifestPrefix holds collation manifests, which this class never touches.
+const collationManifestPrefix = "joined/nightly-collation-v2/manifests"
 
-// keCoverage is one owner row saying a raw key's bytes are inside a stitched
-// output already stored in R2 (--ke-coverage and --best14-coverage rows alike).
-type keCoverage struct {
+// coverageRow is one owner row saying a non-KE best-14 raw key's bytes are
+// inside a stitched output already stored in R2.
+type coverageRow struct {
 	OutputKey           string
 	RawSize, OutputSize int64
 }
@@ -120,12 +118,10 @@ type rules struct {
 	RecentFrom int64 // objects modified at or after this instant are protected
 	Released   map[string]bool
 	Evidence   map[string]evidence // nil unless nas_keep_20 is released
-	// KECoverage is the owner's --ke-coverage rows per raw key, Best14Coverage
-	// the --best14-coverage rows, and OutputKeys every stitched output either
-	// names. Outputs is the size each of those outputs has in the listing being
-	// decided: the plan snapshot, or delete's fresh listing.
-	KECoverage     map[string][]keCoverage
-	Best14Coverage map[string][]keCoverage
+	// Best14Coverage is the owner's --best14-coverage rows per raw key, and
+	// OutputKeys every stitched output those rows name. Outputs records their
+	// sizes in the listing being decided: the plan snapshot, or delete's fresh listing.
+	Best14Coverage map[string][]coverageRow
 	OutputKeys     map[string]bool
 	Outputs        map[string]int64
 	Fresh          map[string]object // delete only: the listing taken right before the run
@@ -134,7 +130,7 @@ type rules struct {
 type ruleFiles struct {
 	identities, dbProtect, closure, controller, picks string
 	derived, nasEvidence, release, recentFrom         string
-	keCoverage, best14Coverage, served                string
+	best14Coverage, served                            string
 }
 
 func (f *ruleFiles) register(fs *flag.FlagSet) {
@@ -147,9 +143,8 @@ func (f *ruleFiles) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.derived, "derived-identities", "", "optional identities derived for keys with no catalog row")
 	fs.StringVar(&f.nasEvidence, "nas-evidence", "", "live NAS custody TSV for window keys; required with --release nas_keep_20")
 	fs.StringVar(&f.release, "release", "", "comma-separated controller protections to lift: "+strings.Join(sortedKeys(releasable), ","))
-	fs.StringVar(&f.keCoverage, "ke-coverage", "", "optional TSV: raw_key,raw_size,output_key,output_size for KE raw already inside a stitched R2 output")
 	fs.StringVar(&f.served, "served", "", "optional: one key per line the live GSS generation serves; each is protect_live_site everywhere, never window-only")
-	fs.StringVar(&f.best14Coverage, "best14-coverage", "", "optional TSV, same columns: non-KE best-14 raw inside a served, keep-held stitched R2 output")
+	fs.StringVar(&f.best14Coverage, "best14-coverage", "", "optional TSV: raw_key,raw_size,output_key,output_size for non-KE best-14 raw inside a served, keep-held stitched R2 output")
 }
 
 func sortedKeys(m map[string]bool) []string {
@@ -165,7 +160,7 @@ func sortedKeys(m map[string]bool) []string {
 func (f ruleFiles) digests() (map[string]string, error) {
 	out := map[string]string{}
 	for name, p := range map[string]string{"identities": f.identities, "db_protect": f.dbProtect, "closure": f.closure,
-		"controller_protect": f.controller, "picks": f.picks, "derived_identities": f.derived, "nas_evidence": f.nasEvidence, "ke_coverage": f.keCoverage,
+		"controller_protect": f.controller, "picks": f.picks, "derived_identities": f.derived, "nas_evidence": f.nasEvidence,
 		"best14_coverage": f.best14Coverage, "served": f.served} {
 		if p == "" {
 			continue
@@ -235,7 +230,7 @@ func (f ruleFiles) load() (*rules, error) {
 	if err := r.loadIdentities(f.identities, f.derived); err != nil {
 		return nil, err
 	}
-	if err := r.loadCoverage(f.keCoverage, f.best14Coverage); err != nil {
+	if err := r.loadCoverage(f.best14Coverage); err != nil {
 		return nil, err
 	}
 	if len(r.Windows) == 0 || len(r.KE) == 0 || len(r.Identities) == 0 {
@@ -478,8 +473,8 @@ func (r *rules) loadIdentityFile(path string, derived bool) error {
 // protection of any reason, not a recent write. The window stitch closure is
 // every source of an output overlapping a window, which is what a coverage row
 // proves, so it never holds a covered raw.
-func (r *rules) coveredDelete(o object, ids []identity, rows []keCoverage) (string, bool) {
-	if len(rows) == 0 || len(ids) == 0 || strings.HasPrefix(o.Key, keManifestPrefix) || r.OutputKeys[o.Key] {
+func (r *rules) coveredDelete(o object, ids []identity, rows []coverageRow) (string, bool) {
+	if len(rows) == 0 || len(ids) == 0 || strings.HasPrefix(o.Key, collationManifestPrefix) || r.OutputKeys[o.Key] {
 		return "", false
 	}
 	for _, id := range ids {
@@ -503,61 +498,47 @@ func (r *rules) coveredDelete(o object, ids []identity, rows []keCoverage) (stri
 	return "", false
 }
 
-// loadCoverage reads the owner's --ke-coverage and --best14-coverage
-// raw_key,raw_size,output_key,output_size TSVs (either may be ""). It is strict:
-// a malformed row, an empty key, a non-positive size, a manifest key, a
-// duplicate (raw, output) pair, a raw in both files, or a raw that is also a
-// coverage output in either refuses the run.
-func (r *rules) loadCoverage(kePath, best14Path string) error {
-	r.KECoverage, r.Best14Coverage, r.OutputKeys, r.Outputs = map[string][]keCoverage{}, map[string][]keCoverage{}, map[string]bool{}, map[string]int64{}
-	for _, f := range []struct {
-		path string
-		into map[string][]keCoverage
-	}{{kePath, r.KECoverage}, {best14Path, r.Best14Coverage}} {
-		if f.path == "" {
-			continue
+// loadCoverage reads the owner's --best14-coverage raw_key,raw_size,output_key,output_size TSV (path may be "").
+// A malformed row, empty key, non-positive size, manifest key, duplicate
+// (raw, output) pair, or raw that is also a coverage output refuses the run.
+func (r *rules) loadCoverage(path string) error {
+	r.Best14Coverage, r.OutputKeys, r.Outputs = map[string][]coverageRow{}, map[string]bool{}, map[string]int64{}
+	if path == "" {
+		return nil
+	}
+	seen := map[[2]string]bool{}
+	if err := eachTSV(path, 4, func(c []string) error {
+		if c[0] == "" || c[2] == "" {
+			return errors.New("empty raw or output key")
 		}
-		seen := map[[2]string]bool{}
-		if err := eachTSV(f.path, 4, func(c []string) error {
-			if c[0] == "" || c[2] == "" {
-				return errors.New("empty raw or output key")
-			}
-			rawSize, err := strconv.ParseInt(c[1], 10, 64)
-			if err != nil {
-				return fmt.Errorf("raw_size: %w", err)
-			}
-			outSize, err := strconv.ParseInt(c[3], 10, 64)
-			if err != nil {
-				return fmt.Errorf("output_size: %w", err)
-			}
-			if rawSize <= 0 || outSize <= 0 {
-				return fmt.Errorf("non-positive size %d,%d", rawSize, outSize)
-			}
-			if strings.HasPrefix(c[2], keManifestPrefix) || strings.HasPrefix(c[0], keManifestPrefix) {
-				return fmt.Errorf("manifest key %q never covers or is covered", c[0])
-			}
-			pair := [2]string{c[0], c[2]}
-			if seen[pair] {
-				return fmt.Errorf("duplicate coverage row %s -> %s", c[0], c[2])
-			}
-			seen[pair] = true
-			r.OutputKeys[c[2]] = true
-			f.into[c[0]] = append(f.into[c[0]], keCoverage{c[2], rawSize, outSize})
-			return nil
-		}); err != nil {
-			return err
+		rawSize, err := strconv.ParseInt(c[1], 10, 64)
+		if err != nil {
+			return fmt.Errorf("raw_size: %w", err)
 		}
+		outSize, err := strconv.ParseInt(c[3], 10, 64)
+		if err != nil {
+			return fmt.Errorf("output_size: %w", err)
+		}
+		if rawSize <= 0 || outSize <= 0 {
+			return fmt.Errorf("non-positive size %d,%d", rawSize, outSize)
+		}
+		if strings.HasPrefix(c[2], collationManifestPrefix) || strings.HasPrefix(c[0], collationManifestPrefix) {
+			return fmt.Errorf("manifest key %q never covers or is covered", c[0])
+		}
+		pair := [2]string{c[0], c[2]}
+		if seen[pair] {
+			return fmt.Errorf("duplicate coverage row %s -> %s", c[0], c[2])
+		}
+		seen[pair] = true
+		r.OutputKeys[c[2]] = true
+		r.Best14Coverage[c[0]] = append(r.Best14Coverage[c[0]], coverageRow{c[2], rawSize, outSize})
+		return nil
+	}); err != nil {
+		return err
 	}
 	for raw := range r.Best14Coverage {
-		if len(r.KECoverage[raw]) > 0 {
-			return fmt.Errorf("raw key %q is in both --ke-coverage and --best14-coverage", raw)
-		}
-	}
-	for _, m := range []map[string][]keCoverage{r.KECoverage, r.Best14Coverage} {
-		for raw := range m {
-			if r.OutputKeys[raw] {
-				return fmt.Errorf("raw key %q is itself a coverage output", raw)
-			}
+		if r.OutputKeys[raw] {
+			return fmt.Errorf("raw key %q is itself a coverage output", raw)
 		}
 	}
 	return nil
@@ -645,12 +626,9 @@ func (r *rules) decide(o object) (class, string) {
 	}
 	keReason := r.keepEverything(o.Key, ids)
 	if keReason != "" {
-		if out, ok := r.coveredDelete(o, ids, r.KECoverage[o.Key]); ok {
-			return deleteKeRawStitched, "covered_by:" + topPrefix(out)
-		}
 		return protectKeepEverything, keReason
 	}
-	// Class (b): a non-KE raw whose bytes serve on the public GSS page inside a
+	// A non-KE best-14 raw whose bytes serve on the public GSS page inside a
 	// stitched output goes from R2 even inside its 20-day window; the window
 	// keeps the NAS copy, not the R2 one. Every key protection still wins.
 	if out, ok := r.coveredDelete(o, ids, r.Best14Coverage[o.Key]); ok && r.mapped(ids) {
