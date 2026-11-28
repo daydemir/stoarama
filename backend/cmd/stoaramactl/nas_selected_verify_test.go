@@ -113,7 +113,7 @@ func TestNASSelectedVerifyRequestAndReport(t *testing.T) {
 
 	o := nasSelectedVerifyOptions{clipIDs: []int64{1}, collatedIDs: []int64{1}, joinedIDs: []int64{1}, label: "first", dryRun: true}
 	dry, err := requestNASSelectedVerify(ctx, pool, o)
-	if err != nil || dry.Items != 3 || dry.Bytes != 33 {
+	if err != nil || dry.Items != 3 || dry.Bytes != 33 || dry.Created || dry.PlanID != 0 {
 		t.Fatalf("dry=%+v err=%v", dry, err)
 	}
 	var count int
@@ -123,23 +123,53 @@ func TestNASSelectedVerifyRequestAndReport(t *testing.T) {
 	}
 	o.dryRun = false
 	o.expectedSHA = dry.PlanSHA256
-	if _, err := requestNASSelectedVerify(ctx, pool, o); err != nil {
-		t.Fatal(err)
+	first, err := requestNASSelectedVerify(ctx, pool, o)
+	if err != nil || !first.Created || first.PlanID <= 0 {
+		t.Fatalf("first=%+v err=%v", first, err)
 	}
-	if _, err := requestNASSelectedVerify(ctx, pool, o); err != nil {
-		t.Fatalf("retry: %v", err)
+	retry, err := requestNASSelectedVerify(ctx, pool, o)
+	if err != nil || retry.Created || retry.PlanID != first.PlanID {
+		t.Fatalf("retry=%+v err=%v", retry, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_selected_verify_items SET state='match', attempts=1, completed_at=now(), client_version='fixture-verified' WHERE plan_id=$1 AND ordinal=1`, first.PlanID); err != nil {
+		t.Fatal(err)
 	}
 	report, err := reportNASSelectedVerify(ctx, pool, "first")
 	if err != nil {
 		t.Fatal(err)
 	}
 	items := report["items"].([]nasSelectedVerifyReportItem)
+	if report["plan_id"] != first.PlanID || report["plan_sha256"] != first.PlanSHA256 {
+		t.Fatalf("unexpected report plan identity: %v", report)
+	}
 	if len(items) != 3 || items[0].RelativePath != "joined/folder/hour.mp4" || items[1].RelativePath != "joined/batch/folder/media.mp4" {
 		t.Fatalf("items=%+v", items)
 	}
+	if items[0].ClientVersion != "fixture-verified" || items[0].CompletedAt == nil || items[0].State != "match" || items[1].ClientVersion != "" || items[1].CompletedAt != nil {
+		t.Fatalf("wrong recorded completion evidence: %+v", items)
+	}
+	different := nasSelectedVerifyOptions{clipIDs: []int64{1}, label: o.label, dryRun: true}
+	differentDry, err := requestNASSelectedVerify(ctx, pool, different)
+	if err != nil {
+		t.Fatal(err)
+	}
+	different.dryRun, different.expectedSHA = false, differentDry.PlanSHA256
+	if sum, err := requestNASSelectedVerify(ctx, pool, different); err == nil || sum.Created || sum.PlanID != 0 {
+		t.Fatalf("accepted different existing plan: %+v err=%v", sum, err)
+	}
 	o.label = "later"
-	if _, err := requestNASSelectedVerify(ctx, pool, o); err != nil {
-		t.Fatalf("fresh repeat: %v", err)
+	if later, err := requestNASSelectedVerify(ctx, pool, o); err != nil || !later.Created || later.PlanID <= 0 || later.PlanID == first.PlanID {
+		t.Fatalf("fresh repeat: %+v err=%v", later, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO connections VALUES(14,48,'nas_pull'); INSERT INTO nas_selected_verify_plans(account_id,connection_id,label,manifest,plan_sha256) SELECT 48,14,'foreign-label',manifest,plan_sha256 FROM nas_selected_verify_plans WHERE label='first'`); err != nil {
+		t.Fatal(err)
+	}
+	o.label = "foreign-label"
+	if sum, err := requestNASSelectedVerify(ctx, pool, o); err == nil || sum.PlanID != 0 {
+		t.Fatalf("accepted foreign label: %+v err=%v", sum, err)
+	}
+	if _, err := reportNASSelectedVerify(ctx, pool, o.label); err == nil {
+		t.Fatal("reported foreign plan")
 	}
 	o.label = "foreign"
 	o.clipIDs = []int64{2}

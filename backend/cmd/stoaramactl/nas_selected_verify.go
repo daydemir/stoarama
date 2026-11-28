@@ -75,6 +75,10 @@ type nasSelectedVerifySummary struct {
 	Items        int    `json:"items"`
 	Bytes        int64  `json:"bytes"`
 	DryRun       bool   `json:"dry_run"`
+	// PlanID and Created name the plan an apply holds; Created is true only when
+	// this call inserted it (a retry of an existing label reports false).
+	PlanID  int64 `json:"plan_id"`
+	Created bool  `json:"created"`
 }
 
 func parseNASSelectedVerifyRequestArgs(args []string) (nasSelectedVerifyOptions, error) {
@@ -261,13 +265,17 @@ func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSele
 			return sum, err
 		}
 		var existingSHA string
-		if err := tx.QueryRow(ctx, `SELECT plan_sha256 FROM nas_selected_verify_plans WHERE label=$1 AND account_id=$2 AND connection_id=$3`, o.label, sum.AccountID, sum.ConnectionID).Scan(&existingSHA); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT id,plan_sha256 FROM nas_selected_verify_plans WHERE label=$1 AND account_id=$2 AND connection_id=$3`, o.label, sum.AccountID, sum.ConnectionID).Scan(&planID, &existingSHA); err != nil {
 			return sum, err
 		}
 		if existingSHA != sum.PlanSHA256 {
 			return sum, errors.New("label already belongs to a different immutable plan")
 		}
-		return sum, tx.Commit(ctx)
+		if err := tx.Commit(ctx); err != nil {
+			return sum, err
+		}
+		sum.PlanID = planID
+		return sum, nil
 	}
 	copied, err := tx.CopyFrom(ctx, pgx.Identifier{"nas_selected_verify_items"}, []string{"plan_id", "ordinal", "kind", "source_id", "relative_path", "size_bytes", "sha256"}, nasSelectedVerifyCopySource(planID, items))
 	if err != nil {
@@ -276,7 +284,11 @@ func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSele
 	if copied != int64(len(items)) {
 		return sum, fmt.Errorf("copied %d selected verify identities, expected %d", copied, len(items))
 	}
-	return sum, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return sum, err
+	}
+	sum.PlanID, sum.Created = planID, true
+	return sum, nil
 }
 
 type nasSelectedVerifyReportItem struct {
@@ -291,16 +303,20 @@ type nasSelectedVerifyReportItem struct {
 	CompletedAt     *string         `json:"completed_at"`
 	Error           string          `json:"error"`
 	OriginalWitness json.RawMessage `json:"original_witness,omitempty"`
+	// Recorded by the lease/result API; an older result may retain the lease's
+	// version when its completion request omitted a version.
+	ClientVersion string `json:"client_version"`
 }
 
 func reportNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, label string) (map[string]any, error) {
+	var planID int64
 	var planSHA, createdAt string
 	var witnessMode bool
 	var manifest json.RawMessage
-	if err := pool.QueryRow(ctx, `SELECT plan_sha256,created_at::text,original_witness,manifest FROM nas_selected_verify_plans WHERE label=$1 AND account_id=$2 AND connection_id=$3`, label, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID).Scan(&planSHA, &createdAt, &witnessMode, &manifest); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT id,plan_sha256,created_at::text,original_witness,manifest FROM nas_selected_verify_plans WHERE label=$1 AND account_id=$2 AND connection_id=$3`, label, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID).Scan(&planID, &planSHA, &createdAt, &witnessMode, &manifest); err != nil {
 		return nil, err
 	}
-	rows, err := pool.Query(ctx, `SELECT i.id,i.kind,i.source_id,i.relative_path,i.size_bytes,i.sha256,i.state,i.attempts,i.completed_at::text,i.outcome_error,i.original_witness FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id WHERE p.label=$1 AND p.account_id=$2 AND p.connection_id=$3 ORDER BY i.ordinal`, label, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID)
+	rows, err := pool.Query(ctx, `SELECT id,kind,source_id,relative_path,size_bytes,sha256,state,attempts,completed_at::text,client_version,outcome_error,original_witness FROM nas_selected_verify_items WHERE plan_id=$1 ORDER BY ordinal`, planID)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +326,7 @@ func reportNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, label stri
 	var bytes int64
 	for rows.Next() {
 		var i nasSelectedVerifyReportItem
-		if err := rows.Scan(&i.ID, &i.Kind, &i.SourceID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.State, &i.Attempts, &i.CompletedAt, &i.Error, &i.OriginalWitness); err != nil {
+		if err := rows.Scan(&i.ID, &i.Kind, &i.SourceID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.State, &i.Attempts, &i.CompletedAt, &i.ClientVersion, &i.Error, &i.OriginalWitness); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -320,7 +336,7 @@ func reportNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, label stri
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	out := map[string]any{"label": label, "plan_sha256": planSHA, "created_at": createdAt, "account_id": nasSelectedVerifyAccountID, "connection_id": nasSelectedVerifyConnectionID, "counts": counts, "bytes": bytes, "items": items}
+	out := map[string]any{"label": label, "plan_id": planID, "plan_sha256": planSHA, "created_at": createdAt, "account_id": nasSelectedVerifyAccountID, "connection_id": nasSelectedVerifyConnectionID, "counts": counts, "bytes": bytes, "items": items}
 	if witnessMode {
 		out["witness_manifest"] = manifest
 	}
