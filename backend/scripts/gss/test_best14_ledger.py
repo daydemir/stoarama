@@ -272,6 +272,23 @@ class AssemblyTests(unittest.TestCase):
         with self.assertRaisesRegex(L.LedgerError, 'crosses an hour'):
             self.w.select()
 
+    def test_clock_join_replaces_live_assemblies_inside_it(self):
+        v79 = self.w.assembly(self.rec, [1, 2], 'aa', L.Source.V79_ASSEMBLY, path='v79.mp4')
+        v85 = self.w.assembly(self.rec, [3, 4], 'bb', L.Source.V85_ASSEMBLY, path='v85.mp4')
+        a = self.w.assembly(self.rec, [1, 2, 3, 4], 'cc')
+        hours = self.w.select()
+        h = self.w.hour(hours, DAYS[3], 5)
+        self.assertEqual([(s.file_id, s.path, s.source) for s in h.served], [(a.file_id, path(DAYS[3], 5), L.Source.CLOCK_ASSEMBLY)])
+        served = {s.file_id for x in hours for s in x.served}
+        self.assertFalse({v79.file_id, v85.file_id} & served)
+        self.assertIn(v79.key, self.w.listing)  # the replaced assembly stays in R2 for rollback
+
+    def test_clock_join_partly_over_a_live_assembly_fails(self):
+        self.w.assembly(self.rec, [1, 2, 3], 'aa', L.Source.V79_ASSEMBLY, path='v79.mp4')
+        self.w.assembly(self.rec, [3, 4], 'cc')
+        with self.assertRaisesRegex(L.LedgerError, 'only partly inside'):
+            self.w.select()
+
     def test_registry_assemblies_need_a_matching_hold(self):
         a = self.w.assembly(self.rec, [1, 2], live=False)
         registry = {'files': {a.file_id: {'key': a.key, 'size_bytes': a.size_bytes, 'etag': f'"{ETAG}"', 'sha256': a.sha256, 'path': 'p.mp4'}}}
@@ -288,11 +305,62 @@ class AssemblyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             proofs = os.path.join(d, 'joined', 'clock-prestitch-20261125', 'proofs')
             os.makedirs(proofs)
-            with open(os.path.join(proofs, a.sha256 + '.json'), 'w') as f:
-                json.dump({'hour_id': self.rec.hour_id, 'inputs': [{'output_id': i} for i in a.input_ids],
-                           'output': {'key': a.key, 'sha256': a.sha256, 'size_bytes': a.size_bytes}}, f)
-            self.assertEqual(L.read_proofs(d, {}), [])
-            self.assertEqual(L.read_proofs(d, {a.key: (a.size_bytes, ETAG)}), [a])
+            p = Path(proofs) / (a.sha256 + '.json')
+            record = {'hour_id': self.rec.hour_id, 'inputs': [{'output_id': i} for i in a.input_ids],
+                      'output': {'key': a.key, 'sha256': a.sha256, 'size_bytes': a.size_bytes}}
+            p.write_text(json.dumps(record), encoding='utf-8')
+            proof_key = a.key.replace('/objects/', '/proofs/').replace('.mp4', '.json')
+            proof_bytes = p.read_bytes()
+            listing = {a.key: (a.size_bytes, ETAG), proof_key: (len(proof_bytes), ETAG)}
+            uploads = {a.key: (a.size_bytes, ETAG, a.sha256),
+                       proof_key: (len(proof_bytes), ETAG, hashlib.sha256(proof_bytes).hexdigest())}
+            self.assertEqual(L.read_proofs(d, listing, uploads), [a])
+            for bad in ({}, {a.key: (a.size_bytes, ETAG, 'f' * 64)}, {a.key: (a.size_bytes, '1' * 32, a.sha256)}):
+                with self.assertRaisesRegex(L.LedgerError, 'no unique server-checked upload binds'):
+                    L.read_proofs(d, listing, bad)
+            with self.assertRaises(L.LedgerError):
+                L.read_proofs(d, {a.key: listing[a.key]}, uploads)
+            with mock.patch.object(L, 'VETOED_PAIRS', frozenset(zip(a.input_ids, a.input_ids[1:]))):
+                with self.assertRaisesRegex(L.LedgerError, 'vetoed original-output boundary'):
+                    L.read_proofs(d, listing, uploads)
+            p.write_bytes(proof_bytes + b' ')
+            with self.assertRaisesRegex(L.LedgerError, 'exact proof bytes'):
+                L.read_proofs(d, listing, uploads)
+            p.write_bytes(proof_bytes)
+            with self.assertRaisesRegex(L.LedgerError, 'complete upload log'):
+                L.read_proofs(d, listing, dict(uploads, extra=(1, ETAG, '0' * 64)))
+
+    def test_an_unheld_live_assembly_cannot_return_through_a_proof(self):
+        a = self.w.assembly(self.rec, [2, 3], live=False)
+        registry = {'files': {a.file_id: {'key': a.key}}}
+        with self.assertRaisesRegex(L.LedgerError, 'not in R2 with a matching keep hold'):
+            L.with_proofs([], [a], registry)
+        held = dataclasses.replace(a, path='p.mp4', source=L.Source.CLOCK_ASSEMBLY)
+        self.assertEqual(L.with_proofs([held], [a], registry), [held])  # the live entry serves
+        with self.assertRaisesRegex(L.LedgerError, 'differs from its live assembly'):
+            L.with_proofs([held], [dataclasses.replace(a, etag='1' * 32)], registry)
+        with self.assertRaisesRegex(L.LedgerError, 'differs from its live assembly'):
+            L.with_proofs([held], [dataclasses.replace(a, input_ids=a.input_ids[:1])], registry)
+
+    def test_conflicting_input_lists_for_one_file_fail(self):
+        self.w.assembly(self.rec, [1, 2], 'aa', L.Source.V79_ASSEMBLY, path='v79.mp4')
+        self.w.assembly(self.rec, [1, 2, 3], 'aa')  # the same sha256 with other inputs
+        with self.assertRaisesRegex(L.LedgerError, 'conflicting input lists'):
+            self.w.select()
+
+    def test_clock_join_replaces_only_v79_and_v85(self):
+        self.w.assembly(self.rec, [1, 2], 'aa', L.Source.STRICT_ASSEMBLY, path='strict.mp4')
+        self.w.assembly(self.rec, [1, 2, 3], 'cc')
+        with self.assertRaisesRegex(L.LedgerError, 'only V79/V85 can be replaced'):
+            self.w.select()
+
+    def test_a_vetoed_clock_proof_leaves_the_live_assembly_serving(self):
+        v79 = self.w.assembly(self.rec, [1, 2], 'aa', L.Source.V79_ASSEMBLY, path='v79.mp4')
+        a = self.w.assembly(self.rec, [1, 2, 3], 'cc')
+        with mock.patch.object(L, 'VETOED', frozenset({a.file_id})):
+            h = self.w.hour(self.w.select(), DAYS[3], 5)
+        self.assertEqual([s.file_id for s in h.served][:1], [v79.file_id])
+        self.assertNotIn(a.file_id, [s.file_id for s in h.served])
 
 
 class RuleTests(unittest.TestCase):
@@ -519,7 +587,7 @@ class VetoTests(unittest.TestCase):
                 p = os.path.join(d, name + '.tsv')
                 Path(p).write_text('\n'.join('\t'.join(r) for r in [L.VETO_COLUMNS] + rows) + '\n', encoding='utf-8')
                 if name == 'ok':
-                    self.assertEqual(L.read_veto(p), {good[0]})
+                    self.assertEqual(L.read_veto(p), ({good[0]}, {(1, 2)}))
                 else:
                     with self.assertRaises(L.LedgerError, msg=name):
                         L.read_veto(p)
