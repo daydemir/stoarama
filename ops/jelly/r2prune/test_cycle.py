@@ -4,6 +4,8 @@
 # single JSON-literal statement's, and that RECEIPTS reads live clips through migration
 # 0273's index with an unchanged result. Nothing reaches production.
 import importlib.util
+import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -73,6 +75,70 @@ class Script(Lane):
         self.assertRegex(rows[0]['cycle'], r'^\d{8}T\d{6}Z$')
         self.assertFalse(Path(L, 'cycle.lock').exists())
         self.assertFalse(Path(L, 'cycles').exists())
+
+    def test_cycle_plans_but_does_not_send_or_create_an_execution_intent(self):
+        L = self.dir
+        (L / 'inputs').mkdir()
+        (L / 'inputs/durham-holds.jsonl').write_text('{}\n')
+        (L / 'cycles').mkdir()
+        W = L / 'cycles/new'
+        W.mkdir()
+        protect = L / 'gss-protect.tsv'
+        protect.write_text('page_link\tx\n' * 1035152)
+        key = 'managed/acct-47/folder/object.mp4'
+        calls = []
+
+        def psql(args, out, *, script=None):
+            Path(out).write_text(f'{key}\t1\t1\traw\t1\t1\t100\t{"a" * 64}\te\n'
+                                 if script == cycle.RECEIPTS else '')
+
+        def popen(args, **kwargs):
+            calls.append(args[1])
+            self.assertEqual(args[1], 'list')
+            return unittest.mock.Mock(stdout=io.StringIO(f'{key}\t100\te\t1\n'), wait=lambda: 0)
+
+        def run(args, **kwargs):
+            calls.append(args[1])
+            self.assertEqual(args[1], 'plan')
+            plan = W / 'plan'
+            plan.mkdir()
+            manifest = plan / 'delete-manifest.jsonl'
+            manifest.write_text(json.dumps({'key': key, 'size': 100, 'etag': 'e', 'class': cycle.DELETE_CLASS}) + '\n')
+            (plan / 'summary.json').write_text(json.dumps({'manifest_sha256': hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                                                            'delete': {'objects': 1, 'bytes': 100}}))
+            return subprocess.CompletedProcess(args, 0)
+
+        with unittest.mock.patch.object(cycle, 'psql', side_effect=psql), \
+             unittest.mock.patch.object(cycle, 'env', return_value={}), \
+             unittest.mock.patch.object(cycle.os.path, 'expanduser', return_value=str(protect)), \
+             unittest.mock.patch.object(cycle.subprocess, 'Popen', side_effect=popen), \
+             unittest.mock.patch.object(cycle.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(SystemExit, 'legacy R2 deletion is disabled'):
+                cycle.run(str(L), str(W), 'new', -1)
+        self.assertEqual(calls, ['list', 'plan'])
+        self.assertTrue((W / 'plan/delete-manifest.jsonl').exists())
+        for name in ('delete-intent.json', 'receipt-sources.json', 'ledger.jsonl', 'receipt-result.json', 'receipt-backfill.tsv'):
+            self.assertFalse((W / name).exists(), name)
+
+    def test_historical_cycle_receipts_can_still_be_replayed(self):
+        W = self.dir / 'legacy'
+        (W / 'plan').mkdir(parents=True)
+        key = 'managed/acct-47/folder/object.mp4'
+        manifest = W / 'plan/delete-manifest.jsonl'
+        manifest.write_text(json.dumps({'key': key, 'size': 100, 'etag': 'e', 'class': cycle.DELETE_CLASS}) + '\n')
+        sources = W / 'receipt-sources.json'
+        sources.write_text(json.dumps({key: cycle.receipt_source('raw', '1', '1', '100', 'a'*64, 'e')}))
+        digest = cycle.sha(manifest)
+        (W / 'delete-intent.json').write_text(json.dumps({'manifest_sha256': digest, 'sources_sha256': cycle.sha(sources)}))
+        (W / 'ledger.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in [
+            {'type': 'run', 'manifest_sha256': digest, 'limit': 0},
+            {'key': key, 'size': 100, 'outcome': 'deleted', 'at': '2026-11-25T10:00:00Z'}]))
+        with unittest.mock.patch.object(cycle, 'apply_receipts') as apply, \
+             unittest.mock.patch.object(cycle.subprocess, 'run', side_effect=AssertionError('unexpected call')):
+            cycle.finish_receipts(str(W), -1, replay=True)
+        apply.assert_called_once_with(str(W), 1, -1)
+        self.assertIn(key, (W / 'receipt-backfill.tsv').read_text())
+        self.assertTrue(json.loads((W / 'receipt-result.json').read_text())['complete'])
 
     def test_receipts_read_is_memory_capped(self):
         sets = [l for l in cycle.RECEIPTS.splitlines() if l.startswith('SET ')]

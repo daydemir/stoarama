@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
-	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,8 +19,8 @@ import (
 	"time"
 )
 
-// fakeS3 implements the two calls r2prune sends: ListObjectsV2 (with prefix,
-// delimiter and a deliberately tiny page size) and DeleteObjects.
+// fakeS3 lists with prefix, delimiter and a deliberately tiny page size.
+// Every attempted mutation is recorded and refused.
 type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string]int64
@@ -34,24 +32,9 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	q := r.URL.Query()
-	if r.Method == http.MethodPost && q.Has("delete") {
-		var req struct {
-			Objects []struct{ Key string } `xml:"Object"`
-		}
-		body, _ := io.ReadAll(r.Body)
-		if err := xml.Unmarshal(body, &req); err != nil || len(req.Objects) > deleteBatch {
-			http.Error(w, "bad delete", http.StatusBadRequest)
-			return
-		}
+	if r.Method != http.MethodGet {
 		f.deletes++
-		var out bytes.Buffer
-		out.WriteString(`<DeleteResult>`)
-		for _, o := range req.Objects {
-			delete(f.objects, o.Key)
-			fmt.Fprintf(&out, "<Deleted><Key>%s</Key></Deleted>", o.Key)
-		}
-		out.WriteString(`</DeleteResult>`)
-		w.Write(out.Bytes())
+		http.Error(w, "unexpected mutation", http.StatusBadRequest)
 		return
 	}
 	prefix, delim := q.Get("prefix"), q.Get("delimiter")
@@ -208,7 +191,7 @@ func TestDecide(t *testing.T) {
 	}
 }
 
-func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
+func TestListPlanAndDeleteHoldAgainstFakeS3(t *testing.T) {
 	files, objects := fixture(t)
 	fake := &fakeS3{objects: map[string]int64{}, page: 7}
 	for k, v := range objects {
@@ -266,84 +249,50 @@ func TestListPlanDeleteAgainstFakeS3(t *testing.T) {
 		t.Fatal("summary does not pin the manifest digest")
 	}
 
-	summaryPath := filepath.Join(out, "summary.json")
-	run, err := verifyReviewedInputs(manifest, summaryPath, sum.ManifestSHA256, files)
-	if err != nil || run.Inputs["controller_protect"] == "" || run.RecentFrom != files.recentFrom {
-		t.Fatalf("reviewed inputs must verify: %v %+v", err, run)
-	}
-	if _, err := verifyReviewedInputs(manifest, summaryPath, strings.Repeat("0", 64), files); err == nil {
-		t.Fatal("wrong manifest digest must refuse")
-	}
-	other := files
-	other.recentFrom = "2026-11-19T00:00:00Z"
-	if _, err := verifyReviewedInputs(manifest, summaryPath, sum.ManifestSHA256, other); err == nil {
-		t.Fatal("a recent-from other than the plan's must refuse")
-	}
-
-	// A key protected by a reason that holds outside the window after the plan:
-	// the changed input refuses the run, and the per-key re-check skips it even
-	// when called directly.
-	f, _ := os.OpenFile(files.dbProtect, os.O_APPEND|os.O_WRONLY, 0)
-	f.WriteString("stitch_input_hold\tmanaged/acct-47/a_folder/late.mp4\n")
-	f.Close()
-	if _, err := verifyReviewedInputs(manifest, summaryPath, sum.ManifestSHA256, files); err == nil {
-		t.Fatal("a changed protect input must refuse")
-	}
 	ledger := filepath.Join(dir, "ledger.jsonl")
-	r, err := files.load()
-	if err != nil {
-		t.Fatal(err)
+	fresh := snap.Name()
+	deleteArgs := []string{"--manifest", manifest, "--summary", filepath.Join(out, "summary.json"),
+		"--fresh-listing", fresh, "--expected-sha256", sum.ManifestSHA256, "--ledger", ledger,
+		"--identities", files.identities, "--db-protect", files.dbProtect, "--closure", files.closure,
+		"--controller-protect", files.controller, "--picks", files.picks, "--recent-from", files.recentFrom}
+	if err := runDelete(context.Background(), deleteArgs); !errors.Is(err, errDeleteHeld) {
+		t.Fatalf("current reviewed delete must refuse: %v", err)
 	}
-	// The fresh listing is the fake bucket as it is now, with one key rewritten.
-	fresh := filepath.Join(dir, "fresh.tsv")
-	ff, _ := os.Create(fresh)
-	if _, _, err := listBucket(context.Background(), st, 4, 3, []string{""}, ff); err != nil {
-		t.Fatal(err)
+	historical := []manifestRow{
+		{Key: "managed/acct-47/ke_folder/x.mp4", Size: 106, ETag: "e", MTime: w0, Class: class("delete_ke_raw_stitched")},
+		{Key: "managed/acct-47/a_folder/old.mp4", Size: 100, ETag: "stale", MTime: w0, Class: deleteRawOutsideWindow},
+		{Key: "joined/nightly-collation-v2/objects/old.mp4", Size: 200, ETag: "e", MTime: w0, Class: deleteCollatedOutsideWindow},
 	}
-	ff.Close()
-	if r.Fresh, err = loadFresh(fresh, manifest); err != nil {
-		t.Fatal(err)
-	}
-	rewritten := r.Fresh["managed/acct-47/a_folder/bulk/0007.mp4"]
-	rewritten.ETag = "changed"
-	r.Fresh["managed/acct-47/a_folder/bulk/0007.mp4"] = rewritten
-	if err := deleteManifest(context.Background(), st, r, run, manifest, ledger, 4, 0); err != nil {
-		t.Fatal(err)
-	}
-	outcomes := map[outcome]int{}
-	lf, _ := os.Open(ledger)
-	sc := bufio.NewScanner(lf)
-	sc.Scan()
-	var header runHeader
-	if json.Unmarshal(sc.Bytes(), &header); header.Type != "run" || header.ManifestSHA256 != sum.ManifestSHA256 || header.RecentFrom != files.recentFrom {
-		t.Fatalf("ledger header %+v", header)
-	}
-	for sc.Scan() {
-		var row ledgerRow
-		json.Unmarshal(sc.Bytes(), &row)
-		outcomes[row.Outcome]++
-	}
-	lf.Close()
-	if outcomes[outcomeDeleted] != 2503 || outcomes[outcomeSkippedProtected] != 1 || outcomes[outcomeSkippedChanged] != 1 || outcomes[outcomeFailed] != 0 {
-		t.Fatalf("outcomes %v", outcomes)
-	}
-	if fake.deletes != 3 {
-		t.Fatalf("want 3 DeleteObjects batches, got %d", fake.deletes)
-	}
-	for _, kept := range []string{"managed/acct-47/a_folder/late.mp4", "managed/acct-47/a_folder/in.mp4", "managed/acct-47/a_folder/innas.mp4",
-		"managed/acct-47/ke_folder/x.mp4", "managed/acct-47/recordings/1/ke.mp4", "joined/best14-20261021/z.mp4", "app/state.json"} {
-		if _, ok := fake.objects[kept]; !ok {
-			t.Errorf("protected key %s was deleted", kept)
+	for _, rows := range [][]manifestRow{historical[:1], historical[1:2], historical, nil} {
+		// Reuse the old CLI shape with an actual historical/mixed/stale
+		// manifest, even though its former ledger and policy cannot authorize it.
+		var body bytes.Buffer
+		for _, row := range rows {
+			if err := json.NewEncoder(&body).Encode(row); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(manifest, body.Bytes(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := runDelete(context.Background(), deleteArgs); !errors.Is(err, errDeleteHeld) {
+			t.Fatalf("old/mixed/stale manifest must refuse: %v", err)
+		}
+		if err := deleteBatchOnce(context.Background(), st, rows, func([]ledgerRow) error {
+			t.Fatal("blocked batch must not record any outcome")
+			return nil
+		}); !errors.Is(err, errDeleteHeld) {
+			t.Fatalf("direct batch must refuse: %v", err)
 		}
 	}
-	if _, ok := fake.objects["joined/nightly-collation-v2/objects/page.mp4"]; ok {
-		t.Error("an outside-window page link survived")
+	if err := runDelete(context.Background(), append(deleteArgs, "--ke-coverage", "old.tsv")); !errors.Is(err, errDeleteHeld) {
+		t.Fatalf("historical flags must refuse: %v", err)
 	}
-	if _, ok := fake.objects["managed/acct-47/a_folder/bulk/0007.mp4"]; !ok {
-		t.Error("a key changed since the plan was deleted")
+	if _, err := os.Stat(ledger); !os.IsNotExist(err) {
+		t.Fatalf("blocked delete created ledger: %v", err)
 	}
-	if _, ok := fake.objects["managed/acct-47/a_folder/old.mp4"]; ok {
-		t.Error("outside-window RAW key survived")
+	if fake.deletes != 0 || len(fake.objects) != len(objects) {
+		t.Fatalf("blocked delete sent %d mutations; objects %d of %d", fake.deletes, len(fake.objects), len(objects))
 	}
 }
 
@@ -601,68 +550,6 @@ func TestLegacyKECoverageFlagIsRejected(t *testing.T) {
 	}
 }
 
-func TestDeleteSkipsHistoricalKEClassEvenWithCoveringOutput(t *testing.T) {
-	files, _ := keFixture(t)
-	dir := t.TempDir()
-	manifest := filepath.Join(dir, "manifest.jsonl")
-	row := manifestRow{Key: "managed/acct-47/ke_folder/cov.mp4", Size: 120, ETag: "e", MTime: w0, Class: class("delete_ke_raw_stitched"),
-		Reason: "covered_by:joined/nightly-collation-v2"}
-	f, err := os.Create(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.NewEncoder(f).Encode(row); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	// A legacy reviewed summary is also rejected by the normal delete path:
-	// the removed rule input cannot match today's registered rule set.
-	digest, err := fileSHA256(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inputs, err := files.digests()
-	if err != nil {
-		t.Fatal(err)
-	}
-	inputs["ke_coverage"] = "historical"
-	body, err := json.Marshal(summary{ManifestSHA256: digest, RecentFrom: files.recentFrom, Inputs: inputs})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := verifyReviewedInputs(manifest, writeFile(t, dir, "summary.json", string(body)), digest, files); err == nil ||
-		!strings.Contains(err.Error(), "are not the reviewed set") {
-		t.Fatalf("legacy policy inputs must refuse: %v", err)
-	}
-	r, err := files.load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Both objects still exist at the reviewed sizes.
-	r.Fresh = map[string]object{row.Key: {Key: row.Key, Size: row.Size, ETag: row.ETag, MTime: row.MTime}}
-	if r.Outputs, err = scanOutputSizes(writeFile(t, dir, "fresh.tsv",
-		fmt.Sprintf("%s\t120\te\t%d\njoined/nightly-collation-v2/objects/out.mp4\t500\te\t%d\n", row.Key, w0, w0)), r.OutputKeys); err != nil {
-		t.Fatal(err)
-	}
-	ledger := filepath.Join(dir, "ledger.jsonl")
-	if err := deleteManifest(context.Background(), store{bucket: "stoarama"}, r, runHeader{}, manifest, ledger, 2, 0); err != nil {
-		t.Fatal(err)
-	}
-	lf, _ := os.Open(ledger)
-	sc := bufio.NewScanner(lf)
-	sc.Scan() // run header
-	outcomes := map[outcome]int{}
-	for sc.Scan() {
-		var got ledgerRow
-		json.Unmarshal(sc.Bytes(), &got)
-		outcomes[got.Outcome]++
-	}
-	lf.Close()
-	if outcomes[outcomeSkippedProtected] != 1 || outcomes[outcomeDeleted] != 0 {
-		t.Fatalf("historical KE class must skip even with its covering output: %v", outcomes)
-	}
-}
-
 // A derived identity (no direct catalog row) never lifts a window-only hold.
 func TestWindowOnlyHoldStaysForDerivedOnlyKey(t *testing.T) {
 	const page = "joined/goodplus-gen1/page-only.mp4"
@@ -803,7 +690,7 @@ func TestBest14CoverageRefusesBadRows(t *testing.T) {
 	}
 }
 
-func TestBest14CoveragePlanThenDeleteRechecksOutput(t *testing.T) {
+func TestBest14CoveragePlanRemainsReadOnly(t *testing.T) {
 	files, sizes := best14Fixture(t)
 	dir := t.TempDir()
 	k := "managed/acct-47/a_folder/b14/cov.mp4"
@@ -823,27 +710,14 @@ func TestBest14CoveragePlanThenDeleteRechecksOutput(t *testing.T) {
 	if sum.Inputs["best14_coverage"] == "" || sum.ByClass[deleteBest14RawStitched] == nil || sum.ByClass[deleteBest14RawStitched].Objects != 1 {
 		t.Fatalf("plan must pin the coverage digest and delete the one covered raw: %+v", sum)
 	}
-	manifest := filepath.Join(out, "delete-manifest.jsonl")
-	r, err := files.load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The fresh listing still has the raw but no longer its output: the key is skipped, never deleted.
-	fresh := writeFile(t, dir, "fresh.tsv", fmt.Sprintf("%s\t%d\te\t%d\n", k, sizes[k], w0))
-	if r.Fresh, err = loadFresh(fresh, manifest); err != nil {
-		t.Fatal(err)
-	}
-	if r.Outputs, err = scanOutputSizes(fresh, r.OutputKeys); err != nil {
-		t.Fatal(err)
-	}
 	ledger := filepath.Join(dir, "ledger.jsonl")
-	if err := deleteManifest(context.Background(), store{bucket: "stoarama"}, r, runHeader{}, manifest, ledger, 2, 0); err != nil {
-		t.Fatal(err)
+	if err := runDelete(context.Background(), []string{"--manifest", filepath.Join(out, "delete-manifest.jsonl"), "--ledger", ledger}); !errors.Is(err, errDeleteHeld) {
+		t.Fatalf("best14 plan must not be executable: %v", err)
 	}
-	body, _ := os.ReadFile(ledger)
-	if !strings.Contains(string(body), `"outcome":"skipped_protected"`) || strings.Contains(string(body), `"outcome":"deleted"`) {
-		t.Fatalf("output gone from the fresh listing must skip: %s", body)
+	if _, err := os.Stat(ledger); !os.IsNotExist(err) {
+		t.Fatalf("blocked delete created ledger: %v", err)
 	}
+
 }
 
 // A key the live GSS generation serves is protect_live_site even outside its

@@ -1,11 +1,10 @@
 // r2prune lists the R2 bucket directly, classifies every key against the
-// owner's keep rules and deletes a reviewed manifest in DeleteObjects batches.
+// owner's keep rules and writes read-only plans. Deletion is disabled.
 //
 //	r2prune list   --out snapshot.tsv                      (stdout when --out is -)
 //	r2prune plan   --snapshot S --identities I --db-protect P --closure C \
 //	               --controller-protect J --picks K --out DIR
-//	r2prune delete --manifest M --expected-sha256 H --controller-protect J \
-//	               --db-protect P --ledger L
+//	r2prune delete  (disabled; always refuses)
 //
 // The plan inputs come from the read-only queries in sql/ (identities per
 // stream, closure per 20-day window, protect sets) plus the controller's
@@ -29,7 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-const usage = "usage: r2prune list|plan|delete [flags]"
+const usage = "usage: r2prune list|plan [flags]; delete is disabled"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -87,8 +86,7 @@ func storeFromEnv() (store, error) {
 // newRetryer backs off on R2's 429 "Reduce your concurrent request rate"
 // (code ServiceUnavailable), which the SDK does not treat as retryable by
 // default; SlowDown and 5xx already are. Backoff is the SDK's capped
-// exponential with jitter. Retrying is safe: list pages reuse their
-// continuation token and DeleteObjects is idempotent for the same key set.
+// exponential with jitter. Retrying list pages reuses their continuation token.
 // Attempts stay bounded; a persistent refusal still fails the run closed.
 func newRetryer() aws.Retryer {
 	return retry.NewStandard(func(o *retry.StandardOptions) {

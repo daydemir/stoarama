@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import random
 import re
 import shutil
 import subprocess
@@ -18,7 +17,6 @@ import time
 
 HERE = Path(__file__).resolve().parent
 PSQL = '/opt/homebrew/opt/libpq/bin/psql'
-AWS = os.path.expanduser('~/aws-cli/aws')
 DBENV = os.path.expanduser('~/Build/stoarama/local/recording-supervisor.env')
 R2ENV = os.path.expanduser('~/Build/stoarama/local/render.env')
 RELEASE = 'nas_keep_20,unresolved_best14_delivery_identity,delivery_repairs_and_unresolved_stitch_provenance'
@@ -350,7 +348,9 @@ def main(L):
 
 def run(L, W, stamp, lock_fd):
     I = L + '/inputs'
-    hold = {json.loads(l)['object_key'] for l in list(open(I + '/durham-holds.jsonl'))[1:]}
+    with open(I + '/durham-holds.jsonl') as f:
+        next(f, None)  # header
+        hold = {json.loads(l)['object_key'] for l in f}
     psql([], W + '/receipts.tsv', script=RECEIPTS)
     ev, nasm, sources = {}, {}, {}
     ambiguous = set()
@@ -390,7 +390,8 @@ def run(L, W, stamp, lock_fd):
                     skipped['receipt_identity'] += 1
         if p.wait() != 0:
             sys.exit('r2prune list failed')
-    present = [l.split('\t', 1)[0] for l in open(W + '/snapshot.tsv')]
+    with open(W + '/snapshot.tsv') as f:
+        present = [l.split('\t', 1)[0] for l in f]
     blocked = preflight(W, present, sources)
     if blocked:
         with open(W + '/snapshot.tsv') as current, open(W + '/snapshot-safe.tsv', 'w') as safe:
@@ -401,7 +402,8 @@ def run(L, W, stamp, lock_fd):
                 else:
                     skipped['catalog_veto'] += 1
         os.replace(W + '/snapshot-safe.tsv', W + '/snapshot.tsv')
-        present = [line.split('\t', 1)[0] for line in open(W + '/snapshot.tsv')]
+        with open(W + '/snapshot.tsv') as f:
+            present = [line.split('\t', 1)[0] for line in f]
     if not present:
         shutil.rmtree(W)
         return log(L, {'cycle': stamp, 'receipts': len(ev), 'present': 0, 'listed': listed, 'skipped': skipped})
@@ -413,54 +415,20 @@ def run(L, W, stamp, lock_fd):
              '--picks', I + '/picks.json', '--release', RELEASE, '--recent-from', RECENT]
     rules += ['--db-protect', W + '/protect-db-now.tsv', '--nas-evidence', W + '/nas-evidence.tsv']
     subprocess.run([L + '/r2prune', 'plan', '--snapshot', W + '/snapshot.tsv', '--out', W + '/plan'] + rules, check=True)
-    summ = json.load(open(W + '/plan/summary.json'))
+    with open(W + '/plan/summary.json') as f:
+        summ = json.load(f)
     manifest = sha(W + '/plan/delete-manifest.jsonl')
     assert manifest == summ['manifest_sha256']
     dele = summ['delete']['objects']
     if dele:
-        assert {c for c in summ['by_class'] if c.startswith('delete_')} == {DELETE_CLASS}, summ['by_class']
-        planned = read_manifest(W, manifest)
-        if len(planned) != dele:
-            raise ValueError(f'{W}: manifest count differs from summary')
-        bound_sources = {key: sources[key] for key in planned}
-        if len({(s['kind'], s['source_id']) for s in bound_sources.values()}) != dele:
-            raise ValueError(f'{W}: manifest sources are ambiguous')
-        for key, row in planned.items():
-            if not receipt_ready(key, row['size'], row['etag'].strip('"'), bound_sources[key]):
-                raise ValueError(f'{W}: manifest key lacks matching receipt source: {key}')
-        source_path = W + '/receipt-sources.json'
-        durable_write(source_path, json.dumps(bound_sources, sort_keys=True) + '\n')
-        with open(W + '/plan/delete-manifest.jsonl', 'rb') as f:
-            os.fsync(f.fileno())
-        sync_dir(W + '/plan')
-        durable_write(W + '/delete-intent.json', json.dumps({
-            'manifest_sha256': manifest, 'sources_sha256': sha(source_path)}) + '\n')
-        delete = subprocess.run([L + '/r2prune', 'delete', '--manifest', W + '/plan/delete-manifest.jsonl', '--summary', W + '/plan/summary.json',
-                        '--fresh-listing', W + '/snapshot.tsv', '--expected-sha256', manifest, '--ledger', W + '/ledger.jsonl',
-                        '--workers', '8'] + rules, env=r2, pass_fds=(lock_fd,))
-        finish_receipts(W, lock_fd)
-        delete.check_returncode()
-    out = {}
-    for l in open(W + '/ledger.jsonl') if dele else []:
-        d = json.loads(l)
-        if 'outcome' in d:
-            out[d['outcome']] = out.get(d['outcome'], 0) + 1
-    gone = [json.loads(l)['key'] for l in open(W + '/ledger.jsonl') if '"deleted"' in l] if dele else []
-    e404 = 0
-    sample = random.sample(gone, min(10, len(gone)))
-    for k in sample:
-        r = subprocess.run([AWS, 's3api', 'head-object', '--endpoint-url', f"https://{r2['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-                            '--bucket', r2['R2_BUCKET'], '--key', k], capture_output=True, text=True,
-                           env={**r2, 'AWS_ACCESS_KEY_ID': r2['R2_ACCESS_KEY_ID'], 'AWS_SECRET_ACCESS_KEY': r2['R2_SECRET_ACCESS_KEY'],
-                                'AWS_DEFAULT_REGION': 'auto'})
-        e404 += r.returncode != 0 and '(404)' in r.stderr
+        # Keep the read-only plan for inspection; never create an execution
+        # intent, receipt source claims, or send a mutation to the legacy binary.
+        raise SystemExit('legacy R2 deletion is disabled: exact surviving copy verification and permanent cross-store protection are required')
     for f in ('snapshot.tsv', 'protect-db-now.tsv', 'receipts.tsv', 'plan/classified.tsv', 'catalog-vetoes.tsv'):
         Path(W, f).unlink(missing_ok=True)
     log(L, {'cycle': stamp, 'receipts': len(ev), 'present': len(present), 'listed': listed, 'skipped': skipped,
          'plan': {c: v['objects'] for c, v in summ['by_class'].items()}, 'delete_bytes': summ['delete']['bytes'],
-         'manifest_sha256': manifest, 'outcomes': out, 'head_404': f'{e404}/{len(sample)}'})
-    if e404 != len(sample):
-        sys.exit('HEAD sample found deleted keys still present')
+         'manifest_sha256': manifest, 'outcomes': {}, 'head_404': '0/0'})
 
 
 if __name__ == '__main__':

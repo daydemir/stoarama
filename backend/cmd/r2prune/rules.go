@@ -124,7 +124,6 @@ type rules struct {
 	Best14Coverage map[string][]coverageRow
 	OutputKeys     map[string]bool
 	Outputs        map[string]int64
-	Fresh          map[string]object // delete only: the listing taken right before the run
 }
 
 type ruleFiles struct {
