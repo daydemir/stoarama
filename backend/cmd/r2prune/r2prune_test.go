@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -398,8 +399,8 @@ func TestReleaseWindowOnLiveEvidence(t *testing.T) {
 	}
 }
 
-// keFixture extends the shared fixture with a KE raw clip whose bytes are in a
-// stitched output, plus the coverage TSV naming it.
+// keFixture deliberately supplies best-14 coverage rows for KE keys: such rows
+// must never override the Keep Everything classification.
 func keFixture(t *testing.T) (ruleFiles, *strings.Builder) {
 	t.Helper()
 	files, _ := fixture(t)
@@ -420,8 +421,9 @@ func keFixture(t *testing.T) (ruleFiles, *strings.Builder) {
 	p.WriteString("page_link\tmanaged/acct-47/ke_folder/page.mp4\n")
 	p.Close()
 	dir := t.TempDir()
-	files.keCoverage = writeFile(t, dir, "coverage.tsv", strings.Join([]string{
+	files.best14Coverage = writeFile(t, dir, "coverage.tsv", strings.Join([]string{
 		"managed/acct-47/ke_folder/cov.mp4\t120\tjoined/nightly-collation-v2/objects/out.mp4\t500",
+		"managed/acct-47/ke_folder/alias.mp4\t107\tjoined/nightly-collation-v2/objects/out.mp4\t500",
 		"managed/acct-47/recordings/1/ke2.mp4\t124\tjoined/nightly-collation-v2/objects/absent.mp4\t600",
 		"managed/acct-47/ke_folder/recent.mp4\t125\tjoined/nightly-collation-v2/objects/out.mp4\t500",
 		"managed/acct-47/ke_folder/page.mp4\t126\tjoined/nightly-collation-v2/objects/out.mp4\t500",
@@ -430,7 +432,7 @@ func keFixture(t *testing.T) (ruleFiles, *strings.Builder) {
 	return files, extra
 }
 
-func TestKECoveragePlanAndDecide(t *testing.T) {
+func TestKeepEverythingProtectedEvenWithCoverage(t *testing.T) {
 	files, _ := keFixture(t)
 	dir := t.TempDir()
 	snapshot := writeFile(t, dir, "snapshot.tsv", strings.Join([]string{
@@ -442,7 +444,7 @@ func TestKECoveragePlanAndDecide(t *testing.T) {
 	out := filepath.Join(dir, "plan")
 	args := []string{"--snapshot", snapshot, "--out", out, "--identities", files.identities, "--db-protect", files.dbProtect,
 		"--closure", files.closure, "--controller-protect", files.controller, "--picks", files.picks,
-		"--recent-from", files.recentFrom, "--ke-coverage", files.keCoverage}
+		"--recent-from", files.recentFrom, "--best14-coverage", files.best14Coverage}
 	if err := runPlan(args); err != nil {
 		t.Fatal(err)
 	}
@@ -451,29 +453,15 @@ func TestKECoveragePlanAndDecide(t *testing.T) {
 	if err := json.Unmarshal(raw, &sum); err != nil {
 		t.Fatal(err)
 	}
-	if sum.Inputs["ke_coverage"] == "" {
-		t.Fatal("plan must pin the coverage file digest")
+	if sum.Delete.Objects != 0 {
+		t.Fatalf("no KE raw may enter a delete manifest: %+v", sum.Delete)
 	}
-	if got := sum.ByClass[deleteKeRawStitched]; got == nil || got.Objects != 1 {
-		t.Fatalf("covered KE raw must be one delete, got %v", got)
+	if got := sum.ByClass[protectKeepEverything]; got == nil || got.Objects != 3 {
+		t.Fatalf("all KE keys stay protected, got %v", got)
 	}
-	if got := sum.ByClass[protectKeepEverything]; got == nil || got.Objects != 2 {
-		t.Fatalf("x.mp4 and the absent-output key stay protected, got %v", got)
-	}
-	var rows []manifestRow
-	lf, _ := os.Open(filepath.Join(out, "delete-manifest.jsonl"))
-	sc := bufio.NewScanner(lf)
-	for sc.Scan() {
-		var row manifestRow
-		if err := json.Unmarshal(sc.Bytes(), &row); err != nil {
-			t.Fatal(err)
-		}
-		rows = append(rows, row)
-	}
-	lf.Close()
-	if len(rows) != 1 || rows[0].Key != "managed/acct-47/ke_folder/cov.mp4" || rows[0].Class != deleteKeRawStitched ||
-		rows[0].Reason != "covered_by:joined/nightly-collation-v2" {
-		t.Fatalf("manifest rows %+v", rows)
+	rows, err := os.ReadFile(filepath.Join(out, "delete-manifest.jsonl"))
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("manifest must be empty, got %q (%v)", rows, err)
 	}
 
 	r, err := files.load()
@@ -482,13 +470,14 @@ func TestKECoveragePlanAndDecide(t *testing.T) {
 	}
 	r.Outputs = map[string]int64{"joined/nightly-collation-v2/objects/out.mp4": 500}
 	for key, want := range map[string]class{
-		"managed/acct-47/ke_folder/cov.mp4":             deleteKeRawStitched,
+		"managed/acct-47/ke_folder/cov.mp4":             protectKeepEverything,
+		"managed/acct-47/ke_folder/alias.mp4":           protectKeepEverything, // non-KE stream, KE folder
 		"managed/acct-47/recordings/1/ke2.mp4":          protectKeepEverything, // output absent
 		"joined/nightly-collation-v2/objects/kecol.mp4": protectKeepEverything, // collated KE
 		"managed/acct-47/ke_folder/page.mp4":            protectLiveSite,       // page_link
 		"managed/acct-47/recordings/1/ke.mp4":           protectKeepEverything, // no coverage row
 	} {
-		size := map[string]int64{"managed/acct-47/ke_folder/cov.mp4": 120, "managed/acct-47/recordings/1/ke2.mp4": 124,
+		size := map[string]int64{"managed/acct-47/ke_folder/cov.mp4": 120, "managed/acct-47/ke_folder/alias.mp4": 107, "managed/acct-47/recordings/1/ke2.mp4": 124,
 			"joined/nightly-collation-v2/objects/kecol.mp4": 122, "managed/acct-47/ke_folder/page.mp4": 126,
 			"managed/acct-47/recordings/1/ke.mp4": 108}[key]
 		if got, reason := r.decide(object{Key: key, Size: size, MTime: w0}); got != want {
@@ -585,45 +574,38 @@ func TestWindowOnlyDBProtectsHoldOnlyInsideWindow(t *testing.T) {
 	}
 }
 
-func TestKECoverageOffLeavesKeepEverythingAlone(t *testing.T) {
+func TestKeepEverythingProtectedWithoutCoverage(t *testing.T) {
 	files, _ := keFixture(t)
-	files.keCoverage = ""
+	files.best14Coverage = ""
 	r, err := files.load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	r.Outputs = map[string]int64{"joined/nightly-collation-v2/objects/out.mp4": 500}
 	if got, reason := r.decide(object{Key: "managed/acct-47/ke_folder/cov.mp4", Size: 120, MTime: w0}); got != protectKeepEverything || reason != "keep_everything_folder_in_key" {
-		t.Fatalf("without --ke-coverage: got %s (%s)", got, reason)
+		t.Fatalf("without coverage: got %s (%s)", got, reason)
 	}
 }
 
-func TestKECoverageRefusesBadRows(t *testing.T) {
-	files, _ := keFixture(t)
-	dir := t.TempDir()
-	for name, body := range map[string]string{
-		"malformed":     "a\t1\tb\n",
-		"zero raw size": "a\t0\tb\t2\n",
-		"zero output":   "a\t1\tb\t0\n",
-		"empty raw":     "\t1\tb\t2\n",
-		"empty output":  "a\t1\t\t2\n",
-		"duplicate":     "a\t1\tb\t2\na\t1\tb\t2\n",
-		"output as raw": "a\t1\tb\t2\nb\t1\tc\t2\n",
-		"manifest out":  "a\t1\tjoined/nightly-collation-v2/manifests/m.json\t2\n",
-	} {
-		bad := files
-		bad.keCoverage = writeFile(t, dir, strings.ReplaceAll(name, " ", "_")+".tsv", body)
-		if _, err := bad.load(); err == nil {
-			t.Errorf("%s: must refuse", name)
+func TestLegacyKECoverageFlagIsRejected(t *testing.T) {
+	for _, cmd := range []string{"plan", "delete"} {
+		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+		var files ruleFiles
+		files.register(fs)
+		if err := fs.Parse([]string{"--ke-coverage", "legacy.tsv"}); err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+			t.Fatalf("%s: legacy flag must be rejected, got %v", cmd, err)
 		}
 	}
+	if class("delete_ke_raw_stitched").deletes() {
+		t.Fatal("historical class must no longer be deletable")
+	}
 }
 
-func TestDeleteSkipsKECoveredKeyWhenOutputLeavesFreshListing(t *testing.T) {
+func TestDeleteSkipsHistoricalKEClassEvenWithCoveringOutput(t *testing.T) {
 	files, _ := keFixture(t)
 	dir := t.TempDir()
 	manifest := filepath.Join(dir, "manifest.jsonl")
-	row := manifestRow{Key: "managed/acct-47/ke_folder/cov.mp4", Size: 120, ETag: "e", MTime: w0, Class: deleteKeRawStitched,
+	row := manifestRow{Key: "managed/acct-47/ke_folder/cov.mp4", Size: 120, ETag: "e", MTime: w0, Class: class("delete_ke_raw_stitched"),
 		Reason: "covered_by:joined/nightly-collation-v2"}
 	f, err := os.Create(manifest)
 	if err != nil {
@@ -633,14 +615,33 @@ func TestDeleteSkipsKECoveredKeyWhenOutputLeavesFreshListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
+	// A legacy reviewed summary is also rejected by the normal delete path:
+	// the removed rule input cannot match today's registered rule set.
+	digest, err := fileSHA256(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := files.digests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs["ke_coverage"] = "historical"
+	body, err := json.Marshal(summary{ManifestSHA256: digest, RecentFrom: files.recentFrom, Inputs: inputs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyReviewedInputs(manifest, writeFile(t, dir, "summary.json", string(body)), digest, files); err == nil ||
+		!strings.Contains(err.Error(), "are not the reviewed set") {
+		t.Fatalf("legacy policy inputs must refuse: %v", err)
+	}
 	r, err := files.load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The fresh listing still has the raw key but no longer its output.
+	// Both objects still exist at the reviewed sizes.
 	r.Fresh = map[string]object{row.Key: {Key: row.Key, Size: row.Size, ETag: row.ETag, MTime: row.MTime}}
 	if r.Outputs, err = scanOutputSizes(writeFile(t, dir, "fresh.tsv",
-		fmt.Sprintf("%s\t120\te\t%d\n", row.Key, w0)), r.OutputKeys); err != nil {
+		fmt.Sprintf("%s\t120\te\t%d\njoined/nightly-collation-v2/objects/out.mp4\t500\te\t%d\n", row.Key, w0, w0)), r.OutputKeys); err != nil {
 		t.Fatal(err)
 	}
 	ledger := filepath.Join(dir, "ledger.jsonl")
@@ -658,7 +659,7 @@ func TestDeleteSkipsKECoveredKeyWhenOutputLeavesFreshListing(t *testing.T) {
 	}
 	lf.Close()
 	if outcomes[outcomeSkippedProtected] != 1 || outcomes[outcomeDeleted] != 0 {
-		t.Fatalf("output gone from fresh listing must skip: %v", outcomes)
+		t.Fatalf("historical KE class must skip even with its covering output: %v", outcomes)
 	}
 }
 
@@ -740,7 +741,7 @@ func TestBest14CoverageDecide(t *testing.T) {
 		"hold":    protectWindowNotOnNAS,   // any key protection wins
 		"absent":  protectWindowNotOnNAS,   // its output is not in the listing
 		"derived": protectWindowNotOnNAS,   // no direct catalog identity
-		"ke":      protectKeepEverything,   // Keep Everything goes only by --ke-coverage
+		"ke":      protectKeepEverything,   // Keep Everything is always protected
 		"out":     protectWindowNotOnNAS,   // no coverage row
 	} {
 		got, reason := r.decide(object{Key: key(n), Size: sizes[key(n)], MTime: w0})
@@ -787,6 +788,9 @@ func TestBest14CoverageRefusesBadRows(t *testing.T) {
 	for name, body := range map[string]string{
 		"malformed":     "a\t1\tb\n",
 		"zero raw size": "a\t0\tb\t2\n",
+		"zero output":   "a\t1\tb\t0\n",
+		"empty raw":     "\t1\tb\t2\n",
+		"empty output":  "a\t1\t\t2\n",
 		"duplicate":     "a\t1\tb\t2\na\t1\tb\t2\n",
 		"output as raw": "a\t1\tb\t2\nb\t1\tc\t2\n",
 		"manifest out":  "a\t1\tjoined/nightly-collation-v2/manifests/m.json\t2\n",
@@ -796,16 +800,6 @@ func TestBest14CoverageRefusesBadRows(t *testing.T) {
 		if _, err := bad.load(); err == nil {
 			t.Errorf("%s: must refuse", name)
 		}
-	}
-	both := files
-	both.keCoverage = writeFile(t, dir, "ke.tsv", "managed/acct-47/a_folder/b14/cov.mp4\t140\tjoined/x.mp4\t2\n")
-	if _, err := both.load(); err == nil || !strings.Contains(err.Error(), "both") {
-		t.Errorf("a raw in both coverage files must refuse, got %v", err)
-	}
-	cross := files
-	cross.keCoverage = writeFile(t, dir, "ke2.tsv", "joined/recovery-best14-20261125/objects/served.mp4\t900\tjoined/x.mp4\t2\n")
-	if _, err := cross.load(); err == nil {
-		t.Error("a best-14 output that is a KE raw row must refuse")
 	}
 }
 

@@ -42,10 +42,8 @@ DEFAULTS = {
 }
 BUCKET = 'stoarama'
 COLLATED = ('joined/goodplus-', 'joined/nightly-collation-v2/', 'joined/best14-20261021/')
-KE_CLASS = 'delete_ke_raw_stitched'  # class (a): Keep Everything raw inside a stitched R2 output
+LEGACY_KE_CLASS = 'delete_ke_raw_stitched'  # historical receipt/manifest value, never admitted for delete
 BEST14_CLASS = 'delete_best14_raw_stitched'  # class (b): best-14 raw inside a stitched output the GSS page serves
-# Covered classes and the r2prune flag naming each one's coverage rows; each runs in verify mode.
-COVERAGE = {KE_CLASS: 'ke-coverage', BEST14_CLASS: 'best14-coverage'}
 OUTCOMES = {'deleted', 'failed', 'skipped_protected', 'skipped_changed'}
 FINAL = OUTCOMES - {'failed'}  # a failed DELETE may still have removed the object
 ABSENT = 'absent_from_fresh_listing'
@@ -58,7 +56,7 @@ ROWS_PER_STATEMENT = 5000
 
 class Mode(enum.Enum):
     LISTING = 'listing'    # the operator's --fresh-listing, pinned for the life of the intent
-    VERIFY = 'verify'      # covered classes: the wrapper writes one live-verified listing per chunk
+    VERIFY = 'verify'      # covered best-14 raws: the wrapper writes one live-verified listing per chunk
     BACKFILL = 'backfill'  # receipts for a run made without the wrapper; never deletes
 
 
@@ -373,8 +371,15 @@ def dry_run(cfg, W, tsv, refuse=True):
     return actions, keys
 
 
+def refuse_ke_manifest(manifest):
+    """Keep Everything is absolute; historical manifests are evidence, not deletion authority."""
+    if any(row['class'] == LEGACY_KE_CLASS for row in manifest.values()):
+        raise SystemExit('Keep Everything is protected: historical delete_ke_raw_stitched manifests cannot be deleted')
+
+
 def preflight(cfg, W, keys, manifest, sources, manifest_sha):
     """The receipt path's checks on every key this r2prune call may delete, as if deleted now."""
+    refuse_ke_manifest(manifest)
     at = now_utc().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     dry_run(cfg, W, receipt_rows({k: at for k in keys}, manifest, sources, manifest_sha, '0' * 64))
 
@@ -460,7 +465,7 @@ def open_intents(roots):
                 yield path.parent, Path(intent.get('manifest') or path.parent / 'plan/delete-manifest.jsonl')
 
 
-# ---- covered classes (a) and (b): live re-verify of each chunk before its r2prune call ----
+# ---- covered best-14 raws: live re-verify of each chunk before its r2prune call ----
 
 def r2_store(path):
     e = env_file(path)
@@ -678,24 +683,26 @@ def run_r2prune(cfg, W, args, lock_fd, listing):
 
 
 def delete(cfg, W, args, lock_fd):
+    if options(args, 'ke-coverage'):
+        raise SystemExit('Keep Everything is protected: --ke-coverage is no longer supported')
     if options(args, 'ledger'):
         raise SystemExit('the wrapper owns --ledger; do not pass it')
     manifest_path, expected = str(Path(one_option(args, 'manifest')).resolve()), one_option(args, 'expected-sha256')
     if sha(manifest_path) != expected:
         raise SystemExit('manifest digest differs from --expected-sha256')
     manifest = read_manifest(manifest_path)
+    refuse_ke_manifest(manifest)
     classes = {row['class'] for row in manifest.values()}
-    covered = classes & COVERAGE.keys()
-    mode = Mode.VERIFY if covered else Mode.LISTING
+    mode = Mode.VERIFY if BEST14_CLASS in classes else Mode.LISTING
     if mode is Mode.VERIFY:
         if len(classes) != 1:
-            raise SystemExit(f'a {"/".join(sorted(covered))} manifest must hold only that class; plan it separately')
+            raise SystemExit(f'a {BEST14_CLASS} manifest must hold only that class; plan it separately')
         if options(args, 'fresh-listing') or options(args, 'limit'):
-            raise SystemExit(f'for {classes.pop()} the wrapper owns --fresh-listing and chunks with --chunk/--chunks; drop --fresh-listing and --limit')
+            raise SystemExit(f'for {BEST14_CLASS} the wrapper owns --fresh-listing and chunks with --chunk/--chunks; drop --fresh-listing and --limit')
         listing_sha = None
     else:
         if cfg.chunk is not None or cfg.chunks is not None:
-            raise SystemExit(f'--chunk and --chunks apply only to {" and ".join(sorted(COVERAGE))} manifests')
+            raise SystemExit(f'--chunk and --chunks apply only to {BEST14_CLASS} manifests')
         listing_sha = sha(one_option(args, 'fresh-listing'))
     Path(W).mkdir(parents=True, exist_ok=True)
     intent_path = Path(W, 'delete-intent.json')
@@ -744,7 +751,7 @@ def delete(cfg, W, args, lock_fd):
                              'rerun the same command with the same --fresh-listing')
         return
 
-    cover = load_coverage(one_option(args, COVERAGE[next(iter(classes))]), manifest)
+    cover = load_coverage(one_option(args, 'best14-coverage'), manifest)
     held = set()
     for other, path in open_intents({Path(W).parent, Path(cfg.lane_cycles)}):
         if other != Path(W):
@@ -882,8 +889,8 @@ def main(argv):
         p.add_argument('--' + k.replace('_', '-'), default=v)
     sub = p.add_subparsers(dest='cmd', required=True)
     d = sub.add_parser('delete', help='resolve receipt sources, preflight, run r2prune delete, write receipts')
-    d.add_argument('--chunk', type=int, help=f'covered classes: raws live-verified per r2prune call (default {CHUNK})')
-    d.add_argument('--chunks', type=int, help='covered classes: stop after this many chunks (a canary)')
+    d.add_argument('--chunk', type=int, help=f'covered best-14 raws: live-verified per r2prune call (default {CHUNK})')
+    d.add_argument('--chunks', type=int, help='covered best-14 raws: stop after this many chunks (a canary)')
     d.add_argument('workdir')
     d.add_argument('args', nargs=argparse.REMAINDER, help='-- then the r2prune delete arguments (not --ledger)')
     r = sub.add_parser('receipts', help='write the receipts of a workdir whose intent is still open')
